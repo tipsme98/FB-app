@@ -48,7 +48,7 @@ def save_db(df, filename):
     df.to_csv(filename, index=False)
 
 # ==========================================
-# 2. 資金與風控算式
+# 2. 資金、風控與累計算式
 # ==========================================
 def get_capital_summary(df_cap, df_db):
     if df_cap.empty:
@@ -107,10 +107,29 @@ def get_html_link(df, title):
     b64 = base64.b64encode(full_html.encode('utf-8')).decode()
     return f'<a href="data:text/html;base64,{b64}" target="_blank" style="text-decoration: none; display: inline-block; padding: 8px 16px; background-color: #28a745; color: white; border-radius: 5px; font-weight: bold; margin-top: 10px;">🌐 獨立開啟 {title} (HTML)</a>'
 
+# 動態加總與介面視覺化渲染函數
+def display_cumulative_metrics(df):
+    total_profit = pd.to_numeric(df['Profit'], errors='coerce').sum()
+    total_unit_profit = pd.to_numeric(df['Unit_Profit'], errors='coerce').sum()
+    total_payout = pd.to_numeric(df['Payout'], errors='coerce').sum()
+    
+    st.markdown("### 📊 數據庫累計總額看板 (Cumulative Summary)")
+    m1, m2, m3 = st.columns(3)
+    
+    # st.metric 的 delta 屬性會自動幫正數標綠色、負數標紅色
+    m1.metric("累積淨盈虧 (Total Profit)", f"${total_profit:,.2f}", delta=f"{total_profit:,.2f}")
+    m2.metric("累積單位平注盈虧 (Total Unit Profit)", f"{total_unit_profit:,.2f} U", delta=f"{total_unit_profit:,.2f}")
+    m3.metric("累積派彩總額 (Total Payout)", f"${total_payout:,.2f}")
+    st.divider()
+
 @st.dialog("🔍 全維度數據庫預覽", width="large")
 def show_database_dialog(db_file, log_file, capital_file):
     df_db = load_db(db_file, DB_COLUMNS)
     df_cap = load_db(capital_file, CAPITAL_COLUMNS)
+    
+    # 在預覽視窗呼叫動態累加看板
+    display_cumulative_metrics(df_db)
+    
     tab1, tab2 = st.tabs(["📋 投注與動態紀錄", "💵 資金流水"])
     with tab1:
         st.dataframe(df_db, use_container_width=True, hide_index=True, height=400)
@@ -366,6 +385,10 @@ def main():
     
     with t_settle:
         st.subheader("⚖️ 賽事結算區")
+        
+        # 呼叫動態累加看板渲染
+        display_cumulative_metrics(st.session_state.df_db)
+        
         open_bets = st.session_state.df_db[st.session_state.df_db['Status'] == 'Open']
         if open_bets.empty:
             st.success("目前沒有未結算的注單。")
