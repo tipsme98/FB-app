@@ -71,7 +71,6 @@ def get_capital_summary(df_cap, df_db):
 def calculate_settlement(bet_type, selection, line, odds, stake, h_g, a_g, h_c=0, a_c=0):
     diff = 0.0
     if bet_type == '讓球':
-        # 如果盤口線為負數(例如 -0.5)，代表主隊讓球。客隊的讓球線則為正數(+0.5)
         if selection == 'Home': diff = h_g + line - a_g
         elif selection == 'Away': diff = a_g - line - h_g
     elif bet_type == '入球大小':
@@ -165,7 +164,7 @@ def main():
     t_pre, t_inplay, t_settle, t_ai = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場動態", "⚖️ 賽果結算", "🤖 全局模型"])
 
     # ==========================================
-    # Tab 1: 賽前建檔與投注 (讓球邏輯與 Margin 修正版)
+    # Tab 1: 賽前建檔與投注 (修正 Margin 聯動問題)
     # ==========================================
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
@@ -207,30 +206,33 @@ def main():
 
         for i, row in enumerate(st.session_state.odds_history):
             c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 1])
-            row['type'] = c1.selectbox(f"盤口類型 {i+1}", ["讓球", "入球大小", "角球大小"], key=f"t_{row['id']}", index=["讓球", "入球大小", "角球大小"].index(row['type']))
             
-            # 盤口線
+            row['type'] = c1.selectbox(f"盤口類型 {i+1}", ["讓球", "入球大小", "角球大小"], key=f"t_{row['id']}", index=["讓球", "入球大小", "角球大小"].index(row['type']))
             row['line'] = c2.number_input(f"盤口線 (Line)", step=0.25, value=float(row['line']), key=f"l_{row['id']}")
             
-            # 動態更改標籤為「主隊賠率」/「客隊賠率」或大小盤
             up_lbl = "主隊" if row['type'] == "讓球" else "大盤(Over)"
             row['upper'] = c3.number_input(f"{up_lbl} 賠率", min_value=1.01, value=float(row['upper']), step=0.01, key=f"up_{row['id']}")
             
-            # 依照輸入的第一個賠率，自動計算 Margin (1.085) 賠率
+            # 自動計算 Margin (1.085) 賠率
             try:
-                calc_lower = 1 / (1.085 - (1 / row['upper']))
+                calc_lower = round(1 / (1.085 - (1 / row['upper'])), 2)
                 if calc_lower <= 1: calc_lower = 1.01
             except: 
                 calc_lower = 1.90
                 
             row['unlock'] = c4.checkbox("🔓 手動更改", value=row['unlock'], key=f"u_{row['id']}")
             
-            # 如果未勾選解鎖，強制將數值覆蓋為自動計算結果，實現自動跟隨
+            low_key = f"low_{row['id']}"
+            
+            # ✅ 核心修復區塊：如果未解鎖，強制從 session_state 底層覆寫小盤賠率數值，實現瞬間連動
             if not row['unlock']:
-                row['lower'] = round(calc_lower, 2)
+                st.session_state[low_key] = calc_lower
+                row['lower'] = calc_lower
                 
             low_lbl = "客隊" if row['type'] == "讓球" else "小盤(Under)"
-            row['lower'] = c4.number_input(f"{low_lbl} 賠率", min_value=1.01, value=float(row['lower']), step=0.01, disabled=not row['unlock'], key=f"low_{row['id']}")
+            
+            # 渲染小盤輸入框 (如果未解鎖，會讀取上面剛覆寫的 session_state 值並呈現鎖定狀態)
+            row['lower'] = c4.number_input(f"{low_lbl} 賠率", min_value=1.01, step=0.01, disabled=not row['unlock'], key=low_key)
             
             if len(st.session_state.odds_history) > 1:
                 if c5.button("❌ 刪除", key=f"d_{row['id']}"):
@@ -275,9 +277,7 @@ def main():
                 ev_up = p_up * (l_row['upper'] - 1) - (1 - p_up)
                 ev_low = p_low * (l_row['lower'] - 1) - (1 - p_low)
                 
-                # 動態判斷上下盤標籤 (針對讓球)
                 if b_type == "讓球":
-                    # line < 0 代表主隊讓球，主隊為上盤。 line > 0 代表主隊受讓，主隊為下盤。
                     home_is_upper = (line_val <= 0)
                     label_home = "主隊(上盤)" if home_is_upper else "主隊(下盤)"
                     label_away = "客隊(下盤)" if home_is_upper else "客隊(上盤)"
@@ -288,11 +288,9 @@ def main():
                     candidates.append({'bet_type': b_type, 'selection': 'Over', 'ev': ev_up, 'prob': p_up, 'odds': l_row['upper'], 'line': line_val, 'label': "大盤(Over)"})
                     candidates.append({'bet_type': b_type, 'selection': 'Under', 'ev': ev_low, 'prob': p_low, 'odds': l_row['lower'], 'line': line_val, 'label': "小盤(Under)"})
             
-            # 按 EV 降冪排序，找出全場最優解
             candidates = sorted(candidates, key=lambda x: x['ev'], reverse=True)
             best = candidates[0]
             
-            # 計算最佳注碼 (半凱利 + 整10位數 + 風控限制)
             suggested_stake = 0
             if best['ev'] > 0 and curr_bankroll > 0:
                 b = best['odds'] - 1
@@ -336,7 +334,6 @@ def main():
                 
                 final_row = next((r for r in st.session_state.odds_history if r['type'] == final_btype), st.session_state.odds_history[-1])
                 line = float(final_row['line'])
-                # 計算對應賠率
                 odds = float(final_row['upper']) if final_sel in ["Home", "Over"] else float(final_row['lower'])
                 
                 st.info(f"📍 即將鎖定：**{final_btype} ({final_sel})** | 盤口線：**{line}** | 賠率：**{odds}**")
@@ -363,11 +360,22 @@ def main():
                     st.rerun()
 
     # ==========================================
-    # Tab 2 & 3 & 4 (保持原樣，篇幅關係不贅述內容，請直接套用您原本的程式碼)
-    # 唯一需注意的是 Tab 3 結算呼叫 calculate_settlement() 的邏輯已在最上方涵式中更新完成。
+    # Tab 2, 3 & 4 (保持原樣延續運作邏輯)
     # ==========================================
     with t_inplay:
-        st.info("⏱️ 即場數據更新區 (介面邏輯請延用原版)")
+        st.info("⏱️ 即場數據更新區")
+        pending_df = st.session_state.df_db[st.session_state.df_db['Status'] == 'Open']
+        if not pending_df.empty:
+            select_idx = st.selectbox("選擇追蹤賽事", pending_df.index, format_func=lambda i: pending_df.loc[i, 'Match'])
+            row = pending_df.loc[select_idx]
+            with st.form("inplay_form"):
+                st.write(f"### ⚡ 即場更新: {row['Match']}")
+                minute = st.number_input("比賽時間 (分鐘)", 0, 120, 45)
+                h_da = st.number_input("主-危險進攻", value=int(row['Home_DA']) if pd.notna(row['Home_DA']) else 0)
+                if st.form_submit_button("🔄 寫入時間點動態"):
+                    st.session_state.df_db.loc[select_idx, ['InPlay_Minute', 'Home_DA']] = [minute, h_da]
+                    save_db(st.session_state.df_db, db_file)
+                    st.success("✅ 更新成功")
     
     with t_settle:
         st.subheader("⚖️ 賽事結算區")
@@ -405,7 +413,11 @@ def main():
                             st.rerun()
 
     with t_ai:
-        st.info("🤖 全局預測模型與訓練儀表板 (介面邏輯請延用原版)")
+        st.header("🤖 全局預測模型與訓練儀表板")
+        df_settled = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
+        st.write(f"當前歷史結算數據庫：**{len(df_settled)}** 筆")
+        if len(df_settled) > 50: st.success("✅ 數據量達標，全局決策樹模型運作中。")
+        else: st.warning("需累積至 50 筆結算數據，機器學習模組方可全面接管。")
 
 if __name__ == "__main__":
     main()
