@@ -29,7 +29,6 @@ DB_COLUMNS = [
 ]
 LOG_COLUMNS = ['ID', 'Date', 'Match', 'Analysis_Content', 'Confidence_Level']
 CAPITAL_COLUMNS = ['ID', 'Date', 'Type', 'Amount', 'Note']
-FUNDS_COLUMNS = ['Date', 'Action_Type', 'Amount', 'Note', 'Data_Type']
 
 def load_db(filename, columns):
     if os.path.exists(filename):
@@ -121,21 +120,65 @@ def display_cumulative_metrics(df):
     st.divider()
 
 @st.dialog("🔍 全維度數據庫預覽", width="large")
-def show_database_dialog(db_file, log_file, capital_file, funds_file):
+def show_database_dialog(db_file, log_file, capital_file):
     df_db = load_db(db_file, DB_COLUMNS)
     df_cap = load_db(capital_file, CAPITAL_COLUMNS)
-    df_funds = load_db(funds_file, FUNDS_COLUMNS)
     
     display_cumulative_metrics(df_db)
     
-    tab1, tab2, tab3 = st.tabs(["📋 投注與動態紀錄", "💵 系統資金流水", "🏦 真實資金流水(Ledger)"])
+    tab1, tab2 = st.tabs(["📋 投注與動態紀錄", "💵 系統資金流水"])
     with tab1:
         st.dataframe(df_db, use_container_width=True, hide_index=True, height=400)
         st.markdown(get_html_link(df_db, "投注與動態紀錄"), unsafe_allow_html=True)
     with tab2:
-        st.dataframe(df_cap, use_container_width=True, hide_index=True, height=400)
-    with tab3:
-        st.dataframe(df_funds, use_container_width=True, hide_index=True, height=400)
+        if not df_cap.empty:
+            disp_df = df_cap.copy()
+            disp_df['Amount'] = pd.to_numeric(disp_df['Amount'], errors='coerce').fillna(0)
+            
+            # 將金額轉為帶正負號的值：存入為負，提取為正
+            disp_df['Signed_Amount'] = disp_df.apply(
+                lambda row: -row['Amount'] if row['Type'] == 'Deposit' else row['Amount'], axis=1
+            )
+            
+            total_sum = disp_df['Signed_Amount'].sum()
+            
+            # 新增總和列
+            total_row = pd.DataFrame([{
+                'ID': '總和 (Total)',
+                'Date': '',
+                'Type': '',
+                'Amount': 0, 
+                'Note': '',
+                'Signed_Amount': total_sum
+            }])
+            disp_df = pd.concat([disp_df, total_row], ignore_index=True)
+            
+            # 格式化顯示字串 (加入 +/- 符號與千分位)
+            def format_money(x):
+                if pd.isna(x): return ""
+                if x > 0: res = f"+{x:,.2f}"
+                elif x < 0: res = f"{x:,.2f}"
+                else: res = "0"
+                return res.replace(".00", "")
+                
+            disp_df['Amount'] = disp_df['Signed_Amount'].apply(format_money)
+            disp_df = disp_df.drop(columns=['Signed_Amount'])
+            
+            # 樣式渲染：正數(提取)綠色，負數(存入)紅色
+            def color_amount(val):
+                val_str = str(val)
+                if val_str.startswith('+'): return 'color: #00cc66;'
+                elif val_str.startswith('-'): return 'color: #ff4444;'
+                return ''
+            
+            if hasattr(disp_df.style, 'map'):
+                styled_df = disp_df.style.map(color_amount, subset=['Amount'])
+            else:
+                styled_df = disp_df.style.applymap(color_amount, subset=['Amount'])
+                
+            st.dataframe(styled_df, use_container_width=True, hide_index=True, height=400)
+        else:
+            st.dataframe(df_cap, use_container_width=True, hide_index=True, height=400)
 
 # ==========================================
 # 3. 主程式 UI 與功能區
@@ -149,11 +192,9 @@ def main():
     db_file = "football_betting_db_test.csv" if mode == "🧪 測試模式" else "football_betting_db.csv"
     log_file = "football_analysis_log_test.csv" if mode == "🧪 測試模式" else "football_analysis_log.csv"
     capital_file = "football_capital_db_test.csv" if mode == "🧪 測試模式" else "football_capital_db.csv"
-    funds_file = "football_funds_ledger_test.csv" if mode == "🧪 測試模式" else "football_funds_ledger.csv"
     
     st.session_state.df_db = load_db(db_file, DB_COLUMNS)
     st.session_state.df_cap = load_db(capital_file, CAPITAL_COLUMNS)
-    st.session_state.df_funds = load_db(funds_file, FUNDS_COLUMNS)
 
     tot_dep, tot_wit, net_dep, tot_pnl, curr_bankroll, max_stake = recalculate_bankroll_from_scratch(st.session_state.df_cap, st.session_state.df_db)
     
@@ -164,7 +205,7 @@ def main():
     st.sidebar.metric("當前總可用資金", f"${curr_bankroll:,.2f}")
     st.sidebar.caption(f"🛑 **單注上限 (本金 10%)**: `${max_stake:,.2f}`")
 
-    cap_action = st.sidebar.selectbox("系統內部本金操作 (不影響真實流水)", ["無操作", "📥 存入本金", "📤 提取本金"])
+    cap_action = st.sidebar.selectbox("系統內部本金操作", ["無操作", "📥 存入本金", "📤 提取本金"])
     if cap_action == "📥 存入本金":
         with st.sidebar.form("deposit_form"):
             dep_amt = st.number_input("存入金額 ($)", min_value=100.0, step=100.0, value=1000.0)
@@ -182,9 +223,9 @@ def main():
                 save_db(st.session_state.df_cap, capital_file)
                 st.rerun()
 
-    st.sidebar.button("🔍 開啟完整資料庫", on_click=show_database_dialog, args=(db_file, log_file, capital_file, funds_file), type="primary", use_container_width=True)
+    st.sidebar.button("🔍 開啟完整資料庫", on_click=show_database_dialog, args=(db_file, log_file, capital_file), type="primary", use_container_width=True)
 
-    t_pre, t_inplay, t_settle, t_ai, t_funds = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場動態", "⚖️ 賽果結算", "🤖 全局模型", "💵 資金流水與真實盈虧"])
+    t_pre, t_inplay, t_settle, t_ai = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場動態", "⚖️ 賽果結算", "🤖 全局模型"])
 
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
@@ -390,71 +431,6 @@ def main():
         st.header("🤖 全局預測模型")
         df_settled = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
         st.write(f"當前歷史結算數據：**{len(df_settled)}** 筆")
-
-    # ==========================================
-    # 4. 全新模組：資金流水與真實盈虧
-    # ==========================================
-    with t_funds:
-        st.header("💵 資金流水與真實盈虧監控模組 (Real P&L Engine)")
-        st.caption(f"目前顯示資料庫: `{funds_file}`")
-        
-        # 計算真實盈虧邏輯
-        df_funds_real = st.session_state.df_funds
-        if df_funds_real.empty:
-            total_dep_funds, total_wit_funds = 0.0, 0.0
-        else:
-            total_dep_funds = pd.to_numeric(df_funds_real[df_funds_real['Action_Type'] == '存入資金 (Deposit)']['Amount'], errors='coerce').sum()
-            total_wit_funds = pd.to_numeric(df_funds_real[df_funds_real['Action_Type'] == '提取資金 (Withdrawal)']['Amount'], errors='coerce').sum()
-            
-        real_pnl = total_wit_funds - total_dep_funds
-        
-        # 判定狀態與視覺化設定
-        if total_dep_funds > total_wit_funds:
-            status_text = "虧蝕中 (Net Capital Deficit)"
-            val_text = f"-${abs(real_pnl):,.2f}"
-            d_color = "normal"  # 負值在 Streamlit metric 預設顯示紅色
-        elif total_wit_funds > total_dep_funds:
-            status_text = "盈利中 (Net Profit Surplus)"
-            val_text = f"+${abs(real_pnl):,.2f}"
-            d_color = "normal"  # 正值預設綠色
-        else:
-            status_text = "打平 (Break Even)"
-            val_text = "$0.00"
-            d_color = "off"
-            
-        fc1, fc2, fc3 = st.columns(3)
-        fc1.metric("📥 累積總存入金額", f"${total_dep_funds:,.2f}")
-        fc2.metric("📤 累積總提取金額", f"${total_wit_funds:,.2f}")
-        fc3.metric("📊 現金流真實盈虧狀態", status_text, delta=val_text, delta_color=d_color)
-        
-        st.divider()
-        
-        with st.form("funds_ledger_form"):
-            st.subheader("➕ 新增資金流水紀錄")
-            c1, c2, c3 = st.columns(3)
-            action_type = c1.selectbox("交易類型", ["存入資金 (Deposit)", "提取資金 (Withdrawal)"])
-            amount = c2.number_input("金額 ($)", min_value=0.0, step=100.0, format="%.2f")
-            note = c3.text_input("備註說明", placeholder="例如：馬會戶口充值、轉帳至銀行等")
-            
-            if st.form_submit_button("✅ 確認提交並寫入流水帳"):
-                data_type_label = 'Test' if mode == "🧪 測試模式" else 'Real'
-                new_entry = {
-                    'Date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'Action_Type': action_type,
-                    'Amount': amount,
-                    'Note': note,
-                    'Data_Type': data_type_label
-                }
-                st.session_state.df_funds = pd.concat([st.session_state.df_funds, pd.DataFrame([new_entry])], ignore_index=True)
-                save_db(st.session_state.df_funds, funds_file)
-                st.toast("✅ 真實資金流水已成功紀錄！", icon="💵")
-                st.rerun()
-                
-        st.subheader("📜 歷史資金流水明細")
-        if st.session_state.df_funds.empty:
-            st.info("尚無資金進出紀錄。")
-        else:
-            st.dataframe(st.session_state.df_funds.sort_values(by="Date", ascending=False), use_container_width=True, hide_index=True)
 
 if __name__ == "__main__":
     main()
