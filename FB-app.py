@@ -48,9 +48,15 @@ def save_db(df, filename):
     df.to_csv(filename, index=False)
 
 # ==========================================
-# 2. 資金、風控與累計算式
+# 2. 資金、風控與累計算式 (State Rebuilding Engine)
 # ==========================================
-def get_capital_summary(df_cap, df_db):
+def recalculate_bankroll_from_scratch(df_cap, df_db):
+    """
+    【資料庫全局重構引擎】
+    絕對不採用加減法逆向推算本金。
+    直接讀取原始資金流水（存/提款），遍歷資料庫中所有剩餘的已結算紀錄全量重加總，
+    從頭計算出 100% 精準的當前可用資金與風控指標。
+    """
     if df_cap.empty:
         total_deposit, total_withdraw = 0.0, 0.0
     else:
@@ -107,7 +113,6 @@ def get_html_link(df, title):
     b64 = base64.b64encode(full_html.encode('utf-8')).decode()
     return f'<a href="data:text/html;base64,{b64}" target="_blank" style="text-decoration: none; display: inline-block; padding: 8px 16px; background-color: #28a745; color: white; border-radius: 5px; font-weight: bold; margin-top: 10px;">🌐 獨立開啟 {title} (HTML)</a>'
 
-# 動態加總與介面視覺化渲染函數
 def display_cumulative_metrics(df):
     total_profit = pd.to_numeric(df['Profit'], errors='coerce').sum()
     total_unit_profit = pd.to_numeric(df['Unit_Profit'], errors='coerce').sum()
@@ -116,7 +121,6 @@ def display_cumulative_metrics(df):
     st.markdown("### 📊 數據庫累計總額看板 (Cumulative Summary)")
     m1, m2, m3 = st.columns(3)
     
-    # st.metric 的 delta 屬性會自動幫正數標綠色、負數標紅色
     m1.metric("累積淨盈虧 (Total Profit)", f"${total_profit:,.2f}", delta=f"{total_profit:,.2f}")
     m2.metric("累積單位平注盈虧 (Total Unit Profit)", f"{total_unit_profit:,.2f} U", delta=f"{total_unit_profit:,.2f}")
     m3.metric("累積派彩總額 (Total Payout)", f"${total_payout:,.2f}")
@@ -127,7 +131,6 @@ def show_database_dialog(db_file, log_file, capital_file):
     df_db = load_db(db_file, DB_COLUMNS)
     df_cap = load_db(capital_file, CAPITAL_COLUMNS)
     
-    # 在預覽視窗呼叫動態累加看板
     display_cumulative_metrics(df_db)
     
     tab1, tab2 = st.tabs(["📋 投注與動態紀錄", "💵 資金流水"])
@@ -153,7 +156,8 @@ def main():
     st.session_state.df_db = load_db(db_file, DB_COLUMNS)
     st.session_state.df_cap = load_db(capital_file, CAPITAL_COLUMNS)
 
-    tot_dep, tot_wit, net_dep, tot_pnl, curr_bankroll, max_stake = get_capital_summary(st.session_state.df_cap, st.session_state.df_db)
+    # 呼叫全局重構引擎獲得最新資金狀態
+    tot_dep, tot_wit, net_dep, tot_pnl, curr_bankroll, max_stake = recalculate_bankroll_from_scratch(st.session_state.df_cap, st.session_state.df_db)
     
     st.sidebar.divider()
     st.sidebar.subheader("💰 資金與盈虧總覽")
@@ -386,12 +390,14 @@ def main():
     with t_settle:
         st.subheader("⚖️ 賽事結算區")
         
-        # 呼叫動態累加看板渲染
+        # 1. 頂部動態累加看板
         display_cumulative_metrics(st.session_state.df_db)
         
+        # 2. 待結算注單清單
+        st.markdown("#### ⏳ 待結算注單")
         open_bets = st.session_state.df_db[st.session_state.df_db['Status'] == 'Open']
         if open_bets.empty:
-            st.success("目前沒有未結算的注單。")
+            st.info("目前沒有待結算的注單。")
         else:
             for idx, row in open_bets.iterrows():
                 with st.expander(f"📌 {row['Match']} - {row['Bet_Type']} ({row['Selection']}) | 盤口: {row['Initial_Line']}"):
@@ -410,7 +416,6 @@ def main():
                                 float(row['Initial_Odds']), float(row['Stake']), h_g, a_g, h_c, a_c
                             )
                             
-                            # 寫入前：強制將字串類型的欄位轉為 object，徹底避免 LossySetitemError
                             for col in ['Result_Label', 'Status']:
                                 if st.session_state.df_db[col].dtype != 'object':
                                     st.session_state.df_db[col] = st.session_state.df_db[col].astype('object')
@@ -428,6 +433,47 @@ def main():
                             save_db(st.session_state.df_db, db_file)
                             st.success(f"結算完成！結果：{lbl} | 淨利：${prof:.2f}")
                             st.rerun()
+
+        st.divider()
+
+        # 3. 撤銷已結算紀錄 (Rollback Settlement) 專區
+        st.subheader("↩️ 撤銷已結算紀錄 (Rollback Settlement)")
+        st.caption("如發現結算數據輸入錯誤，可在下方選擇紀錄進行刪除與本金全局回滾。")
+
+        settled_df = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
+        
+        if settled_df.empty:
+            st.info("目前尚無已結算的歷史紀錄可供撤銷。")
+        else:
+            # 讀取最近 5 筆已結算紀錄（反轉順序讓最新的顯示在最上面）
+            recent_settled = settled_df.tail(5).iloc[::-1]
+            
+            options_dict = {}
+            for _, r in recent_settled.iterrows():
+                p_val = pd.to_numeric(r['Profit'], errors='coerce')
+                p_str = f"+${p_val:,.2f}" if p_val >= 0 else f"-${abs(p_val):,.2f}"
+                opt_label = f"[{r['Date']}] {r['Match']} | 結算: {r['Result_Label']} | 盈虧: {p_str}"
+                options_dict[opt_label] = r['ID']
+                
+            selected_option = st.selectbox("選擇欲撤銷的歷史結算紀錄 (最近 5 筆)", list(options_dict.keys()))
+            
+            with st.form("rollback_form"):
+                st.warning("⚠️ **安全提醒**：點擊下方按鈕將從資料庫中徹底刪除該筆紀錄，並自動調用 `recalculate_bankroll_from_scratch()` 從頭構建整體可用本金！")
+                confirm_rollback = st.form_submit_button("🔴 刪除並回滾所選的結算紀錄", type="primary", use_container_width=True)
+                
+                if confirm_rollback and selected_option:
+                    target_id = options_dict[selected_option]
+                    
+                    # 步驟一（資料拔除）：徹底刪除該行資料
+                    st.session_state.df_db = st.session_state.df_db[st.session_state.df_db['ID'] != target_id].reset_index(drop=True)
+                    
+                    # 步驟二（狀態重置與本金重構）：絕對不採用加減法逆推，發動全局重算引擎
+                    recalculate_bankroll_from_scratch(st.session_state.df_cap, st.session_state.df_db)
+                    
+                    # 步驟三（同步更新與存檔）：回寫 CSV 並跳出成功提示
+                    save_db(st.session_state.df_db, db_file)
+                    st.toast("已成功移除錯誤紀錄，本金已透過資料庫全局重構完成回滾！", icon="🔄")
+                    st.rerun()
 
     with t_ai:
         st.header("🤖 全局預測模型與訓練儀表板")
