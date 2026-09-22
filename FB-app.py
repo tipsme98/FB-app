@@ -29,6 +29,7 @@ DB_COLUMNS = [
 ]
 LOG_COLUMNS = ['ID', 'Date', 'Match', 'Analysis_Content', 'Confidence_Level']
 CAPITAL_COLUMNS = ['ID', 'Date', 'Type', 'Amount', 'Note']
+FUNDS_COLUMNS = ['Date', 'Action_Type', 'Amount', 'Note', 'Data_Type']
 
 def load_db(filename, columns):
     if os.path.exists(filename):
@@ -36,7 +37,6 @@ def load_db(filename, columns):
             df = pd.read_csv(filename)
             for col in columns:
                 if col not in df.columns: 
-                    # 強制宣告為 object 以避免 pandas 預設轉為 float 而導致 LossySetitemError
                     df[col] = pd.Series(dtype='object')
             return df
         except Exception:
@@ -51,12 +51,6 @@ def save_db(df, filename):
 # 2. 資金、風控與累計算式 (State Rebuilding Engine)
 # ==========================================
 def recalculate_bankroll_from_scratch(df_cap, df_db):
-    """
-    【資料庫全局重構引擎】
-    絕對不採用加減法逆向推算本金。
-    直接讀取原始資金流水（存/提款），遍歷資料庫中所有剩餘的已結算紀錄全量重加總，
-    從頭計算出 100% 精準的當前可用資金與風控指標。
-    """
     if df_cap.empty:
         total_deposit, total_withdraw = 0.0, 0.0
     else:
@@ -127,18 +121,21 @@ def display_cumulative_metrics(df):
     st.divider()
 
 @st.dialog("🔍 全維度數據庫預覽", width="large")
-def show_database_dialog(db_file, log_file, capital_file):
+def show_database_dialog(db_file, log_file, capital_file, funds_file):
     df_db = load_db(db_file, DB_COLUMNS)
     df_cap = load_db(capital_file, CAPITAL_COLUMNS)
+    df_funds = load_db(funds_file, FUNDS_COLUMNS)
     
     display_cumulative_metrics(df_db)
     
-    tab1, tab2 = st.tabs(["📋 投注與動態紀錄", "💵 資金流水"])
+    tab1, tab2, tab3 = st.tabs(["📋 投注與動態紀錄", "💵 系統資金流水", "🏦 真實資金流水(Ledger)"])
     with tab1:
         st.dataframe(df_db, use_container_width=True, hide_index=True, height=400)
         st.markdown(get_html_link(df_db, "投注與動態紀錄"), unsafe_allow_html=True)
     with tab2:
         st.dataframe(df_cap, use_container_width=True, hide_index=True, height=400)
+    with tab3:
+        st.dataframe(df_funds, use_container_width=True, hide_index=True, height=400)
 
 # ==========================================
 # 3. 主程式 UI 與功能區
@@ -152,21 +149,22 @@ def main():
     db_file = "football_betting_db_test.csv" if mode == "🧪 測試模式" else "football_betting_db.csv"
     log_file = "football_analysis_log_test.csv" if mode == "🧪 測試模式" else "football_analysis_log.csv"
     capital_file = "football_capital_db_test.csv" if mode == "🧪 測試模式" else "football_capital_db.csv"
+    funds_file = "football_funds_ledger_test.csv" if mode == "🧪 測試模式" else "football_funds_ledger.csv"
     
     st.session_state.df_db = load_db(db_file, DB_COLUMNS)
     st.session_state.df_cap = load_db(capital_file, CAPITAL_COLUMNS)
+    st.session_state.df_funds = load_db(funds_file, FUNDS_COLUMNS)
 
-    # 呼叫全局重構引擎獲得最新資金狀態
     tot_dep, tot_wit, net_dep, tot_pnl, curr_bankroll, max_stake = recalculate_bankroll_from_scratch(st.session_state.df_cap, st.session_state.df_db)
     
     st.sidebar.divider()
-    st.sidebar.subheader("💰 資金與盈虧總覽")
-    st.sidebar.metric("淨存入本金", f"${net_dep:,.2f}")
+    st.sidebar.subheader("💰 系統本金與盈虧總覽")
+    st.sidebar.metric("系統淨存入本金", f"${net_dep:,.2f}")
     st.sidebar.metric("累積總盈虧 (PnL)", f"${tot_pnl:,.2f}", delta=f"${tot_pnl:,.2f}")
     st.sidebar.metric("當前總可用資金", f"${curr_bankroll:,.2f}")
     st.sidebar.caption(f"🛑 **單注上限 (本金 10%)**: `${max_stake:,.2f}`")
 
-    cap_action = st.sidebar.selectbox("資金操作", ["無操作", "📥 存入本金", "📤 提取本金"])
+    cap_action = st.sidebar.selectbox("系統內部本金操作 (不影響真實流水)", ["無操作", "📥 存入本金", "📤 提取本金"])
     if cap_action == "📥 存入本金":
         with st.sidebar.form("deposit_form"):
             dep_amt = st.number_input("存入金額 ($)", min_value=100.0, step=100.0, value=1000.0)
@@ -184,13 +182,13 @@ def main():
                 save_db(st.session_state.df_cap, capital_file)
                 st.rerun()
 
-    st.sidebar.button("🔍 開啟完整資料庫", on_click=show_database_dialog, args=(db_file, log_file, capital_file), type="primary", use_container_width=True)
+    st.sidebar.button("🔍 開啟完整資料庫", on_click=show_database_dialog, args=(db_file, log_file, capital_file, funds_file), type="primary", use_container_width=True)
 
-    t_pre, t_inplay, t_settle, t_ai = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場動態", "⚖️ 賽果結算", "🤖 全局模型"])
+    t_pre, t_inplay, t_settle, t_ai, t_funds = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場動態", "⚖️ 賽果結算", "🤖 全局模型", "💵 資金流水與真實盈虧"])
 
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
-        if net_dep <= 0: st.warning("⚠️ 目前尚無存入本金！無法精確計算注碼。")
+        if net_dep <= 0: st.warning("⚠️ 目前系統內部尚無存入本金！無法精確計算注碼。")
         
         opts_leagues = ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['League'].dropna().unique())))
         opts_teams = ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Home_Team'].dropna().tolist() + st.session_state.df_db['Away_Team'].dropna().tolist())))
@@ -218,44 +216,35 @@ def main():
         al = f6.number_input("客敗", 0, 10, 1)
         home_form, away_form = f"{hw}W{hd}D{hl}L", f"{aw}W{ad}D{al}L"
 
-        st.markdown("##### 3. 賽前盤口與賠率走勢紀錄 (HKJC 學習模組)")
-        st.caption("💡 提示：讓球盤口線輸入 **負數 (如 -0.5)** 代表主隊讓球(上盤)；輸入 **正數 (如 0.5)** 代表主隊受讓(下盤)。系統會透過馬會 Margin (1.085) 自動為你計算並鎖定另一方的賠率。")
-        
+        st.markdown("##### 3. 賽前盤口與賠率走勢紀錄")
         if 'odds_history' not in st.session_state:
             st.session_state.odds_history = [{"id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False}]
             st.session_state.odds_counter = 1
 
         for i, row in enumerate(st.session_state.odds_history):
             c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 1])
-            
             row['type'] = c1.selectbox(f"盤口類型 {i+1}", ["讓球", "入球大小", "角球大小"], key=f"t_{row['id']}", index=["讓球", "入球大小", "角球大小"].index(row['type']))
             row['line'] = c2.number_input(f"盤口線 (Line)", step=0.25, value=float(row['line']), key=f"l_{row['id']}")
-            
             up_lbl = "主隊" if row['type'] == "讓球" else "大盤(Over)"
             row['upper'] = c3.number_input(f"{up_lbl} 賠率", min_value=1.01, value=float(row['upper']), step=0.01, key=f"up_{row['id']}")
-            
             try:
                 calc_lower = round(1 / (1.085 - (1 / row['upper'])), 2)
                 if calc_lower <= 1: calc_lower = 1.01
             except: 
                 calc_lower = 1.90
-                
             row['unlock'] = c4.checkbox("🔓 手動更改", value=row['unlock'], key=f"u_{row['id']}")
             low_key = f"low_{row['id']}"
-            
             if not row['unlock']:
                 st.session_state[low_key] = calc_lower
                 row['lower'] = calc_lower
-                
             low_lbl = "客隊" if row['type'] == "讓球" else "小盤(Under)"
             row['lower'] = c4.number_input(f"{low_lbl} 賠率", min_value=1.01, step=0.01, disabled=not row['unlock'], key=low_key)
-            
             if len(st.session_state.odds_history) > 1:
-                if c5.button("❌ 刪除", key=f"d_{row['id']}"):
+                if c5.button("❌", key=f"d_{row['id']}"):
                     st.session_state.odds_history.pop(i)
                     st.rerun()
 
-        if st.button("➕ 增加一筆盤口與賠率變化 (記錄走勢)", use_container_width=True):
+        if st.button("➕ 增加一筆盤口與賠率變化", use_container_width=True):
             st.session_state.odds_history.append({"id": st.session_state.odds_counter, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False})
             st.session_state.odds_counter += 1
             st.rerun()
@@ -266,11 +255,8 @@ def main():
             st.session_state.show_analysis = True
             df_settled = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
             ml_active = len(df_settled) > 50 and HAS_AI_MODULES
-            
             latest_odds = {}
-            for r in st.session_state.odds_history:
-                latest_odds[r['type']] = r
-                
+            for r in st.session_state.odds_history: latest_odds[r['type']] = r
             candidates = []
             r_map = {"S": 5, "A": 4, "B": 3, "C": 2, "D": 1}
             hr, ar = r_map.get(home_rating, 3), r_map.get(away_rating, 3)
@@ -278,23 +264,16 @@ def main():
             for b_type, l_row in latest_odds.items():
                 p_up, p_low = 0.5, 0.5
                 line_val = float(l_row['line'])
-                
-                if b_type == "讓球":
-                    p_up = max(0.1, min(0.9, 0.5 + ((hr - ar) * 0.03)))
-                elif b_type == "入球大小":
-                    p_up = max(0.1, min(0.9, 0.5 + ((hr + ar - 6) * 0.02)))
-                elif b_type == "角球大小":
-                    p_up = max(0.1, min(0.9, 0.5 + ((hr + ar - 5) * 0.01)))
-                
+                if b_type == "讓球": p_up = max(0.1, min(0.9, 0.5 + ((hr - ar) * 0.03)))
+                elif b_type == "入球大小": p_up = max(0.1, min(0.9, 0.5 + ((hr + ar - 6) * 0.02)))
+                elif b_type == "角球大小": p_up = max(0.1, min(0.9, 0.5 + ((hr + ar - 5) * 0.01)))
                 p_low = 1 - p_up
                 ev_up = p_up * (l_row['upper'] - 1) - (1 - p_up)
                 ev_low = p_low * (l_row['lower'] - 1) - (1 - p_low)
-                
                 if b_type == "讓球":
                     home_is_upper = (line_val <= 0)
                     label_home = "主隊(上盤)" if home_is_upper else "主隊(下盤)"
                     label_away = "客隊(下盤)" if home_is_upper else "客隊(上盤)"
-                    
                     candidates.append({'bet_type': b_type, 'selection': 'Home', 'ev': ev_up, 'prob': p_up, 'odds': l_row['upper'], 'line': line_val, 'label': label_home})
                     candidates.append({'bet_type': b_type, 'selection': 'Away', 'ev': ev_low, 'prob': p_low, 'odds': l_row['lower'], 'line': line_val, 'label': label_away})
                 else:
@@ -303,73 +282,50 @@ def main():
             
             candidates = sorted(candidates, key=lambda x: x['ev'], reverse=True)
             best = candidates[0]
-            
             suggested_stake = 0
             if best['ev'] > 0 and curr_bankroll > 0:
                 b = best['odds'] - 1
                 kelly_f = max(0.0, min((best['prob'] * b - (1 - best['prob'])) / b, 0.10))
-                half_kelly = kelly_f * 0.5
-                raw_stake = curr_bankroll * half_kelly
-                suggested_stake = max(10.0, min(float(max_stake), float(round(raw_stake / 10) * 10)))
+                suggested_stake = max(10.0, min(float(max_stake), float(round((curr_bankroll * (kelly_f * 0.5)) / 10) * 10)))
 
             st.session_state.analysis_result = {
-                'candidates': candidates, 'best': best, 
-                'ml_active': ml_active, 'stake': suggested_stake,
-                'home_form': home_form, 'away_form': away_form,
-                'home_rating': home_rating, 'away_rating': away_rating
+                'candidates': candidates, 'best': best, 'ml_active': ml_active, 'stake': suggested_stake,
+                'home_form': home_form, 'away_form': away_form, 'home_rating': home_rating, 'away_rating': away_rating
             }
             
         if st.session_state.get('show_analysis', False):
             res = st.session_state.analysis_result
             best = res['best']
-            st.success("✅ EV 與機器學習模型運算完成！")
-            
+            st.success("✅ EV 運算完成！")
             c1, c2, c3 = st.columns(3)
-            c1.metric("💡 系統首選推薦 (最高 EV)", f"{best['bet_type']} - {best['label']}")
-            c2.metric("🎯 預期勝率 (Base + ML)", f"{best['prob']*100:.1f}%")
-            c3.metric("📊 數學期望值 (EV)", f"{best['ev']:.3f}", delta="正期望值" if best['ev']>0 else "負期望值", delta_color="normal" if best['ev']>0 else "inverse")
-            
-            st.info(f"**模型建議注碼 (動態半凱利 + 風控)**：`${res['stake']:,.2f}` (佔當前可用資金: {res['stake']/curr_bankroll*100:.1f}% if {curr_bankroll}>0 else 0)")
-            
-            with st.expander("📊 查看所有盤口 EV 運算細節"):
-                df_ev = pd.DataFrame(res['candidates'])
-                df_ev['prob'] = df_ev['prob'].apply(lambda x: f"{x*100:.1f}%")
-                df_ev['ev'] = df_ev['ev'].apply(lambda x: f"{x:.3f}")
-                st.table(df_ev[['bet_type', 'label', 'line', 'odds', 'prob', 'ev']])
+            c1.metric("💡 首選推薦", f"{best['bet_type']} - {best['label']}")
+            c2.metric("🎯 預期勝率", f"{best['prob']*100:.1f}%")
+            c3.metric("📊 EV", f"{best['ev']:.3f}", delta="正期望值" if best['ev']>0 else "負期望值", delta_color="normal" if best['ev']>0 else "inverse")
+            st.info(f"**建議注碼**：`${res['stake']:,.2f}`")
 
-            st.markdown("##### 5. 確認並寫入投注紀錄")
             with st.form("bet_form"):
-                st.caption("以下欄位已自動帶入模型首選，你仍可手動覆寫。")
                 bc1, bc2, bc3 = st.columns(3)
                 final_btype = bc1.selectbox("最終投注項目", [c['bet_type'] for c in res['candidates']], index=0)
                 final_sel = bc2.selectbox("最終投注方向", ["Home", "Away", "Over", "Under"], index=["Home", "Away", "Over", "Under"].index(best['selection']))
                 final_stake = bc3.number_input("實際下注金額 ($)", min_value=10.0, step=10.0, value=float(res['stake'] if res['stake'] > 0 else 50.0))
-                
                 final_row = next((r for r in st.session_state.odds_history if r['type'] == final_btype), st.session_state.odds_history[-1])
                 line = float(final_row['line'])
                 odds = float(final_row['upper']) if final_sel in ["Home", "Over"] else float(final_row['lower'])
                 
-                st.info(f"📍 即將鎖定：**{final_btype} ({final_sel})** | 盤口線：**{line}** | 賠率：**{odds}**")
-
                 if st.form_submit_button("✅ 確定投注並寫入資料庫"):
-                    match_name = f"{home_team} vs {away_team}"
                     new_id = f"B{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                    
                     new_record = {
                         'ID': new_id, 'Date': datetime.now().strftime('%Y-%m-%d %H:%M'), 'Status': 'Open',
-                        'League': league, 'Match': match_name, 'Home_Team': home_team, 'Away_Team': away_team,
-                        'Home_Rating': res['home_rating'], 'Away_Rating': res['away_rating'],
-                        'Home_Form': res['home_form'], 'Away_Form': res['away_form'],
-                        'Bet_Type': final_btype, 'Selection': final_sel, 
-                        'Initial_Line': line, 'Initial_Odds': odds, 'Stake': final_stake,
+                        'League': league, 'Match': f"{home_team} vs {away_team}", 'Home_Team': home_team, 'Away_Team': away_team,
+                        'Home_Rating': res['home_rating'], 'Away_Rating': res['away_rating'], 'Home_Form': res['home_form'], 'Away_Form': res['away_form'],
+                        'Bet_Type': final_btype, 'Selection': final_sel, 'Initial_Line': line, 'Initial_Odds': odds, 'Stake': final_stake,
                         'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False)
                     }
-                    
                     st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame([new_record])], ignore_index=True)
                     save_db(st.session_state.df_db, db_file)
                     st.session_state.odds_history = [{"id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False}] 
                     st.session_state.show_analysis = False
-                    st.toast("✅ 投注紀錄已成功寫入！", icon="📝")
+                    st.toast("✅ 投注紀錄寫入成功！", icon="📝")
                     st.rerun()
 
     with t_inplay:
@@ -379,26 +335,20 @@ def main():
             select_idx = st.selectbox("選擇追蹤賽事", pending_df.index, format_func=lambda i: pending_df.loc[i, 'Match'])
             row = pending_df.loc[select_idx]
             with st.form("inplay_form"):
-                st.write(f"### ⚡ 即場更新: {row['Match']}")
                 minute = st.number_input("比賽時間 (分鐘)", 0, 120, 45)
                 h_da = st.number_input("主-危險進攻", value=int(row['Home_DA']) if pd.notna(row['Home_DA']) else 0)
-                if st.form_submit_button("🔄 寫入時間點動態"):
+                if st.form_submit_button("🔄 寫入更新"):
                     st.session_state.df_db.loc[select_idx, ['InPlay_Minute', 'Home_DA']] = [minute, h_da]
                     save_db(st.session_state.df_db, db_file)
                     st.success("✅ 更新成功")
     
     with t_settle:
         st.subheader("⚖️ 賽事結算區")
-        
-        # 1. 頂部動態累加看板
         display_cumulative_metrics(st.session_state.df_db)
         
-        # 2. 待結算注單清單
         st.markdown("#### ⏳ 待結算注單")
         open_bets = st.session_state.df_db[st.session_state.df_db['Status'] == 'Open']
-        if open_bets.empty:
-            st.info("目前沒有待結算的注單。")
-        else:
+        if not open_bets.empty:
             for idx, row in open_bets.iterrows():
                 with st.expander(f"📌 {row['Match']} - {row['Bet_Type']} ({row['Selection']}) | 盤口: {row['Initial_Line']}"):
                     with st.form(f"settle_form_{row['ID']}"):
@@ -415,72 +365,96 @@ def main():
                                 row['Bet_Type'], row['Selection'], float(row['Initial_Line']), 
                                 float(row['Initial_Odds']), float(row['Stake']), h_g, a_g, h_c, a_c
                             )
-                            
                             for col in ['Result_Label', 'Status']:
-                                if st.session_state.df_db[col].dtype != 'object':
-                                    st.session_state.df_db[col] = st.session_state.df_db[col].astype('object')
-
-                            st.session_state.df_db.at[idx, 'Home_Goal'] = h_g
-                            st.session_state.df_db.at[idx, 'Away_Goal'] = a_g
-                            st.session_state.df_db.at[idx, 'Home_Corner'] = h_c
-                            st.session_state.df_db.at[idx, 'Away_Corner'] = a_c
-                            st.session_state.df_db.at[idx, 'Result_Label'] = lbl
-                            st.session_state.df_db.at[idx, 'Profit'] = prof
-                            st.session_state.df_db.at[idx, 'Unit_Profit'] = u_prof
-                            st.session_state.df_db.at[idx, 'Payout'] = payout
-                            st.session_state.df_db.at[idx, 'Status'] = 'Settled'
-                            
+                                if st.session_state.df_db[col].dtype != 'object': st.session_state.df_db[col] = st.session_state.df_db[col].astype('object')
+                            st.session_state.df_db.loc[idx, ['Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner', 'Result_Label', 'Profit', 'Unit_Profit', 'Payout', 'Status']] = [h_g, a_g, h_c, a_c, lbl, prof, u_prof, payout, 'Settled']
                             save_db(st.session_state.df_db, db_file)
                             st.success(f"結算完成！結果：{lbl} | 淨利：${prof:.2f}")
                             st.rerun()
-
         st.divider()
-
-        # 3. 撤銷已結算紀錄 (Rollback Settlement) 專區
-        st.subheader("↩️ 撤銷已結算紀錄 (Rollback Settlement)")
-        st.caption("如發現結算數據輸入錯誤，可在下方選擇紀錄進行刪除與本金全局回滾。")
-
+        st.subheader("↩️ 撤銷已結算紀錄")
         settled_df = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
-        
-        if settled_df.empty:
-            st.info("目前尚無已結算的歷史紀錄可供撤銷。")
-        else:
-            # 讀取最近 5 筆已結算紀錄（反轉順序讓最新的顯示在最上面）
+        if not settled_df.empty:
             recent_settled = settled_df.tail(5).iloc[::-1]
-            
-            options_dict = {}
-            for _, r in recent_settled.iterrows():
-                p_val = pd.to_numeric(r['Profit'], errors='coerce')
-                p_str = f"+${p_val:,.2f}" if p_val >= 0 else f"-${abs(p_val):,.2f}"
-                opt_label = f"[{r['Date']}] {r['Match']} | 結算: {r['Result_Label']} | 盈虧: {p_str}"
-                options_dict[opt_label] = r['ID']
-                
+            options_dict = {f"[{r['Date']}] {r['Match']} | 結算: {r['Result_Label']} | 盈虧: {'+$' if pd.to_numeric(r['Profit'], errors='coerce')>=0 else '-$'}{abs(pd.to_numeric(r['Profit'], errors='coerce')):,.2f}": r['ID'] for _, r in recent_settled.iterrows()}
             selected_option = st.selectbox("選擇欲撤銷的歷史結算紀錄 (最近 5 筆)", list(options_dict.keys()))
-            
             with st.form("rollback_form"):
-                st.warning("⚠️ **安全提醒**：點擊下方按鈕將從資料庫中徹底刪除該筆紀錄，並自動調用 `recalculate_bankroll_from_scratch()` 從頭構建整體可用本金！")
-                confirm_rollback = st.form_submit_button("🔴 刪除並回滾所選的結算紀錄", type="primary", use_container_width=True)
-                
-                if confirm_rollback and selected_option:
-                    target_id = options_dict[selected_option]
-                    
-                    # 步驟一（資料拔除）：徹底刪除該行資料
-                    st.session_state.df_db = st.session_state.df_db[st.session_state.df_db['ID'] != target_id].reset_index(drop=True)
-                    
-                    # 步驟二（狀態重置與本金重構）：絕對不採用加減法逆推，發動全局重算引擎
+                if st.form_submit_button("🔴 刪除並回滾所選紀錄", type="primary", use_container_width=True) and selected_option:
+                    st.session_state.df_db = st.session_state.df_db[st.session_state.df_db['ID'] != options_dict[selected_option]].reset_index(drop=True)
                     recalculate_bankroll_from_scratch(st.session_state.df_cap, st.session_state.df_db)
-                    
-                    # 步驟三（同步更新與存檔）：回寫 CSV 並跳出成功提示
                     save_db(st.session_state.df_db, db_file)
-                    st.toast("已成功移除錯誤紀錄，本金已透過資料庫全局重構完成回滾！", icon="🔄")
+                    st.toast("已移除紀錄並完成本金全局回滾！", icon="🔄")
                     st.rerun()
 
     with t_ai:
-        st.header("🤖 全局預測模型與訓練儀表板")
+        st.header("🤖 全局預測模型")
         df_settled = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
-        st.write(f"當前歷史結算數據庫：**{len(df_settled)}** 筆")
-        if len(df_settled) > 50: st.success("✅ 數據量達標，全局決策樹模型運作中。")
-        else: st.warning("需累積至 50 筆結算數據，機器學習模組方可全面接管。")
+        st.write(f"當前歷史結算數據：**{len(df_settled)}** 筆")
+
+    # ==========================================
+    # 4. 全新模組：資金流水與真實盈虧
+    # ==========================================
+    with t_funds:
+        st.header("💵 資金流水與真實盈虧監控模組 (Real P&L Engine)")
+        st.caption(f"目前顯示資料庫: `{funds_file}`")
+        
+        # 計算真實盈虧邏輯
+        df_funds_real = st.session_state.df_funds
+        if df_funds_real.empty:
+            total_dep_funds, total_wit_funds = 0.0, 0.0
+        else:
+            total_dep_funds = pd.to_numeric(df_funds_real[df_funds_real['Action_Type'] == '存入資金 (Deposit)']['Amount'], errors='coerce').sum()
+            total_wit_funds = pd.to_numeric(df_funds_real[df_funds_real['Action_Type'] == '提取資金 (Withdrawal)']['Amount'], errors='coerce').sum()
+            
+        real_pnl = total_wit_funds - total_dep_funds
+        
+        # 判定狀態與視覺化設定
+        if total_dep_funds > total_wit_funds:
+            status_text = "虧蝕中 (Net Capital Deficit)"
+            val_text = f"-${abs(real_pnl):,.2f}"
+            d_color = "normal"  # 負值在 Streamlit metric 預設顯示紅色
+        elif total_wit_funds > total_dep_funds:
+            status_text = "盈利中 (Net Profit Surplus)"
+            val_text = f"+${abs(real_pnl):,.2f}"
+            d_color = "normal"  # 正值預設綠色
+        else:
+            status_text = "打平 (Break Even)"
+            val_text = "$0.00"
+            d_color = "off"
+            
+        fc1, fc2, fc3 = st.columns(3)
+        fc1.metric("📥 累積總存入金額", f"${total_dep_funds:,.2f}")
+        fc2.metric("📤 累積總提取金額", f"${total_wit_funds:,.2f}")
+        fc3.metric("📊 現金流真實盈虧狀態", status_text, delta=val_text, delta_color=d_color)
+        
+        st.divider()
+        
+        with st.form("funds_ledger_form"):
+            st.subheader("➕ 新增資金流水紀錄")
+            c1, c2, c3 = st.columns(3)
+            action_type = c1.selectbox("交易類型", ["存入資金 (Deposit)", "提取資金 (Withdrawal)"])
+            amount = c2.number_input("金額 ($)", min_value=0.0, step=100.0, format="%.2f")
+            note = c3.text_input("備註說明", placeholder="例如：馬會戶口充值、轉帳至銀行等")
+            
+            if st.form_submit_button("✅ 確認提交並寫入流水帳"):
+                data_type_label = 'Test' if mode == "🧪 測試模式" else 'Real'
+                new_entry = {
+                    'Date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'Action_Type': action_type,
+                    'Amount': amount,
+                    'Note': note,
+                    'Data_Type': data_type_label
+                }
+                st.session_state.df_funds = pd.concat([st.session_state.df_funds, pd.DataFrame([new_entry])], ignore_index=True)
+                save_db(st.session_state.df_funds, funds_file)
+                st.toast("✅ 真實資金流水已成功紀錄！", icon="💵")
+                st.rerun()
+                
+        st.subheader("📜 歷史資金流水明細")
+        if st.session_state.df_funds.empty:
+            st.info("尚無資金進出紀錄。")
+        else:
+            st.dataframe(st.session_state.df_funds.sort_values(by="Date", ascending=False), use_container_width=True, hide_index=True)
 
 if __name__ == "__main__":
     main()
