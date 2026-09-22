@@ -35,7 +35,9 @@ def load_db(filename, columns):
         try:
             df = pd.read_csv(filename)
             for col in columns:
-                if col not in df.columns: df[col] = None
+                if col not in df.columns: 
+                    # 強制宣告為 object 以避免 pandas 預設轉為 float 而導致 LossySetitemError
+                    df[col] = pd.Series(dtype='object')
             return df
         except Exception:
             return pd.DataFrame(columns=columns)
@@ -163,9 +165,6 @@ def main():
 
     t_pre, t_inplay, t_settle, t_ai = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場動態", "⚖️ 賽果結算", "🤖 全局模型"])
 
-    # ==========================================
-    # Tab 1: 賽前建檔與投注 (修正 Margin 聯動問題)
-    # ==========================================
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
         if net_dep <= 0: st.warning("⚠️ 目前尚無存入本金！無法精確計算注碼。")
@@ -196,7 +195,6 @@ def main():
         al = f6.number_input("客敗", 0, 10, 1)
         home_form, away_form = f"{hw}W{hd}D{hl}L", f"{aw}W{ad}D{al}L"
 
-        # --- 3. 賽前盤口與動態賠率追蹤 ---
         st.markdown("##### 3. 賽前盤口與賠率走勢紀錄 (HKJC 學習模組)")
         st.caption("💡 提示：讓球盤口線輸入 **負數 (如 -0.5)** 代表主隊讓球(上盤)；輸入 **正數 (如 0.5)** 代表主隊受讓(下盤)。系統會透過馬會 Margin (1.085) 自動為你計算並鎖定另一方的賠率。")
         
@@ -213,7 +211,6 @@ def main():
             up_lbl = "主隊" if row['type'] == "讓球" else "大盤(Over)"
             row['upper'] = c3.number_input(f"{up_lbl} 賠率", min_value=1.01, value=float(row['upper']), step=0.01, key=f"up_{row['id']}")
             
-            # 自動計算 Margin (1.085) 賠率
             try:
                 calc_lower = round(1 / (1.085 - (1 / row['upper'])), 2)
                 if calc_lower <= 1: calc_lower = 1.01
@@ -221,17 +218,13 @@ def main():
                 calc_lower = 1.90
                 
             row['unlock'] = c4.checkbox("🔓 手動更改", value=row['unlock'], key=f"u_{row['id']}")
-            
             low_key = f"low_{row['id']}"
             
-            # ✅ 核心修復區塊：如果未解鎖，強制從 session_state 底層覆寫小盤賠率數值，實現瞬間連動
             if not row['unlock']:
                 st.session_state[low_key] = calc_lower
                 row['lower'] = calc_lower
                 
             low_lbl = "客隊" if row['type'] == "讓球" else "小盤(Under)"
-            
-            # 渲染小盤輸入框 (如果未解鎖，會讀取上面剛覆寫的 session_state 值並呈現鎖定狀態)
             row['lower'] = c4.number_input(f"{low_lbl} 賠率", min_value=1.01, step=0.01, disabled=not row['unlock'], key=low_key)
             
             if len(st.session_state.odds_history) > 1:
@@ -246,13 +239,11 @@ def main():
 
         st.markdown("---")
         
-        # --- 4. 觸發 EV 跨維度分析 ---
         if st.button("🧠 觸發全局期望值 (EV) 分析與預測", type="primary", use_container_width=True):
             st.session_state.show_analysis = True
             df_settled = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
             ml_active = len(df_settled) > 50 and HAS_AI_MODULES
             
-            # 取出每種盤口的最新一筆數據
             latest_odds = {}
             for r in st.session_state.odds_history:
                 latest_odds[r['type']] = r
@@ -265,7 +256,6 @@ def main():
                 p_up, p_low = 0.5, 0.5
                 line_val = float(l_row['line'])
                 
-                # 簡化版公式演算法
                 if b_type == "讓球":
                     p_up = max(0.1, min(0.9, 0.5 + ((hr - ar) * 0.03)))
                 elif b_type == "入球大小":
@@ -354,14 +344,11 @@ def main():
                     
                     st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame([new_record])], ignore_index=True)
                     save_db(st.session_state.df_db, db_file)
-                    st.session_state.odds_history = [{"id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False}] # 清除快取
+                    st.session_state.odds_history = [{"id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False}] 
                     st.session_state.show_analysis = False
                     st.toast("✅ 投注紀錄已成功寫入！", icon="📝")
                     st.rerun()
 
-    # ==========================================
-    # Tab 2, 3 & 4 (保持原樣延續運作邏輯)
-    # ==========================================
     with t_inplay:
         st.info("⏱️ 即場數據更新區")
         pending_df = st.session_state.df_db[st.session_state.df_db['Status'] == 'Open']
@@ -399,6 +386,12 @@ def main():
                                 row['Bet_Type'], row['Selection'], float(row['Initial_Line']), 
                                 float(row['Initial_Odds']), float(row['Stake']), h_g, a_g, h_c, a_c
                             )
+                            
+                            # 寫入前：強制將字串類型的欄位轉為 object，徹底避免 LossySetitemError
+                            for col in ['Result_Label', 'Status']:
+                                if st.session_state.df_db[col].dtype != 'object':
+                                    st.session_state.df_db[col] = st.session_state.df_db[col].astype('object')
+
                             st.session_state.df_db.at[idx, 'Home_Goal'] = h_g
                             st.session_state.df_db.at[idx, 'Away_Goal'] = a_g
                             st.session_state.df_db.at[idx, 'Home_Corner'] = h_c
@@ -408,6 +401,7 @@ def main():
                             st.session_state.df_db.at[idx, 'Unit_Profit'] = u_prof
                             st.session_state.df_db.at[idx, 'Payout'] = payout
                             st.session_state.df_db.at[idx, 'Status'] = 'Settled'
+                            
                             save_db(st.session_state.df_db, db_file)
                             st.success(f"結算完成！結果：{lbl} | 淨利：${prof:.2f}")
                             st.rerun()
