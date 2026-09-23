@@ -458,10 +458,13 @@ def render_odds_section(odds_history_state, prefix="pre"):
         
         if not row['unlock']:
             row['margin'] = c4.number_input("抽水(Margin)", min_value=1.00, value=float(row.get('margin', 1.085)), step=0.005, format="%.3f", key=margin_key)
+            margin_pct = (row['margin'] - 1) * 100
+            c4.caption(f"抽水率: **{margin_pct:.2f}%**")
             row['lower'] = c5.number_input(f"{low_lbl} 賠率", value=float(row['lower']), disabled=True, key=low_key)
         else:
             row['lower'] = c5.number_input(f"{low_lbl} 賠率", min_value=1.01, step=0.01, value=float(row['lower']), key=low_key)
-            c4.caption(f"隱含抽水: **{row['margin']:.3f}**")
+            margin_pct = (row['margin'] - 1) * 100
+            c4.caption(f"隱含抽水: **{row['margin']:.3f} ({margin_pct:.2f}%)**")
 
         if len(odds_history_state) > 1:
             if c6.button("❌", key=f"{prefix}_d_{r_id}"):
