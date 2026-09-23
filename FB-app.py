@@ -39,7 +39,8 @@ def load_db(filename, columns):
     string_cols = [
         'ID', 'Date', 'Status', 'Tournament_Name', 'Tournament_Category', 
         'Match', 'Home_Team', 'Away_Team', 'Home_Rating', 'Away_Rating', 
-        'Home_Form', 'Away_Form', 'Bet_Type', 'Selection', 'Odds_History', 'Result_Label'
+        'Home_Form', 'Away_Form', 'Bet_Type', 'Selection', 'Odds_History', 'Result_Label',
+        'Type', 'Note'
     ]
     if os.path.exists(filename):
         try:
@@ -231,26 +232,133 @@ def evaluate_dimension(df_subset, dim_name, candidates_base, rating_map, h_data)
     }
 
 # ==========================================
-# 4. 模組化組件：動態賠率與預覽彈窗
+# 4. 資金流水 HTML 構建與預覽彈窗
 # ==========================================
-@st.dialog("📊 數據庫即時線上預覽", width="large")
-def preview_db_dialog(df):
-    st.write("您可以在下方表格中自由滑動、點擊欄位排序，或使用關鍵字搜尋特定賽事。")
-    search_query = st.text_input("🔍 關鍵字搜尋 (例如: 球隊名稱、盤口)", "")
+def build_capital_flow_html(df_cap):
+    if df_cap.empty:
+        empty_html = """
+        <div style="text-align:center; padding: 20px; color: gray;">
+            <p>目前尚無資金流水紀錄。</p>
+        </div>
+        """
+        return empty_html, 0.0, "0", "#888888", " (無紀錄)"
     
-    if search_query:
-        mask = df.astype(str).apply(lambda x: x.str.contains(search_query, case=False, na=False)).any(axis=1)
-        show_df = df[mask]
-    else:
-        show_df = df
+    rows_html = []
+    total_amount = 0.0
+    
+    for _, r in df_cap.iterrows():
+        c_id = str(r.get('ID', ''))
+        c_date = str(r.get('Date', ''))
+        c_type_raw = str(r.get('Type', ''))
         
-    st.dataframe(show_df, use_container_width=True)
+        try:
+            amt_raw = float(r.get('Amount', 0.0))
+        except (ValueError, TypeError):
+            amt_raw = 0.0
+            
+        c_note = str(r.get('Note', '')) if pd.notna(r.get('Note')) else ''
+        
+        if 'Deposit' in c_type_raw or '存入' in c_type_raw:
+            c_type_disp = "存入本金 (Deposit)"
+            signed_amt = -amt_raw
+            amt_formatted = f"-{int(amt_raw) if amt_raw.is_integer() else amt_raw:g}"
+            color = "#ff4d4d"  # 紅色代表存入 (-)
+        else:
+            c_type_disp = "提取本金 (Withdraw)"
+            signed_amt = amt_raw
+            amt_formatted = f"+{int(amt_raw) if amt_raw.is_integer() else amt_raw:g}"
+            color = "#28a745"  # 綠色代表提取 (+)
+            
+        total_amount += signed_amt
+        
+        rows_html.append(f"""
+        <tr>
+            <td style="padding: 10px; border: 1px solid #444;">{c_id}</td>
+            <td style="padding: 10px; border: 1px solid #444;">{c_date}</td>
+            <td style="padding: 10px; border: 1px solid #444;">{c_type_disp}</td>
+            <td style="padding: 10px; border: 1px solid #444; color: {color}; font-weight: bold; text-align: right; font-size: 1.05em;">{amt_formatted}</td>
+            <td style="padding: 10px; border: 1px solid #444;">{c_note}</td>
+        </tr>
+        """)
     
-    # 匯出獨立 HTML 報表
-    html = show_df.to_html(index=False, justify='center', border=1, classes="table table-striped")
-    b64 = base64.b64encode(html.encode('utf-8')).decode()
-    href = f'<a href="data:text/html;base64,{b64}" download="football_betting_report.html" target="_blank" style="display:inline-block; margin-top:10px; text-decoration:none; padding:10px 20px; background-color:#4CAF50; color:white; border-radius:5px; font-weight:bold;">📥 點擊下載獨立 HTML 報表</a>'
-    st.markdown(href, unsafe_allow_html=True)
+    if total_amount < 0:
+        tot_color = "#ff4d4d"  # 紅色
+        abs_tot = abs(total_amount)
+        tot_str = f"-{int(abs_tot) if abs_tot.is_integer() else abs_tot:g}"
+        tot_label = f" (代表淨存入 ${abs_tot:,.2f})"
+    elif total_amount > 0:
+        tot_color = "#28a745"  # 綠色
+        tot_str = f"+{int(total_amount) if total_amount.is_integer() else total_amount:g}"
+        tot_label = f" (代表淨提取 ${total_amount:,.2f})"
+    else:
+        tot_color = "#888888"
+        tot_str = "0"
+        tot_label = " (收支平衡)"
+        
+    summary_row_html = f"""
+    <tr style="background-color: rgba(128, 128, 128, 0.2); font-weight: bold; border-top: 2px solid #888;">
+        <td colspan="3" style="padding: 12px; border: 1px solid #444; text-align: right; font-size: 1.05em;">金額總和 (Total Amount Sum):</td>
+        <td style="padding: 12px; border: 1px solid #444; color: {tot_color}; font-weight: bold; font-size: 1.25em; text-align: right;">{tot_str}</td>
+        <td style="padding: 12px; border: 1px solid #444; color: {tot_color}; font-weight: bold; font-size: 0.95em;">{tot_label}</td>
+    </tr>
+    """
+    
+    table_html = f"""
+    <div style="width: 100%; overflow-x: auto; margin-top: 10px;">
+        <table style="width: 100%; border-collapse: collapse; font-family: system-ui, -apple-system, sans-serif; font-size: 14px;">
+            <thead>
+                <tr style="background-color: rgba(128, 128, 128, 0.3); text-align: left;">
+                    <th style="padding: 10px; border: 1px solid #444;">流水號 (ID)</th>
+                    <th style="padding: 10px; border: 1px solid #444;">日期 (Date)</th>
+                    <th style="padding: 10px; border: 1px solid #444;">類型 (Type)</th>
+                    <th style="padding: 10px; border: 1px solid #444; text-align: right;">金額 (Amount)</th>
+                    <th style="padding: 10px; border: 1px solid #444;">備註 (Note)</th>
+                </tr>
+            </thead>
+            <tbody>
+                {"".join(rows_html)}
+                {summary_row_html}
+            </tbody>
+        </table>
+    </div>
+    """
+    return table_html, total_amount, tot_str, tot_color, tot_label
+
+@st.dialog("📊 數據庫即時線上預覽", width="large")
+def preview_db_dialog(df_db, df_cap):
+    tab_bets, tab_capital = st.tabs(["⚽ 投注紀錄數據庫", "💰 系統資金流水"])
+    
+    with tab_bets:
+        st.write("您可以在下方表格中自由滑動、點擊欄位排序，或使用關鍵字搜尋特定賽事。")
+        search_query = st.text_input("🔍 關鍵字搜尋 (例如: 球隊名稱、盤口)", "", key="search_bets")
+        
+        if search_query:
+            mask = df_db.astype(str).apply(lambda x: x.str.contains(search_query, case=False, na=False)).any(axis=1)
+            show_df = df_db[mask]
+        else:
+            show_df = df_db
+            
+        st.dataframe(show_df, use_container_width=True)
+        
+        # 匯出獨立 HTML 報表
+        html = show_df.to_html(index=False, justify='center', border=1, classes="table table-striped")
+        b64 = base64.b64encode(html.encode('utf-8')).decode()
+        href = f'<a href="data:text/html;base64,{b64}" download="football_betting_report.html" target="_blank" style="display:inline-block; margin-top:10px; text-decoration:none; padding:10px 20px; background-color:#4CAF50; color:white; border-radius:5px; font-weight:bold;">📥 點擊下載投注紀錄 HTML 報表</a>'
+        st.markdown(href, unsafe_allow_html=True)
+
+    with tab_capital:
+        st.subheader("💰 系統資金流水帳目 (Capital Flow Ledger)")
+        st.write("記錄所有資金存入與提取之金額。存入金額為紅色 (`-`)，提取金額為綠色 (`+`)。Amount 欄位最後附有總和數值與說明。")
+        
+        table_html, total_amount, tot_str, tot_color, tot_label = build_capital_flow_html(df_cap)
+        
+        st.markdown(table_html, unsafe_allow_html=True)
+        
+        st.markdown("---")
+        # 匯出資金流水獨立 HTML 報表
+        b64_cap = base64.b64encode(table_html.encode('utf-8')).decode()
+        href_cap = f'<a href="data:text/html;base64,{b64_cap}" download="capital_flow_report.html" target="_blank" style="display:inline-block; margin-top:10px; text-decoration:none; padding:10px 20px; background-color:#2196F3; color:white; border-radius:5px; font-weight:bold;">📥 點擊下載資金流水 HTML 報表</a>'
+        st.markdown(href_cap, unsafe_allow_html=True)
 
 def render_odds_section(odds_history_state, prefix="pre"):
     for i, row in enumerate(odds_history_state):
@@ -366,7 +474,7 @@ def main():
 
     st.sidebar.divider()
     if st.sidebar.button("🔍 數據庫即時線上預覽", use_container_width=True):
-        preview_db_dialog(st.session_state.df_db)
+        preview_db_dialog(st.session_state.df_db, st.session_state.df_cap)
 
     t_pre, t_inplay, t_settle, t_ai = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖️ 賽果結算與管理", "🤖 全局模型"])
 
