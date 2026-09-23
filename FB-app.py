@@ -217,7 +217,6 @@ def render_odds_section(odds_history_state, prefix="pre"):
         up_key, type_key, unlock_key = f"{prefix}_up_{r_id}", f"{prefix}_t_{r_id}", f"{prefix}_u_{r_id}"
         margin_key, low_key, line_key = f"{prefix}_m_{r_id}", f"{prefix}_low_{r_id}", f"{prefix}_l_{r_id}"
 
-        # 優先處理型態切換的數值初始化
         if type_key in st.session_state:
             old_type, new_type = row['type'], st.session_state[type_key]
             if old_type != new_type:
@@ -233,7 +232,6 @@ def render_odds_section(odds_history_state, prefix="pre"):
         if margin_key in st.session_state: row['margin'] = st.session_state[margin_key]
         if low_key in st.session_state and row['unlock']: row['lower'] = st.session_state[low_key]
 
-        # Margin 運算核心：並將結果強制寫回 session_state 確保 UI 即時變更
         if not row['unlock']:
             m_val, u_val = float(row.get('margin', 1.085)), float(row.get('upper', 1.90))
             try:
@@ -253,7 +251,6 @@ def render_odds_section(odds_history_state, prefix="pre"):
         type_idx = ["讓球", "入球大小", "角球大小"].index(row['type']) if row['type'] in ["讓球", "入球大小", "角球大小"] else 0
         row['type'] = c1.selectbox(f"盤口類型 {i+1}", ["讓球", "入球大小", "角球大小"], key=type_key, index=type_idx)
         
-        # 角球大小盤口線 +/- 1.0，其他 0.25
         line_step = 1.0 if row['type'] == "角球大小" else 0.25
         row['line'] = c2.number_input("盤口線", step=line_step, value=float(row['line']), key=line_key)
         
@@ -423,7 +420,7 @@ def main():
             dim_label_map = {"微觀 - 賽事名稱": "微觀", "中觀 - 賽事分類": "中觀", "宏觀 - 總數據": "宏觀"}
             dim_short = dim_label_map.get(bm['dim'], "宏觀")
 
-            st.markdown(f"### 🧠 AI 最佳預測模型推薦")
+            st.markdown(f"### 🧠 AI 預測模型推薦")
             st.info(f"系統分析顯示，針對『{res['t_name']}』，採用『{bm['dim']}』級別的模型進行運算，其歷史準確率與 EV 獲利期望值最高，故本次投注策略依據此模型生成。")
             
             mc1, mc2, mc3 = st.columns(3)
@@ -495,11 +492,9 @@ def main():
                 h_red = st.number_input("主隊紅牌", min_value=0, value=get_val(row, 'Home_Red'))
                 h_sub = st.number_input("主隊換人", min_value=0, value=get_val(row, 'Home_Sub'))
                 
-                # 控球率聯動：輸入主隊，自動計算客隊
                 h_poss = st.number_input("主隊控球率 (%)", min_value=0, max_value=100, value=get_val(row, 'Home_Possession', 50))
                 a_poss = max(0, 100 - h_poss)
                 
-                # 自動計算指標 2 & 3
                 h_conv = (h_g / h_sot * 100) if h_sot > 0 else 0.0
                 h_fire = ((h_sot + h_soff) / h_da * 100) if h_da > 0 else 0.0
                 
@@ -518,7 +513,6 @@ def main():
                 
                 st.number_input("客隊控球率 (%) [自動計算]", min_value=0, max_value=100, value=a_poss, disabled=True)
                 
-                # 自動計算客隊指標 2 & 3
                 a_conv = (a_g / a_sot * 100) if a_sot > 0 else 0.0
                 a_fire = ((a_sot + a_soff) / a_da * 100) if a_da > 0 else 0.0
                 
@@ -550,7 +544,6 @@ def main():
                 safe_min = max(1, minute)
                 rem_time = max(1, 90 - minute)
                 
-                # 結合自動計算的「進攻火力 (Firepower)」與「得分率 (Conversion)」進行動態精算
                 h_atk = (h_da * (max(10.0, h_fire) / 100.0) * 0.7 + h_sot * (max(10.0, h_conv) / 100.0 + 1) * 2.0) / safe_min + (h_poss / 100 * 0.5)
                 a_atk = (a_da * (max(10.0, a_fire) / 100.0) * 0.7 + a_sot * (max(10.0, a_conv) / 100.0 + 1) * 2.0) / safe_min + (a_poss / 100 * 0.5)
                 
@@ -671,16 +664,23 @@ def main():
             for idx, row in open_bets.iterrows():
                 with st.expander(f"📌 {row['Match']} - {row['Bet_Type']} ({row['Selection']}) | 盤口: {row['Initial_Line']}"):
                     with st.form(f"settle_form_{row['ID']}"):
+                        st.markdown("##### ⚽ 全場賽果輸入 (入球與角球)")
                         col1, col2 = st.columns(2)
                         h_g = col1.number_input("全場主隊入球數", min_value=0, value=int(row.get('Home_Goal', 0)) if pd.notna(row.get('Home_Goal')) else 0)
                         a_g = col2.number_input("全場客隊入球數", min_value=0, value=int(row.get('Away_Goal', 0)) if pd.notna(row.get('Away_Goal')) else 0)
                         
+                        col3, col4 = st.columns(2)
+                        h_c = col3.number_input("全場主隊角球數", min_value=0, value=int(row.get('Home_Corner', 0)) if pd.notna(row.get('Home_Corner')) else 0)
+                        a_c = col4.number_input("全場客隊角球數", min_value=0, value=int(row.get('Away_Corner', 0)) if pd.notna(row.get('Away_Corner')) else 0)
+                        
                         if st.form_submit_button("確認賽果並結算"):
                             prof, payout, u_prof, lbl, diff = calculate_settlement(
                                 row['Bet_Type'], row['Selection'], float(row['Initial_Line']), 
-                                float(row['Initial_Odds']), float(row['Stake']), h_g, a_g, 0, 0
+                                float(row['Initial_Odds']), float(row['Stake']), h_g, a_g, h_c, a_c
                             )
-                            st.session_state.df_db.loc[idx, ['Home_Goal', 'Away_Goal', 'Result_Label', 'Profit', 'Unit_Profit', 'Payout', 'Status']] = [h_g, a_g, lbl, prof, u_prof, payout, 'Settled']
+                            st.session_state.df_db.loc[idx, ['Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner', 'Result_Label', 'Profit', 'Unit_Profit', 'Payout', 'Status']] = [
+                                h_g, a_g, h_c, a_c, lbl, prof, u_prof, payout, 'Settled'
+                            ]
                             save_db(st.session_state.df_db, db_file)
                             st.success(f"結算完成！結果：{lbl} | 單位盈虧：{u_prof:+.2f} U")
                             st.rerun()
