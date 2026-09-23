@@ -233,15 +233,11 @@ def evaluate_dimension(df_subset, dim_name, candidates_base, rating_map, h_data)
     }
 
 # ==========================================
-# 4. 資金流水 HTML 構建與預覽彈窗
+# 4. 資金流水 HTML 構建 (無縮排，防Markdown代碼化)
 # ==========================================
 def build_capital_flow_html(df_cap):
     if df_cap.empty:
-        empty_html = """
-        <div style="text-align:center; padding: 20px; color: gray;">
-            <p>目前尚無資金流水紀錄。</p>
-        </div>
-        """
+        empty_html = '<div style="text-align:center; padding: 20px; color: gray;"><p>目前尚無資金流水紀錄。</p></div>'
         return empty_html, 0.0, "0", "#888888", " (無紀錄)"
     
     rows_html = []
@@ -272,15 +268,15 @@ def build_capital_flow_html(df_cap):
             
         total_amount += signed_amt
         
-        rows_html.append(f"""
-        <tr>
-            <td style="padding: 10px; border: 1px solid #444;">{c_id}</td>
-            <td style="padding: 10px; border: 1px solid #444;">{c_date}</td>
-            <td style="padding: 10px; border: 1px solid #444;">{c_type_disp}</td>
-            <td style="padding: 10px; border: 1px solid #444; color: {color}; font-weight: bold; text-align: right; font-size: 1.05em;">{amt_formatted}</td>
-            <td style="padding: 10px; border: 1px solid #444;">{c_note}</td>
-        </tr>
-        """)
+        rows_html.append(
+            f'<tr>'
+            f'<td style="padding: 10px; border: 1px solid #444;">{c_id}</td>'
+            f'<td style="padding: 10px; border: 1px solid #444;">{c_date}</td>'
+            f'<td style="padding: 10px; border: 1px solid #444;">{c_type_disp}</td>'
+            f'<td style="padding: 10px; border: 1px solid #444; color: {color}; font-weight: bold; text-align: right; font-size: 1.05em;">{amt_formatted}</td>'
+            f'<td style="padding: 10px; border: 1px solid #444;">{c_note}</td>'
+            f'</tr>'
+        )
     
     if total_amount < 0:
         tot_color = "#ff4d4d"  # 紅色
@@ -296,33 +292,34 @@ def build_capital_flow_html(df_cap):
         tot_str = "0"
         tot_label = " (收支平衡)"
         
-    summary_row_html = f"""
-    <tr style="background-color: rgba(128, 128, 128, 0.2); font-weight: bold; border-top: 2px solid #888;">
-        <td colspan="3" style="padding: 12px; border: 1px solid #444; text-align: right; font-size: 1.05em;">金額總和 (Total Amount Sum):</td>
-        <td style="padding: 12px; border: 1px solid #444; color: {tot_color}; font-weight: bold; font-size: 1.25em; text-align: right;">{tot_str}</td>
-        <td style="padding: 12px; border: 1px solid #444; color: {tot_color}; font-weight: bold; font-size: 0.95em;">{tot_label}</td>
-    </tr>
-    """
+    summary_row_html = (
+        f'<tr style="background-color: rgba(128, 128, 128, 0.2); font-weight: bold; border-top: 2px solid #888;">'
+        f'<td colspan="3" style="padding: 12px; border: 1px solid #444; text-align: right; font-size: 1.05em;">金額總和 (Total Amount Sum):</td>'
+        f'<td style="padding: 12px; border: 1px solid #444; color: {tot_color}; font-weight: bold; font-size: 1.25em; text-align: right;">{tot_str}</td>'
+        f'<td style="padding: 12px; border: 1px solid #444; color: {tot_color}; font-weight: bold; font-size: 0.95em;">{tot_label}</td>'
+        f'</tr>'
+    )
     
-    table_html = f"""
-    <div style="width: 100%; overflow-x: auto; margin-top: 10px;">
-        <table style="width: 100%; border-collapse: collapse; font-family: system-ui, -apple-system, sans-serif; font-size: 14px;">
-            <thead>
-                <tr style="background-color: rgba(128, 128, 128, 0.3); text-align: left;">
-                    <th style="padding: 10px; border: 1px solid #444;">流水號 (ID)</th>
-                    <th style="padding: 10px; border: 1px solid #444;">日期 (Date)</th>
-                    <th style="padding: 10px; border: 1px solid #444;">類型 (Type)</th>
-                    <th style="padding: 10px; border: 1px solid #444; text-align: right;">金額 (Amount)</th>
-                    <th style="padding: 10px; border: 1px solid #444;">備註 (Note)</th>
-                </tr>
-            </thead>
-            <tbody>
-                {"".join(rows_html)}
-                {summary_row_html}
-            </tbody>
-        </table>
-    </div>
-    """
+    rows_str = "".join(rows_html)
+    table_html = (
+        f'<div style="width: 100%; overflow-x: auto; margin-top: 10px;">'
+        f'<table style="width: 100%; border-collapse: collapse; font-family: system-ui, -apple-system, sans-serif; font-size: 14px;">'
+        f'<thead>'
+        f'<tr style="background-color: rgba(128, 128, 128, 0.3); text-align: left;">'
+        f'<th style="padding: 10px; border: 1px solid #444;">流水號 (ID)</th>'
+        f'<th style="padding: 10px; border: 1px solid #444;">日期 (Date)</th>'
+        f'<th style="padding: 10px; border: 1px solid #444;">類型 (Type)</th>'
+        f'<th style="padding: 10px; border: 1px solid #444; text-align: right;">金額 (Amount)</th>'
+        f'<th style="padding: 10px; border: 1px solid #444;">備註 (Note)</th>'
+        f'</tr>'
+        f'</thead>'
+        f'<tbody>'
+        f'{rows_str}'
+        f'{summary_row_html}'
+        f'</tbody>'
+        f'</table>'
+        f'</div>'
+    )
     return table_html, total_amount, tot_str, tot_color, tot_label
 
 @st.dialog("📊 數據庫即時線上預覽", width="large")
@@ -339,9 +336,7 @@ def preview_db_dialog(df_db, df_cap):
         else:
             show_df = df_db.copy()
 
-        # ---------------------------------------------------------
         # 計算 Profit, Unit_Profit, Payout 總和並新增總計列
-        # ---------------------------------------------------------
         total_profit = pd.to_numeric(show_df['Profit'], errors='coerce').sum()
         total_unit = pd.to_numeric(show_df['Unit_Profit'], errors='coerce').sum()
         total_payout = pd.to_numeric(show_df['Payout'], errors='coerce').sum()
@@ -814,7 +809,7 @@ def main():
                         base_p_over = max(0.1, min(0.9, base_p_over))
                         candidates.extend([
                             {'bet_type': b_type, 'selection': 'Over', 'prob': base_p_over, 'odds': u_odds, 'line': line, 'label': "大盤(Over)"},
-                            {'bet_type': b_type, 'selection': 'Under', 'prob': 1-base_p_over, 'odds': l_odds, 'line': label_a if 'label_a' in locals() else "小盤(Under)"}
+                            {'bet_type': b_type, 'selection': 'Under', 'prob': 1-base_p_over, 'odds': l_odds, 'line': line, 'label': "小盤(Under)"}
                         ])
 
                 for c in candidates:
