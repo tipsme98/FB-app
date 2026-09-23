@@ -74,7 +74,7 @@ def save_db(df, filename):
     df.to_csv(filename, index=False)
 
 # ==========================================
-# 2. 資金、風控與累計算式
+# 2. 資金、風控與累計算式 (State Rebuilding Engine)
 # ==========================================
 def recalculate_bankroll_from_scratch(df_cap, df_db):
     if df_cap.empty:
@@ -87,12 +87,15 @@ def recalculate_bankroll_from_scratch(df_cap, df_db):
     
     if df_db.empty:
         total_profit = 0.0
+        open_stake = 0.0
     else:
         settled_df = df_db[df_db['Status'] == 'Settled']
+        open_df = df_db[df_db['Status'] == 'Open']
         total_profit = pd.to_numeric(settled_df['Profit'], errors='coerce').sum()
+        open_stake = pd.to_numeric(open_df['Stake'], errors='coerce').sum()
         
-    current_bankroll = net_deposit + total_profit
-    max_single_stake = net_deposit * 0.10 
+    current_bankroll = net_deposit + total_profit - open_stake
+    max_single_stake = (net_deposit + total_profit) * 0.10 
     
     return round(total_deposit, 2), round(total_withdraw, 2), round(net_deposit, 2), round(total_profit, 2), round(current_bankroll, 2), round(max_single_stake, 2)
 
@@ -114,6 +117,7 @@ def calculate_settlement(bet_type, selection, line, odds, stake, h_g, a_g, h_c=0
 
     diff = round(diff, 2)
     
+    # 5態派彩精算
     if diff >= 0.5:
         res_label = "✅ 全贏"
         profit = stake * (odds - 1)
@@ -227,8 +231,27 @@ def evaluate_dimension(df_subset, dim_name, candidates_base, rating_map, h_data)
     }
 
 # ==========================================
-# 4. 模組化組件：動態賠率與 Margin 運算 UI
+# 4. 模組化組件：動態賠率與預覽彈窗
 # ==========================================
+@st.dialog("📊 數據庫即時線上預覽", width="large")
+def preview_db_dialog(df):
+    st.write("您可以在下方表格中自由滑動、點擊欄位排序，或使用關鍵字搜尋特定賽事。")
+    search_query = st.text_input("🔍 關鍵字搜尋 (例如: 球隊名稱、盤口)", "")
+    
+    if search_query:
+        mask = df.astype(str).apply(lambda x: x.str.contains(search_query, case=False, na=False)).any(axis=1)
+        show_df = df[mask]
+    else:
+        show_df = df
+        
+    st.dataframe(show_df, use_container_width=True)
+    
+    # 匯出獨立 HTML 報表
+    html = show_df.to_html(index=False, justify='center', border=1, classes="table table-striped")
+    b64 = base64.b64encode(html.encode('utf-8')).decode()
+    href = f'<a href="data:text/html;base64,{b64}" download="football_betting_report.html" target="_blank" style="display:inline-block; margin-top:10px; text-decoration:none; padding:10px 20px; background-color:#4CAF50; color:white; border-radius:5px; font-weight:bold;">📥 點擊下載獨立 HTML 報表</a>'
+    st.markdown(href, unsafe_allow_html=True)
+
 def render_odds_section(odds_history_state, prefix="pre"):
     for i, row in enumerate(odds_history_state):
         r_id = row['id']
@@ -316,16 +339,40 @@ def main():
     
     st.sidebar.divider()
     st.sidebar.subheader("💰 系統本金與盈虧總覽")
-    st.sidebar.metric("系統淨存入本金", f"${net_dep:,.2f}")
+    st.sidebar.metric("總存入本金", f"${tot_dep:,.2f}")
+    st.sidebar.metric("總提取本金", f"${tot_wit:,.2f}")
     st.sidebar.metric("累積總盈虧 (PnL)", f"${tot_pnl:,.2f}", delta=f"${tot_pnl:,.2f}")
-    st.sidebar.metric("當前總可用資金", f"${curr_bankroll:,.2f}")
-    st.sidebar.caption(f"🛑 **單注上限 (本金 10%)**: `${max_stake:,.2f}`")
+    st.sidebar.metric("當前總可用資金 (Bankroll)", f"${curr_bankroll:,.2f}")
+    st.sidebar.caption(f"🛑 **單注上限 (動態資金 10%)**: `${max_stake:,.2f}`")
+
+    # 存入與提取本金輸入區
+    with st.sidebar.expander("💸 資金存提管理"):
+        cap_action = st.radio("動作", ["Deposit (存入本金)", "Withdraw (提取本金)"])
+        cap_amount = st.number_input("金額 ($)", min_value=1.0, value=1000.0, step=100.0)
+        cap_note = st.text_input("備註 (選填)")
+        
+        if st.button("確認寫入資金紀錄"):
+            new_cap_record = {
+                'ID': f"C{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                'Date': datetime.now().strftime('%Y-%m-%d %H:%M'),
+                'Type': 'Deposit' if 'Deposit' in cap_action else 'Withdraw',
+                'Amount': float(cap_amount),
+                'Note': cap_note
+            }
+            st.session_state.df_cap = pd.concat([st.session_state.df_cap, pd.DataFrame([new_cap_record])], ignore_index=True)
+            save_db(st.session_state.df_cap, capital_file)
+            st.toast("✅ 資金紀錄寫入成功！系統本金已自動重構。", icon="💰")
+            st.rerun()
+
+    st.sidebar.divider()
+    if st.sidebar.button("🔍 數據庫即時線上預覽", use_container_width=True):
+        preview_db_dialog(st.session_state.df_db)
 
     t_pre, t_inplay, t_settle, t_ai = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖️ 賽果結算與管理", "🤖 全局模型"])
 
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
-        if net_dep <= 0: st.warning("⚠️ 目前系統內部尚無存入本金！無法精確計算注碼。")
+        if curr_bankroll <= 0: st.warning("⚠️ 目前系統可用資金不足！無法精確計算建議注碼。請先至側邊欄存入本金。")
         
         opts_tournaments = ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Tournament_Name'].dropna().unique())))
         opts_teams = ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Home_Team'].dropna().tolist() + st.session_state.df_db['Away_Team'].dropna().tolist())))
@@ -360,7 +407,7 @@ def main():
         home_form = f"{f1.number_input('主勝',0,10,3)}W{f2.number_input('主和',0,10,1)}D{f3.number_input('主敗',0,10,1)}L"
         away_form = f"{f4.number_input('客勝',0,10,2)}W{f5.number_input('客和',0,10,2)}D{f6.number_input('客敗',0,10,1)}L"
 
-        st.markdown("##### 3. 賽前盤口與賠率走勢紀錄")
+        st.markdown("##### 3. 賽前盤口與賠率走勢紀錄 (JSON結構儲存)")
         if 'odds_history' not in st.session_state:
             st.session_state.odds_history = [{"id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}]
         render_odds_section(st.session_state.odds_history, "pre")
@@ -398,6 +445,7 @@ def main():
             df_meso = df_settled[df_settled['Tournament_Category'] == tournament_category]
             df_macro = df_settled
             
+            # 4 大核心維度運算
             res_micro = evaluate_dimension(df_micro, "微觀 - 賽事名稱", candidates_base, rating_map, h_data)
             res_meso = evaluate_dimension(df_meso, "中觀 - 賽事分類", candidates_base, rating_map, h_data)
             res_macro = evaluate_dimension(df_macro, "宏觀 - 總數據", candidates_base, rating_map, h_data)
@@ -737,6 +785,33 @@ def main():
                             save_db(st.session_state.df_db, db_file)
                             st.success(f"結算完成！結果：{lbl} | 單位盈虧：{u_prof:+.2f} U")
                             st.rerun()
+                            
+        st.markdown("---")
+        # 撤銷已結算紀錄 (Rollback Settlement) 專區
+        st.subheader("⚠️ 撤銷與回滾中心 (Settlement Rollback)")
+        st.info("若發生結算錯誤，您可在此刪除錯誤的結算紀錄。系統會自動從初始本金開始，重新扣除待結算注碼並加上所有歷史真實結算盈虧，為您重構出絕對精準的「當前總可用資金 (Bankroll)」。絕不使用逆向加減法！")
+        
+        settled_bets = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].tail(5)
+        
+        if not settled_bets.empty:
+            rollback_options = []
+            for _, r in settled_bets.iterrows():
+                rollback_options.append(f"{r['ID']} | [{r['Date']}] {r['Match']} | 結算狀態: {r['Result_Label']} | 盈虧: ${r['Profit']}")
+                
+            sel_rollback = st.selectbox("請選擇要刪除並回滾的最近結算紀錄：", rollback_options)
+            
+            if st.button("🗑️ 刪除並回滾所選的結算紀錄", type="primary"):
+                rollback_id = sel_rollback.split(" | ")[0]
+                
+                # 步驟一（資料拔除）：從 DataFrame 中徹底刪除該行資料
+                st.session_state.df_db = st.session_state.df_db[st.session_state.df_db['ID'] != rollback_id].reset_index(drop=True)
+                save_db(st.session_state.df_db, db_file)
+                
+                # 步驟二（狀態重置與本金重構）：系統會在下次 rerun 時，在頂端自動呼叫 recalculate_bankroll_from_scratch()，完成本金重構。
+                st.success("✅ 已成功移除錯誤紀錄，本金已透過資料庫全局重構完成回滾！")
+                st.rerun()
+        else:
+            st.write("目前沒有可供撤銷的已結算紀錄。")
 
     with t_ai:
         st.header("🤖 全局預測模型監控")
