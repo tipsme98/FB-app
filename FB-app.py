@@ -251,7 +251,10 @@ def render_odds_section(odds_history_state, prefix="pre"):
         c1, c2, c3, c4, c5, c6 = st.columns([2, 1.5, 1.5, 2, 1.5, 1])
         type_idx = ["讓球", "入球大小", "角球大小"].index(row['type']) if row['type'] in ["讓球", "入球大小", "角球大小"] else 0
         row['type'] = c1.selectbox(f"盤口類型 {i+1}", ["讓球", "入球大小", "角球大小"], key=type_key, index=type_idx)
-        row['line'] = c2.number_input("盤口線", step=0.25, value=float(row['line']), key=line_key)
+        
+        # 根據盤口類型設定動態 step
+        line_step = 1.0 if row['type'] == "角球大小" else 0.25
+        row['line'] = c2.number_input("盤口線", step=line_step, value=float(row['line']), key=line_key)
         
         up_lbl, low_lbl = ("主隊", "客隊") if row['type'] == "讓球" else ("大盤(Over)", "小盤(Under)")
         row['upper'] = c3.number_input(f"{up_lbl} 賠率", min_value=1.01, value=float(row['upper']), step=0.01, key=up_key)
