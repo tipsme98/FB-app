@@ -16,11 +16,10 @@ except ImportError:
     np = None
 
 # ==========================================
-# 1. 初始化設定與資料庫 Schema (結構同步升級)
+# 1. 初始化設定與資料庫 Schema
 # ==========================================
 st.set_page_config(page_title="足球博彩精算與資金管理系統", page_icon="⚽", layout="wide")
 
-# 更新 Schema: 加入 Tournament_Name 與 Tournament_Category
 DB_COLUMNS = [
     'ID', 'Date', 'Status', 
     'Tournament_Name', 'Tournament_Category', 'Match', 'Home_Team', 'Away_Team', 
@@ -39,7 +38,6 @@ def load_db(filename, columns):
     if os.path.exists(filename):
         try:
             df = pd.read_csv(filename)
-            # 歷史數據相容性處理：將舊有的 League 轉移至 Tournament_Name
             if 'League' in df.columns and 'Tournament_Name' not in df.columns:
                 df['Tournament_Name'] = df['League']
                 df['Tournament_Category'] = CATEGORY_OPTIONS[0]
@@ -47,7 +45,7 @@ def load_db(filename, columns):
             for col in columns:
                 if col not in df.columns: 
                     df[col] = pd.Series(dtype='object')
-            return df[columns] # 確保欄位順序一致
+            return df[columns]
         except Exception:
             return pd.DataFrame(columns=columns)
     else:
@@ -138,7 +136,7 @@ def display_cumulative_metrics(df):
     st.divider()
 
 # ==========================================
-# 3. 三維度 ML 與 EV 分析引擎 (Tri-Level ML Analytics)
+# 3. 三維度 ML 與 EV 分析引擎
 # ==========================================
 def extract_form_points(form_str):
     try:
@@ -187,20 +185,17 @@ def evaluate_dimension(df_subset, dim_name, candidates_base, rating_map, h_data)
                 
                 for c in candidates:
                     x_input = np.array([[h_data['hr'], h_data['ar'], h_data['hf'], h_data['af'], c['line'], c['odds']]])
-                    prob = clf.predict_proba(x_input)[0][1] # Probability of winning
-                    # Blend base heuristic with ML to prevent extreme overconfidence
+                    prob = clf.predict_proba(x_input)[0][1]
                     c['prob'] = (c['base_prob'] * 0.4) + (prob * 0.6)
                 model_success = True
             except Exception:
                 pass
 
     if not model_success:
-        # Fallback to heuristic adjustments if ML fails or is unavailable
         for c in candidates:
             shift = (acc - 0.5) * 0.2 + (roi * 0.1)
             c['prob'] = max(0.05, min(0.95, c['base_prob'] + shift))
 
-    # Calculate final EV
     for c in candidates:
         c['ev'] = c['prob'] * (c['odds'] - 1) - (1 - c['prob'])
 
@@ -221,6 +216,7 @@ def render_odds_section(odds_history_state, prefix="pre"):
         up_key, type_key, unlock_key = f"{prefix}_up_{r_id}", f"{prefix}_t_{r_id}", f"{prefix}_u_{r_id}"
         margin_key, low_key, line_key = f"{prefix}_m_{r_id}", f"{prefix}_low_{r_id}", f"{prefix}_l_{r_id}"
 
+        # 優先處理型態切換的數值初始化
         if type_key in st.session_state:
             old_type, new_type = row['type'], st.session_state[type_key]
             if old_type != new_type:
@@ -236,6 +232,7 @@ def render_odds_section(odds_history_state, prefix="pre"):
         if margin_key in st.session_state: row['margin'] = st.session_state[margin_key]
         if low_key in st.session_state and row['unlock']: row['lower'] = st.session_state[low_key]
 
+        # Margin 運算核心：並將結果強制寫回 session_state 確保 UI 即時變更
         if not row['unlock']:
             m_val, u_val = float(row.get('margin', 1.085)), float(row.get('upper', 1.90))
             try:
@@ -243,11 +240,13 @@ def render_odds_section(odds_history_state, prefix="pre"):
                 row['lower'] = calc_lower if calc_lower > 1 else 1.01
             except:
                 row['lower'] = 1.90
+            st.session_state[low_key] = float(row['lower']) # 強制覆蓋對盤口的舊有狀態
         else:
             try:
                 row['margin'] = (1 / float(row.get('upper', 1.90))) + (1 / float(row.get('lower', 1.90)))
             except:
                 row['margin'] = 1.085
+            st.session_state[margin_key] = float(row['margin']) # 強制覆蓋 margin 的舊有狀態
 
         c1, c2, c3, c4, c5, c6 = st.columns([2, 1.5, 1.5, 2, 1.5, 1])
         type_idx = ["讓球", "入球大小", "角球大小"].index(row['type']) if row['type'] in ["讓球", "入球大小", "角球大小"] else 0
@@ -260,7 +259,7 @@ def render_odds_section(odds_history_state, prefix="pre"):
         
         if not row['unlock']:
             row['margin'] = c4.number_input("抽水(Margin)", min_value=1.00, value=float(row.get('margin', 1.085)), step=0.005, format="%.3f", key=margin_key)
-            c5.number_input(f"{low_lbl} 賠率", value=float(row['lower']), disabled=True, key=low_key)
+            row['lower'] = c5.number_input(f"{low_lbl} 賠率", value=float(row['lower']), disabled=True, key=low_key)
         else:
             row['lower'] = c5.number_input(f"{low_lbl} 賠率", min_value=1.01, step=0.01, value=float(row['lower']), key=low_key)
             c4.caption(f"隱含抽水: **{row['margin']:.3f}**")
@@ -309,7 +308,6 @@ def main():
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
         if net_dep <= 0: st.warning("⚠️ 目前系統內部尚無存入本金！無法精確計算注碼。")
         
-        # --- UI 欄位重構與自動記憶機制 (Auto-Memorization UI) ---
         opts_tournaments = ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Tournament_Name'].dropna().unique())))
         opts_teams = ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Home_Team'].dropna().tolist() + st.session_state.df_db['Away_Team'].dropna().tolist())))
         
@@ -318,7 +316,6 @@ def main():
         sel_tournament = col_t.selectbox("賽事名稱 (Tournament Name)", opts_tournaments)
         tournament_name = col_t.text_input("輸入新賽事名稱") if sel_tournament == "➕ 新增手動輸入..." else sel_tournament
         
-        # 尋找歷史紀錄中的賽事分類，實現自動回填
         default_cat_idx = 0
         if sel_tournament != "➕ 新增手動輸入...":
             match_rows = st.session_state.df_db[st.session_state.df_db['Tournament_Name'] == tournament_name]
@@ -351,7 +348,6 @@ def main():
         
         st.markdown("---")
         
-        # --- 三維度機器學習與數據分析引擎 ---
         if st.button("🚀 賽前數據分析執行", type="primary", use_container_width=True):
             st.session_state.show_analysis = True
             df_settled = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
@@ -360,7 +356,6 @@ def main():
             hr_val = rating_map.get(home_rating, 3)
             ar_val = rating_map.get(away_rating, 3)
             
-            # 建立基礎候選清單 (Heuristic Probabilities)
             candidates_base = []
             for r in st.session_state.odds_history:
                 b_type, line_val = r['type'], float(r['line'])
@@ -380,7 +375,6 @@ def main():
 
             h_data = {'hr': hr_val, 'ar': ar_val, 'hf': extract_form_points(home_form), 'af': extract_form_points(away_form)}
             
-            # 切割三個維度
             df_micro = df_settled[df_settled['Tournament_Name'] == tournament_name]
             df_meso = df_settled[df_settled['Tournament_Category'] == tournament_category]
             df_macro = df_settled
@@ -389,7 +383,6 @@ def main():
             res_meso = evaluate_dimension(df_meso, "中觀 - 賽事分類", candidates_base, rating_map, h_data)
             res_macro = evaluate_dimension(df_macro, "宏觀 - 總數據", candidates_base, rating_map, h_data)
             
-            # 挑選最佳模型
             valid_res = [r for r in [res_micro, res_meso, res_macro] if r['valid']]
             best_model = max(valid_res, key=lambda x: x['score']) if valid_res else res_macro
             if not valid_res: best_model['msg'] = "所有維度樣本數不足，降級為純基礎期望值運算。"
@@ -410,7 +403,6 @@ def main():
             res = st.session_state.analysis_result
             st.success("✅ 三維度數據分析與 EV 運算完成！")
             
-            # 展示三維度報告
             c1, c2, c3 = st.columns(3)
             for col, r, title in zip([c1, c2, c3], [res['micro'], res['meso'], res['macro']], ["A. 微觀 (賽事名稱)", "B. 中觀 (賽事分類)", "C. 宏觀 (全局數據)"]):
                 with col.container(border=True):
