@@ -521,15 +521,27 @@ def main():
 
             if st.button("🔄 僅保存賽事實時數據與分析指標", use_container_width=True):
                 match_mask = st.session_state.df_db['Match'] == selected_match_name
-                st.session_state.df_db.loc[match_mask, [
-                    'InPlay_Minute', 'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner', 
-                    'Home_DA', 'Away_DA', 'Home_SoT', 'Away_SoT', 'Home_SoFF', 'Away_SoFF', 
-                    'Home_Red', 'Away_Red', 'Home_Sub', 'Away_Sub', 'Home_Possession', 'Away_Possession',
-                    'Home_Goal_Conversion', 'Away_Goal_Conversion', 'Home_Firepower', 'Away_Firepower'
-                ]] = [
-                    minute, h_g, a_g, h_c, a_c, h_da, a_da, h_sot, a_sot, h_soff, a_soff, 
-                    h_red, a_red, h_sub, a_sub, h_poss, a_poss, h_conv, a_conv, h_fire, a_fire
-                ]
+                st.session_state.df_db.loc[match_mask, 'InPlay_Minute'] = minute
+                st.session_state.df_db.loc[match_mask, 'Home_Goal'] = h_g
+                st.session_state.df_db.loc[match_mask, 'Away_Goal'] = a_g
+                st.session_state.df_db.loc[match_mask, 'Home_Corner'] = h_c
+                st.session_state.df_db.loc[match_mask, 'Away_Corner'] = a_c
+                st.session_state.df_db.loc[match_mask, 'Home_DA'] = h_da
+                st.session_state.df_db.loc[match_mask, 'Away_DA'] = a_da
+                st.session_state.df_db.loc[match_mask, 'Home_SoT'] = h_sot
+                st.session_state.df_db.loc[match_mask, 'Away_SoT'] = a_sot
+                st.session_state.df_db.loc[match_mask, 'Home_SoFF'] = h_soff
+                st.session_state.df_db.loc[match_mask, 'Away_SoFF'] = a_soff
+                st.session_state.df_db.loc[match_mask, 'Home_Red'] = h_red
+                st.session_state.df_db.loc[match_mask, 'Away_Red'] = a_red
+                st.session_state.df_db.loc[match_mask, 'Home_Sub'] = h_sub
+                st.session_state.df_db.loc[match_mask, 'Away_Sub'] = a_sub
+                st.session_state.df_db.loc[match_mask, 'Home_Possession'] = h_poss
+                st.session_state.df_db.loc[match_mask, 'Away_Possession'] = a_poss
+                st.session_state.df_db.loc[match_mask, 'Home_Goal_Conversion'] = h_conv
+                st.session_state.df_db.loc[match_mask, 'Away_Goal_Conversion'] = a_conv
+                st.session_state.df_db.loc[match_mask, 'Home_Firepower'] = h_fire
+                st.session_state.df_db.loc[match_mask, 'Away_Firepower'] = a_fire
                 save_db(st.session_state.df_db, db_file)
                 st.success("✅ 實時數據與自動計算指標儲存成功！")
                 st.rerun()
@@ -637,15 +649,27 @@ def main():
                             })
                             
                             match_mask = st.session_state.df_db['Match'] == match_info['Match']
-                            st.session_state.df_db.loc[match_mask, [
-                                'InPlay_Minute', 'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner', 
-                                'Home_DA', 'Away_DA', 'Home_SoT', 'Away_SoT', 'Home_SoFF', 'Away_SoFF', 
-                                'Home_Red', 'Away_Red', 'Home_Sub', 'Away_Sub', 'Home_Possession', 'Away_Possession',
-                                'Home_Goal_Conversion', 'Away_Goal_Conversion', 'Home_Firepower', 'Away_Firepower'
-                            ]] = [
-                                minute, h_g, a_g, h_c, a_c, h_da, a_da, h_sot, a_sot, h_soff, a_soff, 
-                                h_red, a_red, h_sub, a_sub, h_poss, a_poss, h_conv, a_conv, h_fire, a_fire
-                            ]
+                            st.session_state.df_db.loc[match_mask, 'InPlay_Minute'] = minute
+                            st.session_state.df_db.loc[match_mask, 'Home_Goal'] = h_g
+                            st.session_state.df_db.loc[match_mask, 'Away_Goal'] = a_g
+                            st.session_state.df_db.loc[match_mask, 'Home_Corner'] = h_c
+                            st.session_state.df_db.loc[match_mask, 'Away_Corner'] = a_c
+                            st.session_state.df_db.loc[match_mask, 'Home_DA'] = h_da
+                            st.session_state.df_db.loc[match_mask, 'Away_DA'] = a_da
+                            st.session_state.df_db.loc[match_mask, 'Home_SoT'] = h_sot
+                            st.session_state.df_db.loc[match_mask, 'Away_SoT'] = a_sot
+                            st.session_state.df_db.loc[match_mask, 'Home_SoFF'] = h_soff
+                            st.session_state.df_db.loc[match_mask, 'Away_SoFF'] = a_soff
+                            st.session_state.df_db.loc[match_mask, 'Home_Red'] = h_red
+                            st.session_state.df_db.loc[match_mask, 'Away_Red'] = a_red
+                            st.session_state.df_db.loc[match_mask, 'Home_Sub'] = h_sub
+                            st.session_state.df_db.loc[match_mask, 'Away_Sub'] = a_sub
+                            st.session_state.df_db.loc[match_mask, 'Home_Possession'] = h_poss
+                            st.session_state.df_db.loc[match_mask, 'Away_Possession'] = a_poss
+                            st.session_state.df_db.loc[match_mask, 'Home_Goal_Conversion'] = h_conv
+                            st.session_state.df_db.loc[match_mask, 'Away_Goal_Conversion'] = a_conv
+                            st.session_state.df_db.loc[match_mask, 'Home_Firepower'] = h_fire
+                            st.session_state.df_db.loc[match_mask, 'Away_Firepower'] = a_fire
 
                             st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame([new_record])], ignore_index=True)
                             save_db(st.session_state.df_db, db_file)
@@ -666,21 +690,29 @@ def main():
                     with st.form(f"settle_form_{row['ID']}"):
                         st.markdown("##### ⚽ 全場賽果輸入 (入球與角球)")
                         col1, col2 = st.columns(2)
-                        h_g = col1.number_input("全場主隊入球數", min_value=0, value=int(row.get('Home_Goal', 0)) if pd.notna(row.get('Home_Goal')) else 0)
-                        a_g = col2.number_input("全場客隊入球數", min_value=0, value=int(row.get('Away_Goal', 0)) if pd.notna(row.get('Away_Goal')) else 0)
+                        h_g = col1.number_input("全場主隊入球數", min_value=0, value=int(row.get('Home_Goal', 0)) if pd.notna(row.get('Home_Goal')) else 0, key=f"hg_{row['ID']}")
+                        a_g = col2.number_input("全場客隊入球數", min_value=0, value=int(row.get('Away_Goal', 0)) if pd.notna(row.get('Away_Goal')) else 0, key=f"ag_{row['ID']}")
                         
                         col3, col4 = st.columns(2)
-                        h_c = col3.number_input("全場主隊角球數", min_value=0, value=int(row.get('Home_Corner', 0)) if pd.notna(row.get('Home_Corner')) else 0)
-                        a_c = col4.number_input("全場客隊角球數", min_value=0, value=int(row.get('Away_Corner', 0)) if pd.notna(row.get('Away_Corner')) else 0)
+                        h_c = col3.number_input("全場主隊角球數", min_value=0, value=int(row.get('Home_Corner', 0)) if pd.notna(row.get('Home_Corner')) else 0, key=f"hc_{row['ID']}")
+                        a_c = col4.number_input("全場客隊角球數", min_value=0, value=int(row.get('Away_Corner', 0)) if pd.notna(row.get('Away_Corner')) else 0, key=f"ac_{row['ID']}")
                         
                         if st.form_submit_button("確認賽果並結算"):
                             prof, payout, u_prof, lbl, diff = calculate_settlement(
                                 row['Bet_Type'], row['Selection'], float(row['Initial_Line']), 
                                 float(row['Initial_Odds']), float(row['Stake']), h_g, a_g, h_c, a_c
                             )
-                            st.session_state.df_db.loc[idx, ['Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner', 'Result_Label', 'Profit', 'Unit_Profit', 'Payout', 'Status']] = [
-                                h_g, a_g, h_c, a_c, lbl, prof, u_prof, payout, 'Settled'
-                            ]
+                            # 單欄位獨立賦值，防止 Pandas LossySetitemError
+                            st.session_state.df_db.loc[idx, 'Home_Goal'] = h_g
+                            st.session_state.df_db.loc[idx, 'Away_Goal'] = a_g
+                            st.session_state.df_db.loc[idx, 'Home_Corner'] = h_c
+                            st.session_state.df_db.loc[idx, 'Away_Corner'] = a_c
+                            st.session_state.df_db.loc[idx, 'Result_Label'] = lbl
+                            st.session_state.df_db.loc[idx, 'Profit'] = prof
+                            st.session_state.df_db.loc[idx, 'Unit_Profit'] = u_prof
+                            st.session_state.df_db.loc[idx, 'Payout'] = payout
+                            st.session_state.df_db.loc[idx, 'Status'] = 'Settled'
+                            
                             save_db(st.session_state.df_db, db_file)
                             st.success(f"結算完成！結果：{lbl} | 單位盈虧：{u_prof:+.2f} U")
                             st.rerun()
