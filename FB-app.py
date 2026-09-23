@@ -36,6 +36,11 @@ CAPITAL_COLUMNS = ['ID', 'Date', 'Type', 'Amount', 'Note']
 CATEGORY_OPTIONS = ["國內聯賽 (Domestic League)", "國際聯賽 (International League)", "國際盃賽 (Cup)", "國內盃賽 (Domestic Cup)", "友誼賽 (Friendly)"]
 
 def load_db(filename, columns):
+    string_cols = [
+        'ID', 'Date', 'Status', 'Tournament_Name', 'Tournament_Category', 
+        'Match', 'Home_Team', 'Away_Team', 'Home_Rating', 'Away_Rating', 
+        'Home_Form', 'Away_Form', 'Bet_Type', 'Selection', 'Odds_History', 'Result_Label'
+    ]
     if os.path.exists(filename):
         try:
             df = pd.read_csv(filename)
@@ -46,11 +51,24 @@ def load_db(filename, columns):
             for col in columns:
                 if col not in df.columns: 
                     df[col] = pd.Series(dtype='object')
+            
+            for col in string_cols:
+                if col in df.columns:
+                    df[col] = df[col].astype('object')
+                    
             return df[columns]
         except Exception:
-            return pd.DataFrame(columns=columns)
+            df = pd.DataFrame(columns=columns)
+            for col in string_cols:
+                if col in df.columns:
+                    df[col] = df[col].astype('object')
+            return df
     else:
-        return pd.DataFrame(columns=columns)
+        df = pd.DataFrame(columns=columns)
+        for col in string_cols:
+            if col in df.columns:
+                df[col] = df[col].astype('object')
+        return df
 
 def save_db(df, filename):
     df.to_csv(filename, index=False)
@@ -702,15 +720,18 @@ def main():
                                 row['Bet_Type'], row['Selection'], float(row['Initial_Line']), 
                                 float(row['Initial_Odds']), float(row['Stake']), h_g, a_g, h_c, a_c
                             )
-                            # 單欄位獨立賦值，防止 Pandas LossySetitemError
+                            # 確保 Result_Label 等欄位型態正確並單欄位賦值
+                            st.session_state.df_db['Result_Label'] = st.session_state.df_db['Result_Label'].astype('object')
+                            st.session_state.df_db['Status'] = st.session_state.df_db['Status'].astype('object')
+                            
                             st.session_state.df_db.loc[idx, 'Home_Goal'] = h_g
                             st.session_state.df_db.loc[idx, 'Away_Goal'] = a_g
                             st.session_state.df_db.loc[idx, 'Home_Corner'] = h_c
                             st.session_state.df_db.loc[idx, 'Away_Corner'] = a_c
-                            st.session_state.df_db.loc[idx, 'Result_Label'] = lbl
-                            st.session_state.df_db.loc[idx, 'Profit'] = prof
-                            st.session_state.df_db.loc[idx, 'Unit_Profit'] = u_prof
-                            st.session_state.df_db.loc[idx, 'Payout'] = payout
+                            st.session_state.df_db.loc[idx, 'Result_Label'] = str(lbl)
+                            st.session_state.df_db.loc[idx, 'Profit'] = float(prof)
+                            st.session_state.df_db.loc[idx, 'Unit_Profit'] = float(u_prof)
+                            st.session_state.df_db.loc[idx, 'Payout'] = float(payout)
                             st.session_state.df_db.loc[idx, 'Status'] = 'Settled'
                             
                             save_db(st.session_state.df_db, db_file)
