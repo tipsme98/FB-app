@@ -28,6 +28,7 @@ DB_COLUMNS = [
     'InPlay_Minute', 'Home_DA', 'Away_DA', 'Home_SoT', 'Away_SoT', 'Home_SoFF', 'Away_SoFF',
     'Home_Red', 'Away_Red', 'Home_Sub', 'Away_Sub', 'Home_Possession', 'Away_Possession',
     'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner', 
+    'Home_Goal_Conversion', 'Away_Goal_Conversion', 'Home_Firepower', 'Away_Firepower',
     'Result_Label', 'Profit', 'Unit_Profit', 'Payout'
 ]
 LOG_COLUMNS = ['ID', 'Date', 'Match', 'Analysis_Content', 'Confidence_Level']
@@ -240,19 +241,19 @@ def render_odds_section(odds_history_state, prefix="pre"):
                 row['lower'] = calc_lower if calc_lower > 1 else 1.01
             except:
                 row['lower'] = 1.90
-            st.session_state[low_key] = float(row['lower']) # 強制覆蓋對盤口的舊有狀態
+            st.session_state[low_key] = float(row['lower'])
         else:
             try:
                 row['margin'] = (1 / float(row.get('upper', 1.90))) + (1 / float(row.get('lower', 1.90)))
             except:
                 row['margin'] = 1.085
-            st.session_state[margin_key] = float(row['margin']) # 強制覆蓋 margin 的舊有狀態
+            st.session_state[margin_key] = float(row['margin'])
 
         c1, c2, c3, c4, c5, c6 = st.columns([2, 1.5, 1.5, 2, 1.5, 1])
         type_idx = ["讓球", "入球大小", "角球大小"].index(row['type']) if row['type'] in ["讓球", "入球大小", "角球大小"] else 0
         row['type'] = c1.selectbox(f"盤口類型 {i+1}", ["讓球", "入球大小", "角球大小"], key=type_key, index=type_idx)
         
-        # 根據盤口類型設定動態 step
+        # 角球大小盤口線 +/- 1.0，其他 0.25
         line_step = 1.0 if row['type'] == "角球大小" else 0.25
         row['line'] = c2.number_input("盤口線", step=line_step, value=float(row['line']), key=line_key)
         
@@ -458,9 +459,8 @@ def main():
                     st.rerun()
 
     with t_inplay:
-        st.subheader("⏱️ 即場賽事實時更新與動態預測")
+        st.subheader("⏱️ 即場賽事實時更新與智慧火力分析")
         
-        # 初始化即場盤口狀態
         if 'inplay_odds_history' not in st.session_state:
             st.session_state.inplay_odds_history = [
                 {"id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085},
@@ -472,7 +472,6 @@ def main():
         if pending_df.empty:
             st.info("目前沒有待結算的進行中賽事 (Status='Open')。請先於「📝 賽前建檔」建立賽事。")
         else:
-            # 獲取獨立的賽事列表以防重複
             unique_matches = pending_df.drop_duplicates(subset=['Match']).reset_index(drop=True)
             selected_match_name = st.selectbox("📌 請選擇正在進行中的賽事", unique_matches['Match'])
             row = pending_df[pending_df['Match'] == selected_match_name].iloc[0]
@@ -482,7 +481,7 @@ def main():
                 if pd.isna(val) or val == "": return default
                 return int(float(val))
 
-            st.markdown("##### 1. 實時數據輸入 (實時同步修改)")
+            st.markdown("##### 1. 實時數據輸入與自動效率計算")
             minute = st.number_input("比賽進行時間 (分鐘)", min_value=0, max_value=120, value=get_val(row, 'InPlay_Minute', 45))
             
             c1, c2 = st.columns(2)
@@ -495,7 +494,17 @@ def main():
                 h_soff = st.number_input("主隊射偏 (SoFF)", min_value=0, value=get_val(row, 'Home_SoFF'))
                 h_red = st.number_input("主隊紅牌", min_value=0, value=get_val(row, 'Home_Red'))
                 h_sub = st.number_input("主隊換人", min_value=0, value=get_val(row, 'Home_Sub'))
+                
+                # 控球率聯動：輸入主隊，自動計算客隊
                 h_poss = st.number_input("主隊控球率 (%)", min_value=0, max_value=100, value=get_val(row, 'Home_Possession', 50))
+                a_poss = max(0, 100 - h_poss)
+                
+                # 自動計算指標 2 & 3
+                h_conv = (h_g / h_sot * 100) if h_sot > 0 else 0.0
+                h_fire = ((h_sot + h_soff) / h_da * 100) if h_da > 0 else 0.0
+                
+                st.markdown(f"> 🎯 **主隊得分率**: `{h_conv:.1f}%` ({h_g}進球 / {h_sot}射正)")
+                st.markdown(f"> ⚡ **主隊進攻火力**: `{h_fire:.1f}%` ({h_sot+h_soff}射門 / {h_da}危險進攻)")
                 
             with c2:
                 st.markdown("##### ✈️ 客隊實時數據")
@@ -506,33 +515,44 @@ def main():
                 a_soff = st.number_input("客隊射偏 (SoFF)", min_value=0, value=get_val(row, 'Away_SoFF'))
                 a_red = st.number_input("客隊紅牌", min_value=0, value=get_val(row, 'Away_Red'))
                 a_sub = st.number_input("客隊換人", min_value=0, value=get_val(row, 'Away_Sub'))
-                a_poss = st.number_input("客隊控球率 (%)", min_value=0, max_value=100, value=get_val(row, 'Away_Possession', 50))
+                
+                st.number_input("客隊控球率 (%) [自動計算]", min_value=0, max_value=100, value=a_poss, disabled=True)
+                
+                # 自動計算客隊指標 2 & 3
+                a_conv = (a_g / a_sot * 100) if a_sot > 0 else 0.0
+                a_fire = ((a_sot + a_soff) / a_da * 100) if a_da > 0 else 0.0
+                
+                st.markdown(f"> 🎯 **客隊得分率**: `{a_conv:.1f}%` ({a_g}進球 / {a_sot}射正)")
+                st.markdown(f"> ⚡ **客隊進攻火力**: `{a_fire:.1f}%` ({a_sot+a_soff}射門 / {a_da}危險進攻)")
 
-            if st.button("🔄 僅保存賽事實時數據 (不投注)", use_container_width=True):
+            if st.button("🔄 僅保存賽事實時數據與分析指標", use_container_width=True):
                 match_mask = st.session_state.df_db['Match'] == selected_match_name
                 st.session_state.df_db.loc[match_mask, [
                     'InPlay_Minute', 'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner', 
                     'Home_DA', 'Away_DA', 'Home_SoT', 'Away_SoT', 'Home_SoFF', 'Away_SoFF', 
-                    'Home_Red', 'Away_Red', 'Home_Sub', 'Away_Sub', 'Home_Possession', 'Away_Possession'
-                ]] = [minute, h_g, a_g, h_c, a_c, h_da, a_da, h_sot, a_sot, h_soff, a_soff, h_red, a_red, h_sub, a_sub, h_poss, a_poss]
+                    'Home_Red', 'Away_Red', 'Home_Sub', 'Away_Sub', 'Home_Possession', 'Away_Possession',
+                    'Home_Goal_Conversion', 'Away_Goal_Conversion', 'Home_Firepower', 'Away_Firepower'
+                ]] = [
+                    minute, h_g, a_g, h_c, a_c, h_da, a_da, h_sot, a_sot, h_soff, a_soff, 
+                    h_red, a_red, h_sub, a_sub, h_poss, a_poss, h_conv, a_conv, h_fire, a_fire
+                ]
                 save_db(st.session_state.df_db, db_file)
-                st.success("✅ 實時數據更新成功！")
+                st.success("✅ 實時數據與自動計算指標儲存成功！")
                 st.rerun()
 
             st.divider()
             st.markdown("##### 2. 即場盤口與賠率計算 (手動/自動抽水)")
             render_odds_section(st.session_state.inplay_odds_history, "inplay")
 
-            if st.button("🚀 即場攻防分析與 EV 智能推薦", type="primary", use_container_width=True):
+            if st.button("🚀 結合火力與剩餘時間計算 EV 智能推薦", type="primary", use_container_width=True):
                 st.session_state.show_inplay_analysis = True
                 
-                # 基於時間與攻勢的啟發式即場分析
                 safe_min = max(1, minute)
                 rem_time = max(1, 90 - minute)
                 
-                # 計算單位時間攻勢危險度
-                h_atk = (h_da * 0.5 + h_sot * 2 + h_soff * 1) / safe_min + (h_poss / 100 * 0.5)
-                a_atk = (a_da * 0.5 + a_sot * 2 + a_soff * 1) / safe_min + (a_poss / 100 * 0.5)
+                # 結合自動計算的「進攻火力 (Firepower)」與「得分率 (Conversion)」進行動態精算
+                h_atk = (h_da * (max(10.0, h_fire) / 100.0) * 0.7 + h_sot * (max(10.0, h_conv) / 100.0 + 1) * 2.0) / safe_min + (h_poss / 100 * 0.5)
+                a_atk = (a_da * (max(10.0, a_fire) / 100.0) * 0.7 + a_sot * (max(10.0, a_conv) / 100.0 + 1) * 2.0) / safe_min + (a_poss / 100 * 0.5)
                 
                 candidates = []
                 for r in st.session_state.inplay_odds_history:
@@ -548,23 +568,22 @@ def main():
                             {'bet_type': b_type, 'selection': 'Away', 'prob': 1-base_p, 'odds': l_odds, 'line': line, 'label': lbl_a}
                         ])
                     elif b_type == "入球大小":
-                        intensity = h_atk + a_atk
-                        base_p_over = 0.5 + (intensity - 1.0) * 0.2
+                        intensity = (h_atk + a_atk) * (rem_time / 90.0 + 0.5)
+                        base_p_over = 0.5 + (intensity - 1.2) * 0.25
                         base_p_over = max(0.1, min(0.9, base_p_over))
                         candidates.extend([
                             {'bet_type': b_type, 'selection': 'Over', 'prob': base_p_over, 'odds': u_odds, 'line': line, 'label': "大盤(Over)"},
                             {'bet_type': b_type, 'selection': 'Under', 'prob': 1-base_p_over, 'odds': l_odds, 'line': line, 'label': "小盤(Under)"}
                         ])
                     elif b_type == "角球大小":
-                        intensity_c = (h_da + a_da) / safe_min 
-                        base_p_over = 0.5 + (intensity_c - 0.8) * 0.25
+                        corner_intensity = ((h_da + a_da) / safe_min) * ((h_fire + a_fire) / 200.0 + 0.5)
+                        base_p_over = 0.5 + (corner_intensity - 0.9) * 0.3
                         base_p_over = max(0.1, min(0.9, base_p_over))
                         candidates.extend([
                             {'bet_type': b_type, 'selection': 'Over', 'prob': base_p_over, 'odds': u_odds, 'line': line, 'label': "大盤(Over)"},
                             {'bet_type': b_type, 'selection': 'Under', 'prob': 1-base_p_over, 'odds': l_odds, 'line': line, 'label': "小盤(Under)"}
                         ])
 
-                # 結算 EV
                 for c in candidates:
                     c['ev'] = c['prob'] * (c['odds'] - 1) - (1 - c['prob'])
                 
@@ -587,9 +606,9 @@ def main():
                 best_bet = res['best_bet']
                 match_info = res['match_row']
                 
-                st.success("✅ 即場攻防轉換與 EV 運算完成！")
+                st.success("✅ 結合火力與剩餘時間的即場 EV 精算完成！")
                 if best_bet:
-                    st.info("系統結合當前攻防差距（DA、SoT）與剩餘時間比重，推算出以下最具價值的即場盤口：")
+                    st.info("系統已成功納入進攻火力效率與得分率，為您挑選出最佳價值的即場盤口：")
                     mc1, mc2, mc3 = st.columns(3)
                     mc1.metric("💡 首選推薦", f"{best_bet['bet_type']} - {best_bet['label']}")
                     mc2.metric(f"🎯 動態勝率預測", f"{best_bet['prob']*100:.1f}%")
@@ -609,7 +628,6 @@ def main():
                             
                             new_id = f"B{datetime.now().strftime('%Y%m%d%H%M%S')}_INPLAY"
                             
-                            # 建立新的即場注單記錄，並清洗掉與該注單無關的結算數據（避免複製繼承）
                             new_record = match_info.copy()
                             new_record.update({
                                 'ID': new_id, 'Date': datetime.now().strftime('%Y-%m-%d %H:%M'),
@@ -620,18 +638,22 @@ def main():
                                 'Home_DA': h_da, 'Away_DA': a_da, 'Home_SoT': h_sot, 'Away_SoT': a_sot,
                                 'Home_SoFF': h_soff, 'Away_SoFF': a_soff, 'Home_Red': h_red, 'Away_Red': a_red,
                                 'Home_Sub': h_sub, 'Away_Sub': a_sub, 'Home_Possession': h_poss, 'Away_Possession': a_poss,
+                                'Home_Goal_Conversion': h_conv, 'Away_Goal_Conversion': a_conv, 
+                                'Home_Firepower': h_fire, 'Away_Firepower': a_fire,
                                 'Result_Label': '', 'Profit': 0, 'Unit_Profit': 0, 'Payout': 0
                             })
                             
-                            # 同步更新該賽事的所有紀錄（包含先前的）為最新的實時數據
                             match_mask = st.session_state.df_db['Match'] == match_info['Match']
                             st.session_state.df_db.loc[match_mask, [
                                 'InPlay_Minute', 'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner', 
                                 'Home_DA', 'Away_DA', 'Home_SoT', 'Away_SoT', 'Home_SoFF', 'Away_SoFF', 
-                                'Home_Red', 'Away_Red', 'Home_Sub', 'Away_Sub', 'Home_Possession', 'Away_Possession'
-                            ]] = [minute, h_g, a_g, h_c, a_c, h_da, a_da, h_sot, a_sot, h_soff, a_soff, h_red, a_red, h_sub, a_sub, h_poss, a_poss]
+                                'Home_Red', 'Away_Red', 'Home_Sub', 'Away_Sub', 'Home_Possession', 'Away_Possession',
+                                'Home_Goal_Conversion', 'Away_Goal_Conversion', 'Home_Firepower', 'Away_Firepower'
+                            ]] = [
+                                minute, h_g, a_g, h_c, a_c, h_da, a_da, h_sot, a_sot, h_soff, a_soff, 
+                                h_red, a_red, h_sub, a_sub, h_poss, a_poss, h_conv, a_conv, h_fire, a_fire
+                            ]
 
-                            # 寫入新注單
                             st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame([new_record])], ignore_index=True)
                             save_db(st.session_state.df_db, db_file)
                             
