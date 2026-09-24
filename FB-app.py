@@ -408,9 +408,9 @@ def build_capital_flow_html(df_cap):
     )
     return table_html, total_amount, tot_str, tot_color, tot_label
 
-@st.dialog("📊 數據庫即時線上預覽", width="large")
-def preview_db_dialog(df_db, df_cap):
-    tab_bets, tab_capital = st.tabs(["⚽ 投注紀錄數據庫", "💰 系統資金流水"])
+@st.dialog("📊 數據庫即時線上預覽與管理", width="large")
+def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table):
+    tab_bets, tab_capital, tab_manage = st.tabs(["⚽ 投注紀錄預覽", "💰 資金流水預覽", "🗑️ 數據清理與還原"])
     
     with tab_bets:
         st.write("您可以在下方表格中自由滑動、點擊欄位排序，或使用關鍵字搜尋特定賽事。")
@@ -462,6 +462,85 @@ def preview_db_dialog(df_db, df_cap):
             st.download_button("📥 點擊下載資金流水 Excel 報表", excel_cap.getvalue(), "capital_flow_report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="btn_down_cap_xlsx")
         except:
             st.download_button("📥 點擊下載資金流水報表 (CSV)", df_cap_exp.to_csv(index=False).encode('utf-8'), "capital_flow_report.csv", "text/csv", key="btn_down_cap_csv")
+
+    with tab_manage:
+        st.subheader("1. 批量刪除與一鍵清除")
+        del_mode = st.radio("選擇要清理的資料表", ["⚽ 投注紀錄", "💰 資金流水"])
+        
+        if del_mode == "⚽ 投注紀錄":
+            df_target = df_db
+            target_name = 'bets'
+            opts = [f"{r['ID']} | {r['Date']} | {r.get('Match', '')}" for _, r in df_target.iterrows()]
+        else:
+            df_target = df_cap
+            target_name = 'cap'
+            opts = [f"{r['ID']} | {r['Date']} | {r.get('Type', '')} | ${r.get('Amount', 0)}" for _, r in df_target.iterrows()]
+            
+        selected_to_delete = st.multiselect("選擇要刪除的紀錄 (可多選):", opts)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("🗑️ 刪除選中紀錄", use_container_width=True):
+                if selected_to_delete:
+                    ids_to_delete = [x.split(" | ")[0] for x in selected_to_delete]
+                    df_to_delete = df_target[df_target['ID'].isin(ids_to_delete)]
+                    
+                    st.session_state.undo_stack.append({
+                        'target': target_name,
+                        'data': df_to_delete.copy(),
+                        'timestamp': datetime.now().strftime('%H:%M:%S')
+                    })
+                    
+                    if target_name == 'bets':
+                        st.session_state.df_db = df_db[~df_db['ID'].isin(ids_to_delete)]
+                        save_db(st.session_state.df_db, db_file, db_table)
+                    else:
+                        st.session_state.df_cap = df_cap[~df_cap['ID'].isin(ids_to_delete)]
+                        save_db(st.session_state.df_cap, capital_file, cap_table)
+                        
+                    st.rerun()
+                else:
+                    st.warning("請先選擇要刪除的紀錄。")
+                    
+        with col2:
+            with st.expander("💣 一鍵清除全部資料 (危險操作)"):
+                st.warning(f"確認要清空所有 **{del_mode}** 嗎？")
+                st.caption("此操作會將當前資料表所有紀錄移除，點擊下方確認執行。")
+                if st.button("⚠️ 確認清空全部", type="primary", use_container_width=True):
+                    if not df_target.empty:
+                        st.session_state.undo_stack.append({
+                            'target': target_name,
+                            'data': df_target.copy(),
+                            'timestamp': datetime.now().strftime('%H:%M:%S')
+                        })
+                        if target_name == 'bets':
+                            st.session_state.df_db = pd.DataFrame(columns=DB_COLUMNS)
+                            save_db(st.session_state.df_db, db_file, db_table)
+                        else:
+                            st.session_state.df_cap = pd.DataFrame(columns=CAPITAL_COLUMNS)
+                            save_db(st.session_state.df_cap, capital_file, cap_table)
+                        st.rerun()
+                        
+        st.divider()
+        st.subheader("2. ↩️ 狀態重置 (Undo 復原中心)")
+        if not st.session_state.undo_stack:
+            st.info("目前沒有可還原的刪除紀錄。")
+        else:
+            last_action = st.session_state.undo_stack[-1]
+            t_label = "投注紀錄" if last_action['target'] == 'bets' else "資金流水"
+            st.write(f"**可復原的最後一次刪除操作：** 於 {last_action['timestamp']} 刪除了 **{len(last_action['data'])}** 筆 ({t_label})")
+            
+            if st.button("↩️ 復原最後一次刪除 (Undo)", type="primary"):
+                action = st.session_state.undo_stack.pop()
+                if action['target'] == 'bets':
+                    st.session_state.df_db = pd.concat([st.session_state.df_db, action['data']], ignore_index=True)
+                    save_db(st.session_state.df_db, db_file, db_table)
+                else:
+                    st.session_state.df_cap = pd.concat([st.session_state.df_cap, action['data']], ignore_index=True)
+                    save_db(st.session_state.df_cap, capital_file, cap_table)
+                st.toast("✅ 已成功復原資料！資料已自動寫回雲端。", icon="↩️")
+                st.rerun()
 
 def render_odds_section(odds_history_state, prefix="pre"):
     for i, row in enumerate(odds_history_state):
@@ -540,6 +619,10 @@ def render_odds_section(odds_history_state, prefix="pre"):
 def main():
     st.title("⚽ 足球博彩精算與資金管理系統")
     
+    # 初始化全域復原堆疊
+    if 'undo_stack' not in st.session_state:
+        st.session_state.undo_stack = []
+        
     st.sidebar.header("⚙️ 系統設定與資金管理")
     mode = st.sidebar.radio("運作模式選擇", ["🧪 測試模式", "🟢 真實模式"])
     
@@ -581,8 +664,8 @@ def main():
             st.rerun()
 
     st.sidebar.divider()
-    if st.sidebar.button("🔍 數據庫即時線上預覽", use_container_width=True):
-        preview_db_dialog(st.session_state.df_db, st.session_state.df_cap)
+    if st.sidebar.button("🔍 數據庫即時線上預覽與管理", use_container_width=True):
+        preview_db_dialog(st.session_state.df_db, st.session_state.df_cap, db_file, capital_file, db_table, cap_table)
 
     t_pre, t_inplay, t_settle, t_ai = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖️ 賽果結算與管理", "🤖 全局模型"])
 
@@ -671,7 +754,6 @@ def main():
 
             best_bet = best_model['best'] if 'best' in best_model else candidates_base[0]
             
-            # --- 加入讓球最低投注額($200)與風險衡量邏輯 ---
             suggested_stake = 0
             upgrade_msg = ""
             if 'ev' in best_bet and best_bet['ev'] > 0 and curr_bankroll > 0:
@@ -898,7 +980,6 @@ def main():
                 candidates = sorted(candidates, key=lambda x: x['ev'], reverse=True)
                 best_bet = candidates[0] if candidates else None
                 
-                # --- 加入讓球最低投注額($200)與風險衡量邏輯 (即場版) ---
                 suggested_stake = 0
                 upgrade_msg = ""
                 if best_bet and best_bet['ev'] > 0 and curr_bankroll > 0:
@@ -1059,7 +1140,6 @@ def main():
             if st.button("↩️ 撤銷結算並恢復為未結算狀態", type="primary"):
                 rollback_id = sel_rollback.split(" | ")[0]
                 
-                # 找到該筆紀錄並更新狀態與結算數據 (Undo操作)
                 idx_mask = st.session_state.df_db['ID'] == rollback_id
                 st.session_state.df_db.loc[idx_mask, 'Status'] = 'Open'
                 st.session_state.df_db.loc[idx_mask, 'Result_Label'] = ''
