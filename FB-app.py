@@ -852,6 +852,27 @@ def main():
             dim_short = dim_label_map.get(bm['dim'], "宏觀")
 
             st.markdown(f"### 🧠 AI 預測模型推薦")
+            
+            # --- 新增：顯示所有盤口評估明細清單 ---
+            st.markdown("#### 📊 所有盤口評估明細 (系統決策依據)")
+            cand_list = bm.get('candidates', [])
+            if cand_list:
+                df_show = pd.DataFrame(cand_list)
+                df_show['推薦排序'] = range(1, len(df_show) + 1)
+                df_show = df_show[['推薦排序', 'bet_type', 'line', 'label', 'odds', 'prob', 'ev']]
+                df_show.columns = ['推薦排序', '盤口類型', '盤口線', '投注方向', '賠率', '預期勝率', '期望值 (EV)']
+                df_show['預期勝率'] = df_show['預期勝率'].apply(lambda x: f"{x*100:.2f}%")
+                df_show['期望值 (EV)'] = df_show['期望值 (EV)'].apply(lambda x: f"{x:.3f}")
+                
+                # 第一名首選呈現高亮
+                def highlight_first(row):
+                    if row.name == 0:
+                        return ['background-color: rgba(40, 167, 69, 0.2)'] * len(row)
+                    return [''] * len(row)
+                    
+                st.dataframe(df_show.style.apply(highlight_first, axis=1), use_container_width=True)
+            # ------------------------------------
+            
             st.info(f"系統分析顯示，針對『{res['t_name']}』，採用『{bm['dim']}』級別的模型進行運算，其歷史準確率與 EV 獲利期望值最高，故本次投注策略依據此模型生成。")
             
             mc1, mc2, mc3 = st.columns(3)
@@ -1063,6 +1084,25 @@ def main():
                 match_info = res['match_row']
                 
                 st.success("✅ 結合火力與剩餘時間的即場 EV 精算完成！")
+                
+                # --- 新增：顯示所有即場盤口評估明細清單 ---
+                if res.get('candidates'):
+                    st.markdown("#### 📊 所有即場盤口評估明細 (系統決策依據)")
+                    df_inplay_show = pd.DataFrame(res['candidates'])
+                    df_inplay_show['推薦排序'] = range(1, len(df_inplay_show) + 1)
+                    df_inplay_show = df_inplay_show[['推薦排序', 'bet_type', 'line', 'label', 'odds', 'prob', 'ev']]
+                    df_inplay_show.columns = ['推薦排序', '盤口類型', '盤口線', '投注方向', '賠率', '動態勝率', '期望值 (EV)']
+                    df_inplay_show['動態勝率'] = df_inplay_show['動態勝率'].apply(lambda x: f"{x*100:.2f}%")
+                    df_inplay_show['期望值 (EV)'] = df_inplay_show['期望值 (EV)'].apply(lambda x: f"{x:.3f}")
+                    
+                    def highlight_first_inplay(row):
+                        if row.name == 0:
+                            return ['background-color: rgba(40, 167, 69, 0.2)'] * len(row)
+                        return [''] * len(row)
+                        
+                    st.dataframe(df_inplay_show.style.apply(highlight_first_inplay, axis=1), use_container_width=True)
+                # ----------------------------------------
+                
                 if best_bet:
                     st.info("系統已成功納入進攻火力效率與得分率，為您挑選出最佳價值的即場盤口：")
                     mc1, mc2, mc3 = st.columns(3)
