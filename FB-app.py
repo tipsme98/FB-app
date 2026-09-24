@@ -486,11 +486,14 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
                     ids_to_delete = [x.split(" | ")[0] for x in selected_to_delete]
                     df_to_delete = df_target[df_target['ID'].isin(ids_to_delete)]
                     
+                    # 加入復原堆疊並限制最近 10 次
                     st.session_state.undo_stack.append({
+                        'id': f"U{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
                         'target': target_name,
                         'data': df_to_delete.copy(),
-                        'timestamp': datetime.now().strftime('%H:%M:%S')
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     })
+                    st.session_state.undo_stack = st.session_state.undo_stack[-10:]
                     
                     if target_name == 'bets':
                         st.session_state.df_db = df_db[~df_db['ID'].isin(ids_to_delete)]
@@ -509,11 +512,15 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
                 st.caption("此操作會將當前資料表所有紀錄移除，點擊下方確認執行。")
                 if st.button("⚠️ 確認清空全部", type="primary", use_container_width=True):
                     if not df_target.empty:
+                        # 加入復原堆疊並限制最近 10 次
                         st.session_state.undo_stack.append({
+                            'id': f"U{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
                             'target': target_name,
                             'data': df_target.copy(),
-                            'timestamp': datetime.now().strftime('%H:%M:%S')
+                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         })
+                        st.session_state.undo_stack = st.session_state.undo_stack[-10:]
+                        
                         if target_name == 'bets':
                             st.session_state.df_db = pd.DataFrame(columns=DB_COLUMNS)
                             save_db(st.session_state.df_db, db_file, db_table)
@@ -527,19 +534,30 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
         if not st.session_state.undo_stack:
             st.info("目前沒有可還原的刪除紀錄。")
         else:
-            last_action = st.session_state.undo_stack[-1]
-            t_label = "投注紀錄" if last_action['target'] == 'bets' else "資金流水"
-            st.write(f"**可復原的最後一次刪除操作：** 於 {last_action['timestamp']} 刪除了 **{len(last_action['data'])}** 筆 ({t_label})")
+            st.write(f"目前系統為您保留最近 **{len(st.session_state.undo_stack)}** 次的刪除操作供隨時復原。")
+            undo_options = []
             
-            if st.button("↩️ 復原最後一次刪除 (Undo)", type="primary"):
-                action = st.session_state.undo_stack.pop()
+            # 建立選單選項，反轉順序讓最新刪除的操作排在最上面
+            for idx, action in enumerate(reversed(st.session_state.undo_stack)):
+                t_label = "⚽ 投注紀錄" if action['target'] == 'bets' else "💰 資金流水"
+                real_idx = len(st.session_state.undo_stack) - 1 - idx
+                opt_str = f"[{action['timestamp']}] 刪除了 {len(action['data'])} 筆 {t_label}"
+                undo_options.append((real_idx, opt_str))
+                
+            sel_undo = st.selectbox("請選擇要復原的刪除紀錄：", undo_options, format_func=lambda x: x[1])
+            
+            if st.button("↩️ 復原所選的刪除紀錄 (Undo)", type="primary"):
+                real_idx = sel_undo[0]
+                action = st.session_state.undo_stack.pop(real_idx)
+                
                 if action['target'] == 'bets':
                     st.session_state.df_db = pd.concat([st.session_state.df_db, action['data']], ignore_index=True)
                     save_db(st.session_state.df_db, db_file, db_table)
                 else:
                     st.session_state.df_cap = pd.concat([st.session_state.df_cap, action['data']], ignore_index=True)
                     save_db(st.session_state.df_cap, capital_file, cap_table)
-                st.toast("✅ 已成功復原資料！資料已自動寫回雲端。", icon="↩️")
+                    
+                st.toast(f"✅ 已成功復原 {len(action['data'])} 筆資料！系統資金池已自動重構。", icon="↩️")
                 st.rerun()
 
 def render_odds_section(odds_history_state, prefix="pre"):
@@ -619,7 +637,7 @@ def render_odds_section(odds_history_state, prefix="pre"):
 def main():
     st.title("⚽ 足球博彩精算與資金管理系統")
     
-    # 初始化全域復原堆疊
+    # 初始化全域 Undo 堆疊 (紀錄最近10次)
     if 'undo_stack' not in st.session_state:
         st.session_state.undo_stack = []
         
