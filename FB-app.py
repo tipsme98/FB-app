@@ -560,6 +560,28 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
                 st.toast(f"✅ 已成功復原 {len(action['data'])} 筆資料！系統資金池已自動重構。", icon="↩️")
                 st.rerun()
 
+def get_last_odds_state(history, target_type, default_line):
+    # 尋找歷史紀錄中最後一筆相同類型的盤口，直接複製資料
+    for row in reversed(history):
+        if row['type'] == target_type:
+            return {
+                "type": target_type,
+                "line": float(row.get('line', default_line)),
+                "upper": float(row.get('upper', 1.90)),
+                "lower": float(row.get('lower', 1.90)),
+                "unlock": bool(row.get('unlock', False)),
+                "margin": float(row.get('margin', 1.085))
+            }
+    # 若為第一筆無紀錄可參考，回傳預設值
+    return {
+        "type": target_type,
+        "line": default_line,
+        "upper": 1.90,
+        "lower": 1.90,
+        "unlock": False,
+        "margin": 1.085
+    }
+
 def render_odds_section(odds_history_state, prefix="pre"):
     for i, row in enumerate(odds_history_state):
         r_id = row['id']
@@ -624,12 +646,24 @@ def render_odds_section(odds_history_state, prefix="pre"):
 
     ac1, ac2, ac3 = st.columns(3)
     max_id = max([r['id'] for r in odds_history_state]) if odds_history_state else 0
-    if ac1.button("➕ 讓球盤 (0.0)", key=f"{prefix}_add_hand", use_container_width=True):
-        odds_history_state.append({"id": max_id+1, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}); st.rerun()
-    if ac2.button("➕ 入球大小 (2.5)", key=f"{prefix}_add_goal", use_container_width=True):
-        odds_history_state.append({"id": max_id+1, "type": "入球大小", "line": 2.5, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}); st.rerun()
-    if ac3.button("➕ 角球大小 (9.5)", key=f"{prefix}_add_corn", use_container_width=True):
-        odds_history_state.append({"id": max_id+1, "type": "角球大小", "line": 9.5, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}); st.rerun()
+    
+    if ac1.button("➕ 新增讓球盤", key=f"{prefix}_add_hand", use_container_width=True):
+        new_row = get_last_odds_state(odds_history_state, "讓球", 0.0)
+        new_row["id"] = max_id + 1
+        odds_history_state.append(new_row)
+        st.rerun()
+        
+    if ac2.button("➕ 新增入球大小", key=f"{prefix}_add_goal", use_container_width=True):
+        new_row = get_last_odds_state(odds_history_state, "入球大小", 2.5)
+        new_row["id"] = max_id + 1
+        odds_history_state.append(new_row)
+        st.rerun()
+        
+    if ac3.button("➕ 新增角球大小", key=f"{prefix}_add_corn", use_container_width=True):
+        new_row = get_last_odds_state(odds_history_state, "角球大小", 9.5)
+        new_row["id"] = max_id + 1
+        odds_history_state.append(new_row)
+        st.rerun()
 
 # ==========================================
 # 5. 主程式 UI 
