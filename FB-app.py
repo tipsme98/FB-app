@@ -682,7 +682,6 @@ def main():
                 
                 if "讓球" in best_bet['bet_type']:
                     if 0 < suggested_stake < 200:
-                        # 判斷是否值得升級至 200：EV 大於等於 3% 且 勝率大於等於 50%
                         if best_bet.get('ev', 0) >= 0.03 and best_bet.get('prob', 0) >= 0.50:
                             suggested_stake = 200.0
                             upgrade_msg = "💡 **智能風控提示**：依據凱利公式，原計算注碼不足 $200。但因該讓球盤 EV (≥0.03) 與勝率 (≥50%) 均達標，系統判定具備高投資價值，建議升級至最低投注額 **$200**。"
@@ -727,7 +726,6 @@ def main():
             mc3.metric("📊 修正 EV", f"{bb.get('ev', 0):.3f}")
             st.markdown(f"**建議注碼**：`${res['stake']:,.2f}`")
             
-            # 顯示智能風控提示訊息
             if res.get('upgrade_msg'):
                 if "放棄" in res['upgrade_msg']:
                     st.warning(res['upgrade_msg'])
@@ -940,7 +938,6 @@ def main():
                     mc3.metric("📊 即場 EV", f"{best_bet['ev']:.3f}")
                     st.markdown(f"**建議即場注碼**：`${res['stake']:,.2f}`")
                     
-                    # 顯示智能風控提示訊息 (即場)
                     if res.get('upgrade_msg'):
                         if "放棄" in res['upgrade_msg']:
                             st.warning(res['upgrade_msg'])
@@ -1048,7 +1045,7 @@ def main():
                             
         st.markdown("---")
         st.subheader("⚠️ 撤銷與回滾中心 (Settlement Rollback)")
-        st.info("若發生結算錯誤，您可在此刪除錯誤的結算紀錄。系統會自動重構出絕對精準的資金池。")
+        st.info("若發生結算錯誤，您可在此撤銷該筆結算。撤銷後，該賽事將恢復為「Open」未結算狀態，並重新顯示於上方的賽果輸入區，供您修改後重新結算。資金池會自動重構。")
         
         settled_bets = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].tail(5)
         
@@ -1057,15 +1054,22 @@ def main():
             for _, r in settled_bets.iterrows():
                 rollback_options.append(f"{r['ID']} | [{r['Date']}] {r['Match']} | 結算狀態: {r['Result_Label']} | 盈虧: ${r['Profit']}")
                 
-            sel_rollback = st.selectbox("請選擇要刪除並回滾的最近結算紀錄：", rollback_options)
+            sel_rollback = st.selectbox("請選擇要撤銷結算的最近紀錄：", rollback_options)
             
-            if st.button("🗑️ 刪除並回滾所選的結算紀錄", type="primary"):
+            if st.button("↩️ 撤銷結算並恢復為未結算狀態", type="primary"):
                 rollback_id = sel_rollback.split(" | ")[0]
                 
-                st.session_state.df_db = st.session_state.df_db[st.session_state.df_db['ID'] != rollback_id].reset_index(drop=True)
+                # 找到該筆紀錄並更新狀態與結算數據 (Undo操作)
+                idx_mask = st.session_state.df_db['ID'] == rollback_id
+                st.session_state.df_db.loc[idx_mask, 'Status'] = 'Open'
+                st.session_state.df_db.loc[idx_mask, 'Result_Label'] = ''
+                st.session_state.df_db.loc[idx_mask, 'Profit'] = 0.0
+                st.session_state.df_db.loc[idx_mask, 'Unit_Profit'] = 0.0
+                st.session_state.df_db.loc[idx_mask, 'Payout'] = 0.0
+                
                 save_db(st.session_state.df_db, db_file, db_table)
                 
-                st.success("✅ 已成功移除錯誤紀錄，雲端本金已重構完成回滾！")
+                st.success("✅ 已成功撤銷結算！該賽事已恢復至上方列表，資金池已自動重構，請重新輸入正確賽果。")
                 st.rerun()
         else:
             st.write("目前沒有可供撤銷的已結算紀錄。")
