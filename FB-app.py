@@ -7,7 +7,9 @@ import re
 import io
 from datetime import datetime
 
-# 嘗試載入機器學習套件
+# ==========================================
+# 0. 嘗試載入依賴套件 (AI與雲端資料庫)
+# ==========================================
 try:
     from sklearn.ensemble import RandomForestClassifier
     import numpy as np
@@ -15,6 +17,13 @@ try:
 except ImportError:
     HAS_AI_MODULES = False
     np = None
+
+try:
+    from sqlalchemy import create_engine
+    import sqlalchemy
+    HAS_SQLALCHEMY = True
+except ImportError:
+    HAS_SQLALCHEMY = False
 
 # ==========================================
 # 1. 初始化設定與資料庫 Schema
@@ -36,13 +45,35 @@ LOG_COLUMNS = ['ID', 'Date', 'Match', 'Analysis_Content', 'Confidence_Level']
 CAPITAL_COLUMNS = ['ID', 'Date', 'Type', 'Amount', 'Note']
 CATEGORY_OPTIONS = ["國內聯賽 (Domestic League)", "國際聯賽 (International League)", "國際盃賽 (Cup)", "國內盃賽 (Domestic Cup)", "友誼賽 (Friendly)"]
 
-def load_db(filename, columns):
+def load_db(filename, columns, table_name):
     string_cols = [
         'ID', 'Date', 'Status', 'Tournament_Name', 'Tournament_Category', 
         'Match', 'Home_Team', 'Away_Team', 'Home_Rating', 'Away_Rating', 
         'Home_Form', 'Away_Form', 'Bet_Type', 'Selection', 'Odds_History', 'Result_Label',
         'Type', 'Note'
     ]
+    
+    # 策略 A: 嘗試從雲端 PostgreSQL 資料庫載入 (確保跨裝置同步)
+    if HAS_SQLALCHEMY and "DB_URL" in st.secrets:
+        try:
+            engine = create_engine(st.secrets["DB_URL"])
+            df = pd.read_sql_table(table_name, engine)
+            
+            for col in columns:
+                if col not in df.columns: 
+                    df[col] = pd.Series(dtype='object')
+            for col in string_cols:
+                if col in df.columns:
+                    df[col] = df[col].astype('object')
+                    
+            return df[columns]
+        except ValueError:
+            # 資料表尚未建立 (第一次執行)，無縫降級到建立空 DataFrame
+            pass
+        except Exception as e:
+            st.sidebar.error(f"⚠️ 雲端資料庫讀取異常，切換至本地模式: {e}")
+
+    # 策略 B: 備用本地 CSV 載入 (原有機制)
     if os.path.exists(filename):
         try:
             df = pd.read_csv(filename)
@@ -53,30 +84,41 @@ def load_db(filename, columns):
             for col in columns:
                 if col not in df.columns: 
                     df[col] = pd.Series(dtype='object')
-            
             for col in string_cols:
                 if col in df.columns:
                     df[col] = df[col].astype('object')
                     
             return df[columns]
         except Exception:
-            df = pd.DataFrame(columns=columns)
-            for col in string_cols:
-                if col in df.columns:
-                    df[col] = df[col].astype('object')
-            return df
-    else:
-        df = pd.DataFrame(columns=columns)
-        for col in string_cols:
-            if col in df.columns:
-                df[col] = df[col].astype('object')
-        return df
+            pass
+            
+    # 策略 C: 全新建立
+    df = pd.DataFrame(columns=columns)
+    for col in string_cols:
+        if col in df.columns:
+            df[col] = df[col].astype('object')
+    return df
 
-def save_db(df, filename):
+def save_db(df, filename, table_name):
+    # 策略 A: 嘗試優先寫入雲端資料庫
+    if HAS_SQLALCHEMY and "DB_URL" in st.secrets:
+        try:
+            engine = create_engine(st.secrets["DB_URL"])
+            # 確保物件型態能正確寫入 SQL
+            df_to_db = df.copy()
+            for col in df_to_db.columns:
+                if df_to_db[col].dtype == 'object':
+                    df_to_db[col] = df_to_db[col].apply(lambda x: str(x) if pd.notna(x) else None)
+            
+            df_to_db.to_sql(table_name, engine, if_exists='replace', index=False)
+        except Exception as e:
+            st.sidebar.error(f"⚠️ 雲端資料庫寫入失敗: {e}")
+
+    # 策略 B: 同步備份至本地 CSV
     df.to_csv(filename, index=False)
 
 # ==========================================
-# 2. 資金、風控與累計算式 (State Rebuilding Engine)
+# 2. 資金、風控與累計算式
 # ==========================================
 def recalculate_bankroll_from_scratch(df_cap, df_db):
     if df_cap.empty:
@@ -119,7 +161,6 @@ def calculate_settlement(bet_type, selection, line, odds, stake, h_g, a_g, h_c=0
 
     diff = round(diff, 2)
     
-    # 5態派彩精算
     if diff >= 0.5:
         res_label = "✅ 全贏"
         profit = stake * (odds - 1)
@@ -207,7 +248,6 @@ def evaluate_dimension(df_subset, dim_name, candidates_base, rating_map, h_data)
             try:
                 clf = RandomForestClassifier(n_estimators=50, random_state=42, max_depth=5)
                 clf.fit(X, y)
-                
                 for c in candidates:
                     x_input = np.array([[h_data['hr'], h_data['ar'], h_data['hf'], h_data['af'], c['line'], c['odds']]])
                     prob = clf.predict_proba(x_input)[0][1]
@@ -233,7 +273,7 @@ def evaluate_dimension(df_subset, dim_name, candidates_base, rating_map, h_data)
     }
 
 # ==========================================
-# 4. 資金流水 HTML 構建 (無縮排，防Markdown代碼化)
+# 4. 資金流水 HTML 構建
 # ==========================================
 def build_capital_flow_html(df_cap):
     if df_cap.empty:
@@ -259,12 +299,12 @@ def build_capital_flow_html(df_cap):
             c_type_disp = "存入本金 (Deposit)"
             signed_amt = -amt_raw
             amt_formatted = f"-{int(amt_raw) if amt_raw.is_integer() else amt_raw:g}"
-            color = "#ff4d4d"  # 紅色代表存入 (-)
+            color = "#ff4d4d" 
         else:
             c_type_disp = "提取本金 (Withdraw)"
             signed_amt = amt_raw
             amt_formatted = f"+{int(amt_raw) if amt_raw.is_integer() else amt_raw:g}"
-            color = "#28a745"  # 綠色代表提取 (+)
+            color = "#28a745" 
             
         total_amount += signed_amt
         
@@ -279,12 +319,12 @@ def build_capital_flow_html(df_cap):
         )
     
     if total_amount < 0:
-        tot_color = "#ff4d4d"  # 紅色
+        tot_color = "#ff4d4d"
         abs_tot = abs(total_amount)
         tot_str = f"-{int(abs_tot) if abs_tot.is_integer() else abs_tot:g}"
         tot_label = f" (代表淨存入 ${abs_tot:,.2f})"
     elif total_amount > 0:
-        tot_color = "#28a745"  # 綠色
+        tot_color = "#28a745"
         tot_str = f"+{int(total_amount) if total_amount.is_integer() else total_amount:g}"
         tot_label = f" (代表淨提取 ${total_amount:,.2f})"
     else:
@@ -336,7 +376,6 @@ def preview_db_dialog(df_db, df_cap):
         else:
             show_df = df_db.copy()
 
-        # 計算 Profit, Unit_Profit, Payout 總和並新增總計列
         total_profit = pd.to_numeric(show_df['Profit'], errors='coerce').sum()
         total_unit = pd.to_numeric(show_df['Unit_Profit'], errors='coerce').sum()
         total_payout = pd.to_numeric(show_df['Payout'], errors='coerce').sum()
@@ -352,36 +391,18 @@ def preview_db_dialog(df_db, df_cap):
 
         st.dataframe(show_df_with_summary, use_container_width=True)
         
-        # 匯出 Excel 報表
         excel_data = io.BytesIO()
         try:
             show_df_with_summary.to_excel(excel_data, index=False)
-            st.download_button(
-                label="📥 點擊下載投注紀錄 Excel 報表",
-                data=excel_data.getvalue(),
-                file_name="football_betting_report.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="btn_down_bets_xlsx"
-            )
-        except Exception:
-            csv_data = show_df_with_summary.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 點擊下載投注紀錄報表 (自動降級為 CSV)",
-                data=csv_data,
-                file_name="football_betting_report.csv",
-                mime="text/csv",
-                key="btn_down_bets_csv"
-            )
+            st.download_button("📥 點擊下載投注紀錄 Excel 報表", excel_data.getvalue(), "football_betting_report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="btn_down_bets_xlsx")
+        except:
+            st.download_button("📥 點擊下載投注紀錄報表 (CSV)", show_df_with_summary.to_csv(index=False).encode('utf-8'), "football_betting_report.csv", "text/csv", key="btn_down_bets_csv")
 
     with tab_capital:
         st.subheader("💰 系統資金流水帳目 (Capital Flow Ledger)")
-        st.write("記錄所有資金存入與提取之金額。存入金額為紅色 (`-`)，提取金額為綠色 (`+`)。Amount 欄位最後附有總和數值與說明。")
-        
         table_html, total_amount, tot_str, tot_color, tot_label = build_capital_flow_html(df_cap)
         st.markdown(table_html, unsafe_allow_html=True)
-        st.markdown("---")
         
-        # 資金流水 Excel 報表
         df_cap_exp = df_cap.copy()
         cap_summary = {col: None for col in df_cap_exp.columns}
         if 'ID' in cap_summary: cap_summary['ID'] = "TOTAL (總計)"
@@ -392,22 +413,9 @@ def preview_db_dialog(df_db, df_cap):
         excel_cap = io.BytesIO()
         try:
             df_cap_exp.to_excel(excel_cap, index=False)
-            st.download_button(
-                label="📥 點擊下載資金流水 Excel 報表",
-                data=excel_cap.getvalue(),
-                file_name="capital_flow_report.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="btn_down_cap_xlsx"
-            )
-        except Exception:
-            csv_cap = df_cap_exp.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 點擊下載資金流水報表 (自動降級為 CSV)",
-                data=csv_cap,
-                file_name="capital_flow_report.csv",
-                mime="text/csv",
-                key="btn_down_cap_csv"
-            )
+            st.download_button("📥 點擊下載資金流水 Excel 報表", excel_cap.getvalue(), "capital_flow_report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="btn_down_cap_xlsx")
+        except:
+            st.download_button("📥 點擊下載資金流水報表 (CSV)", df_cap_exp.to_csv(index=False).encode('utf-8'), "capital_flow_report.csv", "text/csv", key="btn_down_cap_csv")
 
 def render_odds_section(odds_history_state, prefix="pre"):
     for i, row in enumerate(odds_history_state):
@@ -489,11 +497,24 @@ def main():
     st.sidebar.header("⚙️ 系統設定與資金管理")
     mode = st.sidebar.radio("運作模式選擇", ["🧪 測試模式", "🟢 真實模式"])
     
+    # 宣告檔案與資料表名稱
     db_file = "football_betting_db_test.csv" if mode == "🧪 測試模式" else "football_betting_db.csv"
     capital_file = "football_capital_db_test.csv" if mode == "🧪 測試模式" else "football_capital_db.csv"
+    db_table = "football_bets_test" if mode == "🧪 測試模式" else "football_bets"
+    cap_table = "football_cap_test" if mode == "🧪 測試模式" else "football_cap"
     
-    st.session_state.df_db = load_db(db_file, DB_COLUMNS)
-    st.session_state.df_cap = load_db(capital_file, CAPITAL_COLUMNS)
+    # 雲端同步狀態顯示
+    st.sidebar.divider()
+    st.sidebar.subheader("☁️ 雲端同步狀態")
+    if HAS_SQLALCHEMY and "DB_URL" in st.secrets:
+        st.sidebar.success("🟢 已連線至雲端資料庫！跨裝置資料將自動同步，不再遺失。")
+    else:
+        st.sidebar.error("🔴 尚未連線雲端資料庫 (僅本地暫存)")
+        st.sidebar.caption("提示: 您的環境會在休眠時清空資料。請於 App 佈署後台的 Secrets 加上 `DB_URL` 啟用永久雲端存檔。")
+    
+    # 載入資料庫
+    st.session_state.df_db = load_db(db_file, DB_COLUMNS, db_table)
+    st.session_state.df_cap = load_db(capital_file, CAPITAL_COLUMNS, cap_table)
 
     tot_dep, tot_wit, net_dep, tot_pnl, curr_bankroll, max_stake = recalculate_bankroll_from_scratch(st.session_state.df_cap, st.session_state.df_db)
     
@@ -505,7 +526,6 @@ def main():
     st.sidebar.metric("當前總可用資金 (Bankroll)", f"${curr_bankroll:,.2f}")
     st.sidebar.caption(f"🛑 **單注上限 (動態資金 10%)**: `${max_stake:,.2f}`")
 
-    # 存入與提取本金輸入區
     with st.sidebar.expander("💸 資金存提管理"):
         cap_action = st.radio("動作", ["Deposit (存入本金)", "Withdraw (提取本金)"])
         cap_amount = st.number_input("金額 ($)", min_value=1.0, value=1000.0, step=100.0)
@@ -520,8 +540,8 @@ def main():
                 'Note': cap_note
             }
             st.session_state.df_cap = pd.concat([st.session_state.df_cap, pd.DataFrame([new_cap_record])], ignore_index=True)
-            save_db(st.session_state.df_cap, capital_file)
-            st.toast("✅ 資金紀錄寫入成功！系統本金已自動重構。", icon="💰")
+            save_db(st.session_state.df_cap, capital_file, cap_table)
+            st.toast("✅ 資金紀錄雲端寫入成功！系統本金已自動重構。", icon="💰")
             st.rerun()
 
     st.sidebar.divider()
@@ -605,7 +625,6 @@ def main():
             df_meso = df_settled[df_settled['Tournament_Category'] == tournament_category]
             df_macro = df_settled
             
-            # 4 大核心維度運算
             res_micro = evaluate_dimension(df_micro, "微觀 - 賽事名稱", candidates_base, rating_map, h_data)
             res_meso = evaluate_dimension(df_meso, "中觀 - 賽事分類", candidates_base, rating_map, h_data)
             res_macro = evaluate_dimension(df_macro, "宏觀 - 總數據", candidates_base, rating_map, h_data)
@@ -664,7 +683,7 @@ def main():
                 final_row = next((r for r in st.session_state.odds_history if r['type'] == final_btype), st.session_state.odds_history[-1])
                 line, odds = float(final_row['line']), float(final_row['upper']) if final_sel in ["Home", "Over"] else float(final_row['lower'])
                 
-                if st.form_submit_button("✅ 確定投注並寫入資料庫"):
+                if st.form_submit_button("✅ 確定投注並寫入雲端資料庫"):
                     new_id = f"B{datetime.now().strftime('%Y%m%d%H%M%S')}"
                     new_record = {
                         'ID': new_id, 'Date': datetime.now().strftime('%Y-%m-%d %H:%M'), 'Status': 'Open',
@@ -675,10 +694,10 @@ def main():
                         'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False)
                     }
                     st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame([new_record])], ignore_index=True)
-                    save_db(st.session_state.df_db, db_file)
+                    save_db(st.session_state.df_db, db_file, db_table)
                     st.session_state.odds_history = [{"id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}] 
                     st.session_state.show_analysis = False
-                    st.toast("✅ 投注紀錄寫入成功！", icon="📝")
+                    st.toast("✅ 投注紀錄雲端寫入成功！", icon="📝")
                     st.rerun()
 
     with t_inplay:
@@ -768,8 +787,8 @@ def main():
                 st.session_state.df_db.loc[match_mask, 'Away_Goal_Conversion'] = a_conv
                 st.session_state.df_db.loc[match_mask, 'Home_Firepower'] = h_fire
                 st.session_state.df_db.loc[match_mask, 'Away_Firepower'] = a_fire
-                save_db(st.session_state.df_db, db_file)
-                st.success("✅ 實時數據與自動計算指標儲存成功！")
+                save_db(st.session_state.df_db, db_file, db_table)
+                st.success("✅ 實時數據雲端儲存成功！")
                 st.rerun()
 
             st.divider()
@@ -898,10 +917,10 @@ def main():
                             st.session_state.df_db.loc[match_mask, 'Away_Firepower'] = a_fire
 
                             st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame([new_record])], ignore_index=True)
-                            save_db(st.session_state.df_db, db_file)
+                            save_db(st.session_state.df_db, db_file, db_table)
                             
                             st.session_state.show_inplay_analysis = False
-                            st.toast("✅ 即場注單寫入成功！", icon="📝")
+                            st.toast("✅ 即場注單雲端寫入成功！", icon="📝")
                             st.rerun()
                 else:
                     st.warning("⚠️ 目前該場賽事並無明顯具備 EV 價值的即場盤口推薦。")
@@ -923,12 +942,11 @@ def main():
                         h_c = col3.number_input("全場主隊角球數", min_value=0, value=int(row.get('Home_Corner', 0)) if pd.notna(row.get('Home_Corner')) else 0, key=f"hc_{row['ID']}")
                         a_c = col4.number_input("全場客隊角球數", min_value=0, value=int(row.get('Away_Corner', 0)) if pd.notna(row.get('Away_Corner')) else 0, key=f"ac_{row['ID']}")
                         
-                        if st.form_submit_button("確認賽果並結算"):
+                        if st.form_submit_button("確認賽果並雲端結算"):
                             prof, payout, u_prof, lbl, diff = calculate_settlement(
                                 row['Bet_Type'], row['Selection'], float(row['Initial_Line']), 
                                 float(row['Initial_Odds']), float(row['Stake']), h_g, a_g, h_c, a_c
                             )
-                            # 確保 Result_Label 等欄位型態正確並單欄位賦值
                             st.session_state.df_db['Result_Label'] = st.session_state.df_db['Result_Label'].astype('object')
                             st.session_state.df_db['Status'] = st.session_state.df_db['Status'].astype('object')
                             
@@ -942,14 +960,13 @@ def main():
                             st.session_state.df_db.loc[idx, 'Payout'] = float(payout)
                             st.session_state.df_db.loc[idx, 'Status'] = 'Settled'
                             
-                            save_db(st.session_state.df_db, db_file)
-                            st.success(f"結算完成！結果：{lbl} | 單位盈虧：{u_prof:+.2f} U")
+                            save_db(st.session_state.df_db, db_file, db_table)
+                            st.success(f"結算完成並同步雲端！結果：{lbl} | 單位盈虧：{u_prof:+.2f} U")
                             st.rerun()
                             
         st.markdown("---")
-        # 撤銷已結算紀錄 (Rollback Settlement) 專區
         st.subheader("⚠️ 撤銷與回滾中心 (Settlement Rollback)")
-        st.info("若發生結算錯誤，您可在此刪除錯誤的結算紀錄。系統會自動從初始本金開始，重新扣除待結算注碼並加上所有歷史真實結算盈虧，為您重構出絕對精準的「當前總可用資金 (Bankroll)」。絕不使用逆向加減法！")
+        st.info("若發生結算錯誤，您可在此刪除錯誤的結算紀錄。系統會自動重構出絕對精準的資金池。")
         
         settled_bets = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].tail(5)
         
@@ -963,12 +980,10 @@ def main():
             if st.button("🗑️ 刪除並回滾所選的結算紀錄", type="primary"):
                 rollback_id = sel_rollback.split(" | ")[0]
                 
-                # 步驟一（資料拔除）：從 DataFrame 中徹底刪除該行資料
                 st.session_state.df_db = st.session_state.df_db[st.session_state.df_db['ID'] != rollback_id].reset_index(drop=True)
-                save_db(st.session_state.df_db, db_file)
+                save_db(st.session_state.df_db, db_file, db_table)
                 
-                # 步驟二（狀態重置與本金重構）：系統會在下次 rerun 時，在頂端自動呼叫 recalculate_bankroll_from_scratch()，完成本金重構。
-                st.success("✅ 已成功移除錯誤紀錄，本金已透過資料庫全局重構完成回滾！")
+                st.success("✅ 已成功移除錯誤紀錄，雲端本金已重構完成回滾！")
                 st.rerun()
         else:
             st.write("目前沒有可供撤銷的已結算紀錄。")
@@ -977,6 +992,7 @@ def main():
         st.header("🤖 全局預測模型監控")
         df_settled = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
         st.write(f"當前可供訓練的歷史結算數據：**{len(df_settled)}** 筆")
+        st.write(f"雲端資料庫模組狀態 (SQLAlchemy): **{'🟢 已啟用' if HAS_SQLALCHEMY else '🔴 未載入'}**")
         st.write(f"機器學習模組狀態 (Scikit-Learn): **{'🟢 已啟用' if HAS_AI_MODULES else '🔴 未偵測到，使用啟發式算法'}**")
 
 if __name__ == "__main__":
