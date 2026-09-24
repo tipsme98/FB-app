@@ -5,6 +5,7 @@ import json
 import base64
 import re
 import io
+import requests
 from datetime import datetime
 
 # ==========================================
@@ -45,6 +46,33 @@ LOG_COLUMNS = ['ID', 'Date', 'Match', 'Analysis_Content', 'Confidence_Level']
 CAPITAL_COLUMNS = ['ID', 'Date', 'Type', 'Amount', 'Note']
 CATEGORY_OPTIONS = ["國內聯賽 (Domestic League)", "國際聯賽 (International League)", "國際盃賽 (Cup)", "國內盃賽 (Domestic Cup)", "友誼賽 (Friendly)"]
 
+# GitHub API 讀取與寫入輔助函式
+def load_db_github(repo, path, token):
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3.raw"}
+    res = requests.get(url, headers=headers)
+    if res.status_code == 200:
+        return pd.read_csv(io.StringIO(res.text))
+    return None
+
+def save_db_github(df, repo, path, token):
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {"Authorization": f"token {token}"}
+    res_get = requests.get(url, headers=headers)
+    sha = res_get.json().get("sha") if res_get.status_code == 200 else None
+    
+    csv_content = df.to_csv(index=False)
+    content_b64 = base64.b64encode(csv_content.encode("utf-8")).decode("utf-8")
+    
+    payload = {
+        "message": f"Auto-update {path} via Streamlit App",
+        "content": content_b64
+    }
+    if sha:
+        payload["sha"] = sha
+        
+    requests.put(url, json=payload, headers=headers)
+
 def load_db(filename, columns, table_name):
     string_cols = [
         'ID', 'Date', 'Status', 'Tournament_Name', 'Tournament_Category', 
@@ -53,27 +81,37 @@ def load_db(filename, columns, table_name):
         'Type', 'Note'
     ]
     
-    # 策略 A: 嘗試從雲端 PostgreSQL 資料庫載入 (確保跨裝置同步)
-    if HAS_SQLALCHEMY and "DB_URL" in st.secrets:
+    # 策略 A: 嘗試 PostgreSQL 雲端資料庫
+    if HAS_SQLALCHEMY and "DB_URL" in st.secrets and st.secrets["DB_URL"]:
         try:
             engine = create_engine(st.secrets["DB_URL"])
             df = pd.read_sql_table(table_name, engine)
-            
             for col in columns:
                 if col not in df.columns: 
                     df[col] = pd.Series(dtype='object')
             for col in string_cols:
                 if col in df.columns:
                     df[col] = df[col].astype('object')
-                    
             return df[columns]
-        except ValueError:
-            # 資料表尚未建立 (第一次執行)，無縫降級到建立空 DataFrame
+        except Exception:
             pass
-        except Exception as e:
-            st.sidebar.error(f"⚠️ 雲端資料庫讀取異常，切換至本地模式: {e}")
 
-    # 策略 B: 備用本地 CSV 載入 (原有機制)
+    # 策略 B: 嘗試 GitHub API 自動同步
+    if "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
+        try:
+            gh_df = load_db_github(st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
+            if gh_df is not None:
+                for col in columns:
+                    if col not in gh_df.columns: 
+                        gh_df[col] = pd.Series(dtype='object')
+                for col in string_cols:
+                    if col in gh_df.columns:
+                        gh_df[col] = gh_df[col].astype('object')
+                return gh_df[columns]
+        except Exception:
+            pass
+
+    # 策略 C: 本地 CSV 讀取
     if os.path.exists(filename):
         try:
             df = pd.read_csv(filename)
@@ -92,7 +130,7 @@ def load_db(filename, columns, table_name):
         except Exception:
             pass
             
-    # 策略 C: 全新建立
+    # 策略 D: 建立空 DataFrame
     df = pd.DataFrame(columns=columns)
     for col in string_cols:
         if col in df.columns:
@@ -100,22 +138,30 @@ def load_db(filename, columns, table_name):
     return df
 
 def save_db(df, filename, table_name):
-    # 策略 A: 嘗試優先寫入雲端資料庫
-    if HAS_SQLALCHEMY and "DB_URL" in st.secrets:
+    # 策略 A: 寫入 PostgreSQL 雲端資料庫
+    if HAS_SQLALCHEMY and "DB_URL" in st.secrets and st.secrets["DB_URL"]:
         try:
             engine = create_engine(st.secrets["DB_URL"])
-            # 確保物件型態能正確寫入 SQL
             df_to_db = df.copy()
             for col in df_to_db.columns:
                 if df_to_db[col].dtype == 'object':
                     df_to_db[col] = df_to_db[col].apply(lambda x: str(x) if pd.notna(x) else None)
-            
             df_to_db.to_sql(table_name, engine, if_exists='replace', index=False)
         except Exception as e:
             st.sidebar.error(f"⚠️ 雲端資料庫寫入失敗: {e}")
 
-    # 策略 B: 同步備份至本地 CSV
-    df.to_csv(filename, index=False)
+    # 策略 B: 寫入 GitHub 自動同步
+    if "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
+        try:
+            save_db_github(df, st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
+        except Exception as e:
+            st.sidebar.error(f"⚠️ GitHub 自動同步失敗: {e}")
+
+    # 策略 C: 寫入本地 CSV 備份
+    try:
+        df.to_csv(filename, index=False)
+    except Exception:
+        pass
 
 # ==========================================
 # 2. 資金、風控與累計算式
@@ -273,7 +319,7 @@ def evaluate_dimension(df_subset, dim_name, candidates_base, rating_map, h_data)
     }
 
 # ==========================================
-# 4. 資金流水 HTML 構建
+# 4. 資金流水 HTML 構建 (無 Markdown 縮排)
 # ==========================================
 def build_capital_flow_html(df_cap):
     if df_cap.empty:
@@ -497,22 +543,36 @@ def main():
     st.sidebar.header("⚙️ 系統設定與資金管理")
     mode = st.sidebar.radio("運作模式選擇", ["🧪 測試模式", "🟢 真實模式"])
     
-    # 宣告檔案與資料表名稱
     db_file = "football_betting_db_test.csv" if mode == "🧪 測試模式" else "football_betting_db.csv"
     capital_file = "football_capital_db_test.csv" if mode == "🧪 測試模式" else "football_capital_db.csv"
     db_table = "football_bets_test" if mode == "🧪 測試模式" else "football_bets"
     cap_table = "football_cap_test" if mode == "🧪 測試模式" else "football_cap"
     
-    # 雲端同步狀態顯示
+    # 雲端同步狀態顯示（優化版提示，消除紅框）
     st.sidebar.divider()
     st.sidebar.subheader("☁️ 雲端同步狀態")
-    if HAS_SQLALCHEMY and "DB_URL" in st.secrets:
-        st.sidebar.success("🟢 已連線至雲端資料庫！跨裝置資料將自動同步，不再遺失。")
+    if HAS_SQLALCHEMY and "DB_URL" in st.secrets and st.secrets["DB_URL"]:
+        st.sidebar.success("🟢 已成功連線至 PostgreSQL 雲端資料庫")
+    elif "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
+        st.sidebar.success("🟢 已成功連線至 GitHub 倉庫自動同步")
     else:
-        st.sidebar.error("🔴 尚未連線雲端資料庫 (僅本地暫存)")
-        st.sidebar.caption("提示: 您的環境會在休眠時清空資料。請於 App 佈署後台的 Secrets 加上 `DB_URL` 啟用永久雲端存檔。")
+        st.sidebar.warning("🟡 目前為本地暫存模式 (重啟頁面將還原)")
+        with st.sidebar.expander("📖 如何免費啟用跨裝置永久雲端存檔？"):
+            st.markdown("""
+            **方案 A：連接 GitHub 倉庫自動寫入 (最簡單)**
+            進入 Streamlit Cloud 部署後台 $\rightarrow$ **Secrets** 貼上：
+            ```toml
+            GITHUB_TOKEN = "your_github_token"
+            GITHUB_REPO = "username/repo_name"
+            ```
+
+            **方案 B：連接 Supabase / Neon PostgreSQL 雲端資料庫**
+            在 [Supabase](https://supabase.com) 建立免費資料庫，於 **Secrets** 貼上：
+            ```toml
+            DB_URL = "postgresql://使用者:密碼@主機:5432/資料庫名"
+            ```
+            """)
     
-    # 載入資料庫
     st.session_state.df_db = load_db(db_file, DB_COLUMNS, db_table)
     st.session_state.df_cap = load_db(capital_file, CAPITAL_COLUMNS, cap_table)
 
@@ -541,7 +601,7 @@ def main():
             }
             st.session_state.df_cap = pd.concat([st.session_state.df_cap, pd.DataFrame([new_cap_record])], ignore_index=True)
             save_db(st.session_state.df_cap, capital_file, cap_table)
-            st.toast("✅ 資金紀錄雲端寫入成功！系統本金已自動重構。", icon="💰")
+            st.toast("✅ 資金紀錄寫入成功！系統本金已自動重構。", icon="💰")
             st.rerun()
 
     st.sidebar.divider()
@@ -683,7 +743,7 @@ def main():
                 final_row = next((r for r in st.session_state.odds_history if r['type'] == final_btype), st.session_state.odds_history[-1])
                 line, odds = float(final_row['line']), float(final_row['upper']) if final_sel in ["Home", "Over"] else float(final_row['lower'])
                 
-                if st.form_submit_button("✅ 確定投注並寫入雲端資料庫"):
+                if st.form_submit_button("✅ 確定投注並寫入數據庫"):
                     new_id = f"B{datetime.now().strftime('%Y%m%d%H%M%S')}"
                     new_record = {
                         'ID': new_id, 'Date': datetime.now().strftime('%Y-%m-%d %H:%M'), 'Status': 'Open',
@@ -697,7 +757,7 @@ def main():
                     save_db(st.session_state.df_db, db_file, db_table)
                     st.session_state.odds_history = [{"id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}] 
                     st.session_state.show_analysis = False
-                    st.toast("✅ 投注紀錄雲端寫入成功！", icon="📝")
+                    st.toast("✅ 投注紀錄寫入成功！", icon="📝")
                     st.rerun()
 
     with t_inplay:
@@ -788,7 +848,7 @@ def main():
                 st.session_state.df_db.loc[match_mask, 'Home_Firepower'] = h_fire
                 st.session_state.df_db.loc[match_mask, 'Away_Firepower'] = a_fire
                 save_db(st.session_state.df_db, db_file, db_table)
-                st.success("✅ 實時數據雲端儲存成功！")
+                st.success("✅ 實時數據與自動計算指標儲存成功！")
                 st.rerun()
 
             st.divider()
@@ -920,7 +980,7 @@ def main():
                             save_db(st.session_state.df_db, db_file, db_table)
                             
                             st.session_state.show_inplay_analysis = False
-                            st.toast("✅ 即場注單雲端寫入成功！", icon="📝")
+                            st.toast("✅ 即場注單寫入成功！", icon="📝")
                             st.rerun()
                 else:
                     st.warning("⚠️ 目前該場賽事並無明顯具備 EV 價值的即場盤口推薦。")
@@ -942,7 +1002,7 @@ def main():
                         h_c = col3.number_input("全場主隊角球數", min_value=0, value=int(row.get('Home_Corner', 0)) if pd.notna(row.get('Home_Corner')) else 0, key=f"hc_{row['ID']}")
                         a_c = col4.number_input("全場客隊角球數", min_value=0, value=int(row.get('Away_Corner', 0)) if pd.notna(row.get('Away_Corner')) else 0, key=f"ac_{row['ID']}")
                         
-                        if st.form_submit_button("確認賽果並雲端結算"):
+                        if st.form_submit_button("確認賽果並結算"):
                             prof, payout, u_prof, lbl, diff = calculate_settlement(
                                 row['Bet_Type'], row['Selection'], float(row['Initial_Line']), 
                                 float(row['Initial_Odds']), float(row['Stake']), h_g, a_g, h_c, a_c
@@ -961,7 +1021,7 @@ def main():
                             st.session_state.df_db.loc[idx, 'Status'] = 'Settled'
                             
                             save_db(st.session_state.df_db, db_file, db_table)
-                            st.success(f"結算完成並同步雲端！結果：{lbl} | 單位盈虧：{u_prof:+.2f} U")
+                            st.success(f"結算完成！結果：{lbl} | 單位盈虧：{u_prof:+.2f} U")
                             st.rerun()
                             
         st.markdown("---")
@@ -983,7 +1043,7 @@ def main():
                 st.session_state.df_db = st.session_state.df_db[st.session_state.df_db['ID'] != rollback_id].reset_index(drop=True)
                 save_db(st.session_state.df_db, db_file, db_table)
                 
-                st.success("✅ 已成功移除錯誤紀錄，雲端本金已重構完成回滾！")
+                st.success("✅ 已成功移除錯誤紀錄，資金已重構完成回滾！")
                 st.rerun()
         else:
             st.write("目前沒有可供撤銷的已結算紀錄。")
