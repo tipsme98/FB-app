@@ -29,7 +29,7 @@ except ImportError:
 # ==========================================
 # 1. 初始化設定與資料庫 Schema
 # ==========================================
-st.set_page_config(page_title="足球博彩精算與資金管理系統", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="Actuarial and fund management system by Dr. EdwinPro", page_icon="⚽", layout="wide")
 
 DB_COLUMNS = [
     'ID', 'Date', 'Status', 
@@ -43,8 +43,8 @@ DB_COLUMNS = [
     'Home_Goal_Conversion', 'Away_Goal_Conversion', 'Home_Firepower', 'Away_Firepower',
     'Result_Label', 'System_Profit', 'User_Profit', 'Unit_Profit', 'System_Payout', 'User_Payout'
 ]
+CAPITAL_COLUMNS = ['ID', 'Date', 'Type', 'Account', 'Amount', 'Note']
 LOG_COLUMNS = ['ID', 'Date', 'Match', 'Analysis_Content', 'Confidence_Level']
-CAPITAL_COLUMNS = ['ID', 'Date', 'Type', 'Amount', 'Note']
 CATEGORY_OPTIONS = ["國內聯賽 (Domestic League)", "國際聯賽 (International League)", "國際盃賽 (Cup)", "國內盃賽 (Domestic Cup)", "友誼賽 (Friendly)"]
 
 # GitHub API 讀取與寫入輔助函式
@@ -87,64 +87,59 @@ def process_legacy_columns(df):
         df['User_Payout'] = df['Payout']
     return df
 
+def enforce_columns(df, columns):
+    if 'Account' in columns and 'Account' not in df.columns:
+        df['Account'] = 'Both'
+    for col in columns:
+        if col not in df.columns: 
+            df[col] = pd.Series(dtype='object')
+    return df[columns]
+
 def load_db(filename, columns, table_name):
     string_cols = [
         'ID', 'Date', 'Status', 'Tournament_Name', 'Tournament_Category', 
         'Match', 'Home_Team', 'Away_Team', 'Home_Rating', 'Away_Rating', 
         'Home_Form', 'Away_Form', 'Bet_Type', 'Selection', 'Odds_History', 'Result_Label',
-        'Type', 'Note'
+        'Type', 'Account', 'Note'
     ]
     
+    df = pd.DataFrame()
     # 策略 A: 嘗試 PostgreSQL 雲端資料庫
     if HAS_SQLALCHEMY and "DB_URL" in st.secrets and st.secrets["DB_URL"]:
         try:
             engine = create_engine(st.secrets["DB_URL"])
             df = pd.read_sql_table(table_name, engine)
             df = process_legacy_columns(df)
-            for col in columns:
-                if col not in df.columns: df[col] = pd.Series(dtype='object')
-            for col in string_cols:
-                if col in df.columns: df[col] = df[col].astype('object')
-            return df[columns]
         except Exception:
             pass
 
     # 策略 B: 嘗試 GitHub API 自動同步
-    if "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
+    if df.empty and "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
         try:
             gh_df = load_db_github(st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
             if gh_df is not None:
-                gh_df = process_legacy_columns(gh_df)
-                for col in columns:
-                    if col not in gh_df.columns: gh_df[col] = pd.Series(dtype='object')
-                for col in string_cols:
-                    if col in gh_df.columns: gh_df[col] = gh_df[col].astype('object')
-                return gh_df[columns]
+                df = process_legacy_columns(gh_df)
         except Exception:
             pass
 
     # 策略 C: 本地 CSV 讀取防呆
-    if os.path.exists(filename):
+    if df.empty and os.path.exists(filename):
         try:
             df = pd.read_csv(filename)
             if 'League' in df.columns and 'Tournament_Name' not in df.columns:
                 df['Tournament_Name'] = df['League']
                 df['Tournament_Category'] = CATEGORY_OPTIONS[0]
-            
             df = process_legacy_columns(df)
-            for col in columns:
-                if col not in df.columns: df[col] = pd.Series(dtype='object')
-            for col in string_cols:
-                if col in df.columns: df[col] = df[col].astype('object')
-                    
-            return df[columns]
         except Exception:
             pass
             
-    # 策略 D: 建立空 DataFrame
-    df = pd.DataFrame(columns=columns)
+    if df.empty:
+        df = pd.DataFrame(columns=columns)
+        
+    df = enforce_columns(df, columns)
     for col in string_cols:
         if col in df.columns: df[col] = df[col].astype('object')
+        
     return df
 
 def save_db(df, filename, table_name):
@@ -175,12 +170,19 @@ def save_db(df, filename, table_name):
 # ==========================================
 def recalculate_bankroll_from_scratch(df_cap, df_db):
     if df_cap.empty:
-        total_deposit, total_withdraw = 0.0, 0.0
+        sys_dep = sys_wit = usr_dep = usr_wit = 0.0
     else:
-        total_deposit = pd.to_numeric(df_cap[df_cap['Type'] == 'Deposit']['Amount'], errors='coerce').sum()
-        total_withdraw = pd.to_numeric(df_cap[df_cap['Type'] == 'Withdraw']['Amount'], errors='coerce').sum()
+        sys_cap = df_cap[df_cap['Account'].isin(['System', 'Both'])]
+        usr_cap = df_cap[df_cap['Account'].isin(['User', 'Both'])]
+
+        sys_dep = pd.to_numeric(sys_cap[sys_cap['Type'] == 'Deposit']['Amount'], errors='coerce').sum()
+        sys_wit = pd.to_numeric(sys_cap[sys_cap['Type'] == 'Withdraw']['Amount'], errors='coerce').sum()
+        
+        usr_dep = pd.to_numeric(usr_cap[usr_cap['Type'] == 'Deposit']['Amount'], errors='coerce').sum()
+        usr_wit = pd.to_numeric(usr_cap[usr_cap['Type'] == 'Withdraw']['Amount'], errors='coerce').sum()
     
-    net_deposit = max(0.0, total_deposit - total_withdraw)
+    sys_net = max(0.0, sys_dep - sys_wit)
+    usr_net = max(0.0, usr_dep - usr_wit)
     
     if df_db.empty:
         sys_profit = user_profit = 0.0
@@ -194,16 +196,15 @@ def recalculate_bankroll_from_scratch(df_cap, df_db):
         sys_open = pd.to_numeric(open_df['System_Stake'], errors='coerce').sum()
         user_open = pd.to_numeric(open_df['User_Stake'], errors='coerce').sum()
         
-    sys_bankroll = net_deposit + sys_profit - sys_open
-    user_bankroll = net_deposit + user_profit - user_open
+    sys_bankroll = sys_net + sys_profit - sys_open
+    user_bankroll = usr_net + user_profit - user_open
     
-    sys_max_stake = (net_deposit + sys_profit) * 0.10 
-    user_max_stake = (net_deposit + user_profit) * 0.10 
+    sys_max_stake = (sys_net + sys_profit) * 0.10 
+    user_max_stake = (usr_net + user_profit) * 0.10 
     
     return (
-        round(total_deposit, 2), round(total_withdraw, 2), round(net_deposit, 2), 
-        round(sys_profit, 2), round(sys_bankroll, 2), round(sys_max_stake, 2),
-        round(user_profit, 2), round(user_bankroll, 2), round(user_max_stake, 2)
+        round(sys_dep, 2), round(sys_wit, 2), round(sys_net, 2), round(sys_profit, 2), round(sys_bankroll, 2), round(sys_max_stake, 2),
+        round(usr_dep, 2), round(usr_wit, 2), round(usr_net, 2), round(user_profit, 2), round(user_bankroll, 2), round(user_max_stake, 2)
     )
 
 def calculate_settlement(bet_type, selection, line, odds, sys_stake, user_stake, h_g, a_g, h_c=0, a_c=0):
@@ -309,7 +310,6 @@ def evaluate_dimension(df_subset, dim_name, candidates_base, rating_map, h_data)
     msg = "運算成功" if valid else f"樣本數不足 ({n_samples} < 15場)"
     
     if valid:
-        # 機器學習與模型指標純粹根據「系統策略」學習，排除用家情緒性注碼干擾
         total_sys_stake = pd.to_numeric(df_subset['System_Stake'], errors='coerce').sum()
         total_sys_profit = pd.to_numeric(df_subset['System_Profit'], errors='coerce').sum()
         roi = (total_sys_profit / total_sys_stake) if total_sys_stake > 0 else 0
@@ -478,26 +478,42 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
             show_df_with_summary.to_excel(excel_data, index=False)
             st.download_button("📥 點擊下載投注紀錄 Excel 報表", excel_data.getvalue(), "football_betting_report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="btn_down_bets_xlsx")
         except:
-            st.download_button("📥 點擊下載投注紀錄報表 (CSV)", show_df_with_summary.to_csv(index=False).encode('utf-8'), "football_betting_report.csv", "text/csv", key="btn_down_bets_csv")
+            st.download_button("📥 點擊下載投注紀錄報表 (CSV)", show_df_with_summary.to_csv(index=False).encode('utf-8-sig'), "football_betting_report.csv", "text/csv", key="btn_down_bets_csv")
 
     with tab_capital:
-        st.subheader("💰 系統資金流水帳目 (Capital Flow Ledger)")
-        table_html, total_amount, tot_str, tot_color, tot_label = build_capital_flow_html(df_cap)
-        st.markdown(table_html, unsafe_allow_html=True)
+        st.subheader("💰 資金流水帳目 (Capital Flow Ledger)")
+        cap_tab1, cap_tab2 = st.tabs(["🤖 系統資金流水", "👤 用家真實資金流水"])
         
-        df_cap_exp = df_cap.copy()
-        cap_summary = {col: None for col in df_cap_exp.columns}
-        if 'ID' in cap_summary: cap_summary['ID'] = "TOTAL (總計)"
-        if 'Amount' in cap_summary: cap_summary['Amount'] = round(total_amount, 2)
-        if 'Note' in cap_summary: cap_summary['Note'] = tot_label.strip(" ()")
-        df_cap_exp = pd.concat([df_cap_exp, pd.DataFrame([cap_summary])], ignore_index=True)
-
-        excel_cap = io.BytesIO()
-        try:
-            df_cap_exp.to_excel(excel_cap, index=False)
-            st.download_button("📥 點擊下載資金流水 Excel 報表", excel_cap.getvalue(), "capital_flow_report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="btn_down_cap_xlsx")
-        except:
-            st.download_button("📥 點擊下載資金流水報表 (CSV)", df_cap_exp.to_csv(index=False).encode('utf-8'), "capital_flow_report.csv", "text/csv", key="btn_down_cap_csv")
+        sys_cap = df_cap[df_cap['Account'].isin(['System', 'Both'])]
+        usr_cap = df_cap[df_cap['Account'].isin(['User', 'Both'])]
+        
+        with cap_tab1:
+            st.markdown("##### 🤖 系統資金流水")
+            table_html_sys, tot_amt_sys, tot_str_sys, tot_color_sys, tot_label_sys = build_capital_flow_html(sys_cap)
+            st.markdown(table_html_sys, unsafe_allow_html=True)
+            
+            sys_cap_exp = sys_cap.copy()
+            sys_cap_summary = {col: None for col in sys_cap_exp.columns}
+            if 'ID' in sys_cap_summary: sys_cap_summary['ID'] = "TOTAL (總計)"
+            if 'Amount' in sys_cap_summary: sys_cap_summary['Amount'] = round(tot_amt_sys, 2)
+            if 'Note' in sys_cap_summary: sys_cap_summary['Note'] = tot_label_sys.strip(" ()")
+            sys_cap_exp = pd.concat([sys_cap_exp, pd.DataFrame([sys_cap_summary])], ignore_index=True)
+            
+            st.download_button("📥 下載系統資金報表 (CSV)", sys_cap_exp.to_csv(index=False).encode('utf-8-sig'), "system_capital_flow.csv", "text/csv", key="btn_down_sys_cap_csv")
+            
+        with cap_tab2:
+            st.markdown("##### 👤 用家真實資金流水")
+            table_html_usr, tot_amt_usr, tot_str_usr, tot_color_usr, tot_label_usr = build_capital_flow_html(usr_cap)
+            st.markdown(table_html_usr, unsafe_allow_html=True)
+            
+            usr_cap_exp = usr_cap.copy()
+            usr_cap_summary = {col: None for col in usr_cap_exp.columns}
+            if 'ID' in usr_cap_summary: usr_cap_summary['ID'] = "TOTAL (總計)"
+            if 'Amount' in usr_cap_summary: usr_cap_summary['Amount'] = round(tot_amt_usr, 2)
+            if 'Note' in usr_cap_summary: usr_cap_summary['Note'] = tot_label_usr.strip(" ()")
+            usr_cap_exp = pd.concat([usr_cap_exp, pd.DataFrame([usr_cap_summary])], ignore_index=True)
+            
+            st.download_button("📥 下載用家資金報表 (CSV)", usr_cap_exp.to_csv(index=False).encode('utf-8-sig'), "user_capital_flow.csv", "text/csv", key="btn_down_usr_cap_csv")
 
     with tab_manage:
         st.subheader("1. 批量刪除與一鍵清除")
@@ -510,7 +526,7 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
         else:
             df_target = df_cap
             target_name = 'cap'
-            opts = [f"{r['ID']} | {r['Date']} | {r.get('Type', '')} | ${r.get('Amount', 0)}" for _, r in df_target.iterrows()]
+            opts = [f"{r['ID']} | {r['Date']} | {r.get('Account', 'Both')} | {r.get('Type', '')} | ${r.get('Amount', 0)}" for _, r in df_target.iterrows()]
             
         selected_to_delete = st.multiselect("選擇要刪除的紀錄 (可多選):", opts)
         
@@ -700,7 +716,7 @@ def render_odds_section(odds_history_state, prefix="pre"):
 # 5. 主程式 UI 
 # ==========================================
 def main():
-    st.title("⚽ 足球博彩精算與資金管理系統")
+    st.title("⚽ Actuarial and fund management system by Dr. EdwinPro")
     
     if 'undo_stack' not in st.session_state:
         st.session_state.undo_stack = []
@@ -716,12 +732,15 @@ def main():
     st.session_state.df_db = load_db(db_file, DB_COLUMNS, db_table)
     st.session_state.df_cap = load_db(capital_file, CAPITAL_COLUMNS, cap_table)
 
-    tot_dep, tot_wit, net_dep, sys_pnl, sys_bankroll, sys_max_stake, usr_pnl, usr_bankroll, usr_max_stake = recalculate_bankroll_from_scratch(st.session_state.df_cap, st.session_state.df_db)
+    (sys_dep, sys_wit, sys_net, sys_pnl, sys_bankroll, sys_max_stake, 
+     usr_dep, usr_wit, usr_net, usr_pnl, usr_bankroll, usr_max_stake) = recalculate_bankroll_from_scratch(st.session_state.df_cap, st.session_state.df_db)
     
     # --- 系統本金區塊 ---
     st.sidebar.divider()
     st.sidebar.subheader("🤖 系統本金與盈虧總覽 (System)")
     st.sidebar.caption("主要供機器學習與策略檢驗使用")
+    st.sidebar.metric("系統總存入本金", f"${sys_dep:,.2f}")
+    st.sidebar.metric("系統總提取本金", f"${sys_wit:,.2f}")
     st.sidebar.metric("系統累積總盈虧 (PnL)", f"${sys_pnl:,.2f}", delta=f"${sys_pnl:,.2f}")
     st.sidebar.metric("系統當前可用資金 (Bankroll)", f"${sys_bankroll:,.2f}")
     st.sidebar.caption(f"🛑 **系統單注上限 (動態資金 10%)**: `${sys_max_stake:,.2f}`")
@@ -730,27 +749,33 @@ def main():
     st.sidebar.divider()
     st.sidebar.subheader("👤 用家真實本金與盈虧總覽 (User Actual)")
     st.sidebar.caption("供用家作真實資金管理及記錄參考")
-    st.sidebar.metric("總存入本金", f"${tot_dep:,.2f}")
-    st.sidebar.metric("總提取本金", f"${tot_wit:,.2f}")
+    st.sidebar.metric("用家總存入本金", f"${usr_dep:,.2f}")
+    st.sidebar.metric("用家總提取本金", f"${usr_wit:,.2f}")
     st.sidebar.metric("用家真實累積總盈虧 (PnL)", f"${usr_pnl:,.2f}", delta=f"${usr_pnl:,.2f}")
     st.sidebar.metric("用家當前真實可用資金 (Bankroll)", f"${usr_bankroll:,.2f}")
 
     with st.sidebar.expander("💸 資金存提管理"):
+        cap_account = st.radio("目標帳戶 (Account)", ["🤖 系統本金 (System)", "👤 用家本金 (User)", "🔄 兩者同步 (Both)"], index=2)
         cap_action = st.radio("動作", ["Deposit (存入本金)", "Withdraw (提取本金)"])
         cap_amount = st.number_input("金額 ($)", min_value=1.0, value=1000.0, step=100.0)
         cap_note = st.text_input("備註 (選填)")
         
         if st.button("確認寫入資金紀錄"):
+            acc_val = 'Both'
+            if "System" in cap_account: acc_val = 'System'
+            elif "User" in cap_account: acc_val = 'User'
+            
             new_cap_record = {
                 'ID': f"C{datetime.now().strftime('%Y%m%d%H%M%S')}",
                 'Date': datetime.now().strftime('%Y-%m-%d %H:%M'),
                 'Type': 'Deposit' if 'Deposit' in cap_action else 'Withdraw',
+                'Account': acc_val,
                 'Amount': float(cap_amount),
                 'Note': cap_note
             }
             st.session_state.df_cap = pd.concat([st.session_state.df_cap, pd.DataFrame([new_cap_record])], ignore_index=True)
             save_db(st.session_state.df_cap, capital_file, cap_table)
-            st.toast("✅ 資金紀錄雲端同步成功！系統本金已自動重構。", icon="💰")
+            st.toast("✅ 資金紀錄雲端同步成功！系統與用家本金已自動重構。", icon="💰")
             st.rerun()
 
     st.sidebar.divider()
