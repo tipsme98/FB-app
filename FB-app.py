@@ -35,12 +35,13 @@ DB_COLUMNS = [
     'ID', 'Date', 'Status', 
     'Tournament_Name', 'Tournament_Category', 'Match', 'Home_Team', 'Away_Team', 
     'Home_Rating', 'Away_Rating', 'Home_Form', 'Away_Form',
-    'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 'Stake', 'Odds_History',
+    'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 
+    'System_Stake', 'User_Stake', 'Odds_History',
     'InPlay_Minute', 'Home_DA', 'Away_DA', 'Home_SoT', 'Away_SoT', 'Home_SoFF', 'Away_SoFF',
     'Home_Red', 'Away_Red', 'Home_Sub', 'Away_Sub', 'Home_Possession', 'Away_Possession',
     'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner', 
     'Home_Goal_Conversion', 'Away_Goal_Conversion', 'Home_Firepower', 'Away_Firepower',
-    'Result_Label', 'Profit', 'Unit_Profit', 'Payout'
+    'Result_Label', 'System_Profit', 'User_Profit', 'Unit_Profit', 'System_Payout', 'User_Payout'
 ]
 LOG_COLUMNS = ['ID', 'Date', 'Match', 'Analysis_Content', 'Confidence_Level']
 CAPITAL_COLUMNS = ['ID', 'Date', 'Type', 'Amount', 'Note']
@@ -73,6 +74,19 @@ def save_db_github(df, repo, path, token):
         
     requests.put(url, json=payload, headers=headers)
 
+def process_legacy_columns(df):
+    """處理舊資料庫欄位轉移防呆"""
+    if 'Stake' in df.columns and 'System_Stake' not in df.columns:
+        df['System_Stake'] = df['Stake']
+        df['User_Stake'] = df['Stake']
+    if 'Profit' in df.columns and 'System_Profit' not in df.columns:
+        df['System_Profit'] = df['Profit']
+        df['User_Profit'] = df['Profit']
+    if 'Payout' in df.columns and 'System_Payout' not in df.columns:
+        df['System_Payout'] = df['Payout']
+        df['User_Payout'] = df['Payout']
+    return df
+
 def load_db(filename, columns, table_name):
     string_cols = [
         'ID', 'Date', 'Status', 'Tournament_Name', 'Tournament_Category', 
@@ -81,32 +95,30 @@ def load_db(filename, columns, table_name):
         'Type', 'Note'
     ]
     
-    # 策略 A: 嘗試 PostgreSQL 雲端資料庫 (全背景隱藏執行)
+    # 策略 A: 嘗試 PostgreSQL 雲端資料庫
     if HAS_SQLALCHEMY and "DB_URL" in st.secrets and st.secrets["DB_URL"]:
         try:
             engine = create_engine(st.secrets["DB_URL"])
             df = pd.read_sql_table(table_name, engine)
+            df = process_legacy_columns(df)
             for col in columns:
-                if col not in df.columns: 
-                    df[col] = pd.Series(dtype='object')
+                if col not in df.columns: df[col] = pd.Series(dtype='object')
             for col in string_cols:
-                if col in df.columns:
-                    df[col] = df[col].astype('object')
+                if col in df.columns: df[col] = df[col].astype('object')
             return df[columns]
         except Exception:
             pass
 
-    # 策略 B: 嘗試 GitHub API 自動同步 (全背景隱藏執行)
+    # 策略 B: 嘗試 GitHub API 自動同步
     if "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
         try:
             gh_df = load_db_github(st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
             if gh_df is not None:
+                gh_df = process_legacy_columns(gh_df)
                 for col in columns:
-                    if col not in gh_df.columns: 
-                        gh_df[col] = pd.Series(dtype='object')
+                    if col not in gh_df.columns: gh_df[col] = pd.Series(dtype='object')
                 for col in string_cols:
-                    if col in gh_df.columns:
-                        gh_df[col] = gh_df[col].astype('object')
+                    if col in gh_df.columns: gh_df[col] = gh_df[col].astype('object')
                 return gh_df[columns]
         except Exception:
             pass
@@ -119,12 +131,11 @@ def load_db(filename, columns, table_name):
                 df['Tournament_Name'] = df['League']
                 df['Tournament_Category'] = CATEGORY_OPTIONS[0]
             
+            df = process_legacy_columns(df)
             for col in columns:
-                if col not in df.columns: 
-                    df[col] = pd.Series(dtype='object')
+                if col not in df.columns: df[col] = pd.Series(dtype='object')
             for col in string_cols:
-                if col in df.columns:
-                    df[col] = df[col].astype('object')
+                if col in df.columns: df[col] = df[col].astype('object')
                     
             return df[columns]
         except Exception:
@@ -133,12 +144,10 @@ def load_db(filename, columns, table_name):
     # 策略 D: 建立空 DataFrame
     df = pd.DataFrame(columns=columns)
     for col in string_cols:
-        if col in df.columns:
-            df[col] = df[col].astype('object')
+        if col in df.columns: df[col] = df[col].astype('object')
     return df
 
 def save_db(df, filename, table_name):
-    # 策略 A: 寫入 PostgreSQL 雲端資料庫 (全背景隱藏執行)
     if HAS_SQLALCHEMY and "DB_URL" in st.secrets and st.secrets["DB_URL"]:
         try:
             engine = create_engine(st.secrets["DB_URL"])
@@ -150,21 +159,19 @@ def save_db(df, filename, table_name):
         except Exception:
             pass
 
-    # 策略 B: 寫入 GitHub 自動同步 (全背景隱藏執行)
     if "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
         try:
             save_db_github(df, st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
         except Exception:
             pass
 
-    # 策略 C: 寫入本地 CSV 備份
     try:
         df.to_csv(filename, index=False)
     except Exception:
         pass
 
 # ==========================================
-# 2. 資金、風控與累計算式
+# 2. 資金、風控與累計算式 (分離系統與真實資金)
 # ==========================================
 def recalculate_bankroll_from_scratch(df_cap, df_db):
     if df_cap.empty:
@@ -176,20 +183,30 @@ def recalculate_bankroll_from_scratch(df_cap, df_db):
     net_deposit = max(0.0, total_deposit - total_withdraw)
     
     if df_db.empty:
-        total_profit = 0.0
-        open_stake = 0.0
+        sys_profit = user_profit = 0.0
+        sys_open = user_open = 0.0
     else:
         settled_df = df_db[df_db['Status'] == 'Settled']
         open_df = df_db[df_db['Status'] == 'Open']
-        total_profit = pd.to_numeric(settled_df['Profit'], errors='coerce').sum()
-        open_stake = pd.to_numeric(open_df['Stake'], errors='coerce').sum()
         
-    current_bankroll = net_deposit + total_profit - open_stake
-    max_single_stake = (net_deposit + total_profit) * 0.10 
+        sys_profit = pd.to_numeric(settled_df['System_Profit'], errors='coerce').sum()
+        user_profit = pd.to_numeric(settled_df['User_Profit'], errors='coerce').sum()
+        sys_open = pd.to_numeric(open_df['System_Stake'], errors='coerce').sum()
+        user_open = pd.to_numeric(open_df['User_Stake'], errors='coerce').sum()
+        
+    sys_bankroll = net_deposit + sys_profit - sys_open
+    user_bankroll = net_deposit + user_profit - user_open
     
-    return round(total_deposit, 2), round(total_withdraw, 2), round(net_deposit, 2), round(total_profit, 2), round(current_bankroll, 2), round(max_single_stake, 2)
+    sys_max_stake = (net_deposit + sys_profit) * 0.10 
+    user_max_stake = (net_deposit + user_profit) * 0.10 
+    
+    return (
+        round(total_deposit, 2), round(total_withdraw, 2), round(net_deposit, 2), 
+        round(sys_profit, 2), round(sys_bankroll, 2), round(sys_max_stake, 2),
+        round(user_profit, 2), round(user_bankroll, 2), round(user_max_stake, 2)
+    )
 
-def calculate_settlement(bet_type, selection, line, odds, stake, h_g, a_g, h_c=0, a_c=0):
+def calculate_settlement(bet_type, selection, line, odds, sys_stake, user_stake, h_g, a_g, h_c=0, a_c=0):
     diff = 0.0
     clean_btype = bet_type.replace(" (即場)", "")
     
@@ -209,42 +226,54 @@ def calculate_settlement(bet_type, selection, line, odds, stake, h_g, a_g, h_c=0
     
     if diff >= 0.5:
         res_label = "✅ 全贏"
-        profit = stake * (odds - 1)
-        payout = stake + profit
+        sys_profit = sys_stake * (odds - 1)
+        user_profit = user_stake * (odds - 1)
+        sys_payout = sys_stake + sys_profit
+        user_payout = user_stake + user_profit
         unit_profit = round(odds - 1.0, 2)
     elif diff == 0.25:
         res_label = "🟢 贏半"
-        profit = stake * (odds - 1) / 2
-        payout = stake + profit
+        sys_profit = sys_stake * (odds - 1) / 2
+        user_profit = user_stake * (odds - 1) / 2
+        sys_payout = sys_stake + sys_profit
+        user_payout = user_stake + user_profit
         unit_profit = round((odds - 1.0) / 2.0, 2)
     elif diff == 0.0:
         res_label = "⚪ 走盤退本"
-        profit = 0.0
-        payout = stake
+        sys_profit = user_profit = 0.0
+        sys_payout = sys_stake
+        user_payout = user_stake
         unit_profit = 0.0
     elif diff == -0.25:
         res_label = "🔴 輸半 (退回半本)"
-        profit = -stake / 2
-        payout = stake / 2
+        sys_profit = -sys_stake / 2
+        user_profit = -user_stake / 2
+        sys_payout = sys_stake / 2
+        user_payout = user_stake / 2
         unit_profit = -0.50
     else:
         res_label = "❌ 全輸"
-        profit = -stake
-        payout = 0.0
+        sys_profit = -sys_stake
+        user_profit = -user_stake
+        sys_payout = user_payout = 0.0
         unit_profit = -1.00
 
-    return round(profit, 2), round(payout, 2), unit_profit, res_label, diff
+    return (
+        round(sys_profit, 2), round(user_profit, 2), 
+        round(sys_payout, 2), round(user_payout, 2), 
+        unit_profit, res_label, diff
+    )
 
 def display_cumulative_metrics(df):
-    total_profit = pd.to_numeric(df['Profit'], errors='coerce').sum()
-    total_unit_profit = pd.to_numeric(df['Unit_Profit'], errors='coerce').sum()
-    total_payout = pd.to_numeric(df['Payout'], errors='coerce').sum()
+    sys_profit = pd.to_numeric(df['System_Profit'], errors='coerce').sum()
+    user_profit = pd.to_numeric(df['User_Profit'], errors='coerce').sum()
+    user_payout = pd.to_numeric(df['User_Payout'], errors='coerce').sum()
     
     st.markdown("### 📊 數據庫累計總額看板 (Cumulative Summary)")
     m1, m2, m3 = st.columns(3)
-    m1.metric("累積淨盈虧 (Total Profit)", f"${total_profit:,.2f}", delta=f"{total_profit:,.2f}")
-    m2.metric("累積單位平注盈虧 (Total Unit Profit)", f"{total_unit_profit:,.2f} U", delta=f"{total_unit_profit:,.2f} U")
-    m3.metric("累積派彩總額 (Total Payout)", f"${total_payout:,.2f}")
+    m1.metric("系統累積淨盈虧 (System Profit)", f"${sys_profit:,.2f}", delta=f"{sys_profit:,.2f}")
+    m2.metric("用家真實淨盈虧 (User Profit)", f"${user_profit:,.2f}", delta=f"{user_profit:,.2f}")
+    m3.metric("用家派彩總額 (User Payout)", f"${user_payout:,.2f}")
     st.divider()
 
 # ==========================================
@@ -280,9 +309,10 @@ def evaluate_dimension(df_subset, dim_name, candidates_base, rating_map, h_data)
     msg = "運算成功" if valid else f"樣本數不足 ({n_samples} < 15場)"
     
     if valid:
-        total_stake = pd.to_numeric(df_subset['Stake'], errors='coerce').sum()
-        total_profit = pd.to_numeric(df_subset['Profit'], errors='coerce').sum()
-        roi = (total_profit / total_stake) if total_stake > 0 else 0
+        # 機器學習與模型指標純粹根據「系統策略」學習，排除用家情緒性注碼干擾
+        total_sys_stake = pd.to_numeric(df_subset['System_Stake'], errors='coerce').sum()
+        total_sys_profit = pd.to_numeric(df_subset['System_Profit'], errors='coerce').sum()
+        roi = (total_sys_profit / total_sys_stake) if total_sys_stake > 0 else 0
         wins = len(df_subset[pd.to_numeric(df_subset['Unit_Profit'], errors='coerce') > 0])
         acc = wins / n_samples if n_samples > 0 else 0
     else:
@@ -323,7 +353,7 @@ def evaluate_dimension(df_subset, dim_name, candidates_base, rating_map, h_data)
     }
 
 # ==========================================
-# 4. 資金流水 HTML 構建 (無 Markdown 縮排)
+# 4. 資金流水 HTML 構建
 # ==========================================
 def build_capital_flow_html(df_cap):
     if df_cap.empty:
@@ -426,15 +456,17 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
         else:
             show_df = df_db.copy()
 
-        total_profit = pd.to_numeric(show_df['Profit'], errors='coerce').sum()
+        total_sys_profit = pd.to_numeric(show_df['System_Profit'], errors='coerce').sum()
+        total_user_profit = pd.to_numeric(show_df['User_Profit'], errors='coerce').sum()
         total_unit = pd.to_numeric(show_df['Unit_Profit'], errors='coerce').sum()
-        total_payout = pd.to_numeric(show_df['Payout'], errors='coerce').sum()
+        total_user_payout = pd.to_numeric(show_df['User_Payout'], errors='coerce').sum()
 
         summary_data = {col: None for col in show_df.columns}
         if 'ID' in summary_data: summary_data['ID'] = "TOTAL (總計)"
-        if 'Profit' in summary_data: summary_data['Profit'] = round(total_profit, 2)
+        if 'System_Profit' in summary_data: summary_data['System_Profit'] = round(total_sys_profit, 2)
+        if 'User_Profit' in summary_data: summary_data['User_Profit'] = round(total_user_profit, 2)
         if 'Unit_Profit' in summary_data: summary_data['Unit_Profit'] = round(total_unit, 2)
-        if 'Payout' in summary_data: summary_data['Payout'] = round(total_payout, 2)
+        if 'User_Payout' in summary_data: summary_data['User_Payout'] = round(total_user_payout, 2)
 
         summary_row = pd.DataFrame([summary_data])
         show_df_with_summary = pd.concat([show_df, summary_row], ignore_index=True)
@@ -490,7 +522,6 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
                     ids_to_delete = [x.split(" | ")[0] for x in selected_to_delete]
                     df_to_delete = df_target[df_target['ID'].isin(ids_to_delete)]
                     
-                    # 加入復原堆疊並限制最近 10 次
                     st.session_state.undo_stack.append({
                         'id': f"U{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
                         'target': target_name,
@@ -516,7 +547,6 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
                 st.caption("此操作會將當前資料表所有紀錄移除，點擊下方確認執行。")
                 if st.button("⚠️ 確認清空全部", type="primary", use_container_width=True):
                     if not df_target.empty:
-                        # 加入復原堆疊並限制最近 10 次
                         st.session_state.undo_stack.append({
                             'id': f"U{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
                             'target': target_name,
@@ -541,7 +571,6 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
             st.write(f"目前系統為您保留最近 **{len(st.session_state.undo_stack)}** 次的刪除操作供隨時復原。")
             undo_options = []
             
-            # 建立選單選項，反轉順序讓最新刪除的操作排在最上面
             for idx, action in enumerate(reversed(st.session_state.undo_stack)):
                 t_label = "⚽ 投注紀錄" if action['target'] == 'bets' else "💰 資金流水"
                 real_idx = len(st.session_state.undo_stack) - 1 - idx
@@ -565,7 +594,6 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
                 st.rerun()
 
 def get_last_odds_state(history, target_type, default_line):
-    # 尋找歷史紀錄中最後一筆相同類型的盤口，直接複製資料
     for row in reversed(history):
         if row['type'] == target_type:
             return {
@@ -576,7 +604,6 @@ def get_last_odds_state(history, target_type, default_line):
                 "unlock": bool(row.get('unlock', False)),
                 "margin": float(row.get('margin', 1.085))
             }
-    # 若為第一筆無紀錄可參考，回傳預設值
     return {
         "type": target_type,
         "line": default_line,
@@ -675,7 +702,6 @@ def render_odds_section(odds_history_state, prefix="pre"):
 def main():
     st.title("⚽ 足球博彩精算與資金管理系統")
     
-    # 初始化全域 Undo 堆疊 (紀錄最近10次)
     if 'undo_stack' not in st.session_state:
         st.session_state.undo_stack = []
         
@@ -687,19 +713,27 @@ def main():
     db_table = "football_bets_test" if mode == "🧪 測試模式" else "football_bets"
     cap_table = "football_cap_test" if mode == "🧪 測試模式" else "football_cap"
     
-    # 載入資料庫 (背景自動執行同步讀取)
     st.session_state.df_db = load_db(db_file, DB_COLUMNS, db_table)
     st.session_state.df_cap = load_db(capital_file, CAPITAL_COLUMNS, cap_table)
 
-    tot_dep, tot_wit, net_dep, tot_pnl, curr_bankroll, max_stake = recalculate_bankroll_from_scratch(st.session_state.df_cap, st.session_state.df_db)
+    tot_dep, tot_wit, net_dep, sys_pnl, sys_bankroll, sys_max_stake, usr_pnl, usr_bankroll, usr_max_stake = recalculate_bankroll_from_scratch(st.session_state.df_cap, st.session_state.df_db)
     
+    # --- 系統本金區塊 ---
     st.sidebar.divider()
-    st.sidebar.subheader("💰 系統本金與盈虧總覽")
+    st.sidebar.subheader("🤖 系統本金與盈虧總覽 (System)")
+    st.sidebar.caption("主要供機器學習與策略檢驗使用")
+    st.sidebar.metric("系統累積總盈虧 (PnL)", f"${sys_pnl:,.2f}", delta=f"${sys_pnl:,.2f}")
+    st.sidebar.metric("系統當前可用資金 (Bankroll)", f"${sys_bankroll:,.2f}")
+    st.sidebar.caption(f"🛑 **系統單注上限 (動態資金 10%)**: `${sys_max_stake:,.2f}`")
+
+    # --- 用家真實本金區塊 ---
+    st.sidebar.divider()
+    st.sidebar.subheader("👤 用家真實本金與盈虧總覽 (User Actual)")
+    st.sidebar.caption("供用家作真實資金管理及記錄參考")
     st.sidebar.metric("總存入本金", f"${tot_dep:,.2f}")
     st.sidebar.metric("總提取本金", f"${tot_wit:,.2f}")
-    st.sidebar.metric("累積總盈虧 (PnL)", f"${tot_pnl:,.2f}", delta=f"${tot_pnl:,.2f}")
-    st.sidebar.metric("當前總可用資金 (Bankroll)", f"${curr_bankroll:,.2f}")
-    st.sidebar.caption(f"🛑 **單注上限 (動態資金 10%)**: `${max_stake:,.2f}`")
+    st.sidebar.metric("用家真實累積總盈虧 (PnL)", f"${usr_pnl:,.2f}", delta=f"${usr_pnl:,.2f}")
+    st.sidebar.metric("用家當前真實可用資金 (Bankroll)", f"${usr_bankroll:,.2f}")
 
     with st.sidebar.expander("💸 資金存提管理"):
         cap_action = st.radio("動作", ["Deposit (存入本金)", "Withdraw (提取本金)"])
@@ -727,7 +761,7 @@ def main():
 
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
-        if curr_bankroll <= 0: st.warning("⚠️ 目前系統可用資金不足！無法精確計算建議注碼。請先至側邊欄存入本金。")
+        if sys_bankroll <= 0: st.warning("⚠️ 目前系統可用資金不足！無法精確計算建議注碼。請先至側邊欄存入本金。")
         
         opts_tournaments = ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Tournament_Name'].dropna().unique())))
         opts_teams = ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Home_Team'].dropna().tolist() + st.session_state.df_db['Away_Team'].dropna().tolist())))
@@ -812,11 +846,11 @@ def main():
             
             suggested_stake = 0
             upgrade_msg = ""
-            if 'ev' in best_bet and best_bet['ev'] > 0 and curr_bankroll > 0:
+            if 'ev' in best_bet and best_bet['ev'] > 0 and sys_bankroll > 0:
                 b = best_bet['odds'] - 1
                 kelly = max(0.0, min((best_bet['prob'] * b - (1 - best_bet['prob'])) / b, 0.10))
-                raw_stake = (curr_bankroll * (kelly * 0.5))
-                suggested_stake = min(float(max_stake), float(round(raw_stake / 10) * 10))
+                raw_stake = (sys_bankroll * (kelly * 0.5))
+                suggested_stake = min(float(sys_max_stake), float(round(raw_stake / 10) * 10))
                 
                 if "讓球" in best_bet['bet_type']:
                     if 0 < suggested_stake < 200:
@@ -845,7 +879,7 @@ def main():
                     st.markdown(f"**{title}**")
                     if r['valid']:
                         st.write(f"樣本數: `{r['n']}` 場")
-                        st.write(f"回測 ROI: `{r['roi']*100:.1f}%`")
+                        st.write(f"系統策略 ROI: `{r['roi']*100:.1f}%`")
                         st.write(f"歷史勝率: `{r['acc']*100:.1f}%`")
                     else:
                         st.warning(r['msg'])
@@ -857,7 +891,6 @@ def main():
 
             st.markdown(f"### 🧠 AI 預測模型推薦")
             
-            # --- 新增：顯示所有盤口評估明細清單 ---
             st.markdown("#### 📊 所有盤口評估明細 (系統決策依據)")
             cand_list = bm.get('candidates', [])
             if cand_list:
@@ -868,14 +901,12 @@ def main():
                 df_show['預期勝率'] = df_show['預期勝率'].apply(lambda x: f"{x*100:.2f}%")
                 df_show['期望值 (EV)'] = df_show['期望值 (EV)'].apply(lambda x: f"{x:.3f}")
                 
-                # 第一名首選呈現高亮
                 def highlight_first(row):
                     if row.name == 0:
                         return ['background-color: rgba(40, 167, 69, 0.2)'] * len(row)
                     return [''] * len(row)
                     
                 st.dataframe(df_show.style.apply(highlight_first, axis=1), use_container_width=True)
-            # ------------------------------------
             
             st.info(f"系統分析顯示，針對『{res['t_name']}』，採用『{bm['dim']}』級別的模型進行運算，其歷史準確率與 EV 獲利期望值最高，故本次投注策略依據此模型生成。")
             
@@ -883,7 +914,6 @@ def main():
             mc1.metric("💡 首選推薦", f"{bb['bet_type']} - {bb['label']}")
             mc2.metric(f"🎯 預期勝率 ({dim_short}修正)", f"{bb.get('prob', bb.get('base_prob',0))*100:.1f}%")
             mc3.metric("📊 修正 EV", f"{bb.get('ev', 0):.3f}")
-            st.markdown(f"**建議注碼**：`${res['stake']:,.2f}`")
             
             if res.get('upgrade_msg'):
                 if "放棄" in res['upgrade_msg']:
@@ -892,10 +922,14 @@ def main():
                     st.info(res['upgrade_msg'])
 
             with st.form("bet_form"):
-                bc1, bc2, bc3 = st.columns(3)
+                bc1, bc2 = st.columns(2)
                 final_btype = bc1.selectbox("最終投注項目", [c['bet_type'] for c in bm.get('candidates', [bb])], index=0)
                 final_sel = bc2.selectbox("最終投注方向", ["Home", "Away", "Over", "Under"], index=["Home", "Away", "Over", "Under"].index(bb['selection']))
-                final_stake = bc3.number_input("實際下注金額 ($)", min_value=0.0, step=10.0, value=float(res['stake'] if res['stake'] > 0 else 0.0))
+                
+                bc3, bc4 = st.columns(2)
+                final_sys_stake = float(res['stake'] if res['stake'] > 0 else 0.0)
+                bc3.text_input("🤖 系統建議下注金額 (System Stake) - 供分析學習用", f"${final_sys_stake:,.2f}", disabled=True)
+                final_user_stake = bc4.number_input("👤 用家真實下注金額 (User Actual Stake) ($)", min_value=0.0, step=10.0, value=float(final_sys_stake))
                 
                 final_row = next((r for r in st.session_state.odds_history if r['type'] == final_btype), st.session_state.odds_history[-1])
                 line, odds = float(final_row['line']), float(final_row['upper']) if final_sel in ["Home", "Over"] else float(final_row['lower'])
@@ -907,7 +941,8 @@ def main():
                         'Tournament_Name': res['t_name'], 'Tournament_Category': res['t_cat'], 
                         'Match': f"{home_team} vs {away_team}", 'Home_Team': home_team, 'Away_Team': away_team,
                         'Home_Rating': home_rating, 'Away_Rating': away_rating, 'Home_Form': home_form, 'Away_Form': away_form,
-                        'Bet_Type': final_btype, 'Selection': final_sel, 'Initial_Line': line, 'Initial_Odds': odds, 'Stake': final_stake,
+                        'Bet_Type': final_btype, 'Selection': final_sel, 'Initial_Line': line, 'Initial_Odds': odds, 
+                        'System_Stake': final_sys_stake, 'User_Stake': final_user_stake,
                         'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False)
                     }
                     st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame([new_record])], ignore_index=True)
@@ -1059,11 +1094,11 @@ def main():
                 
                 suggested_stake = 0
                 upgrade_msg = ""
-                if best_bet and best_bet['ev'] > 0 and curr_bankroll > 0:
+                if best_bet and best_bet['ev'] > 0 and sys_bankroll > 0:
                     b = best_bet['odds'] - 1
                     kelly = max(0.0, min((best_bet['prob'] * b - (1 - best_bet['prob'])) / b, 0.10))
-                    raw_stake = (curr_bankroll * (kelly * 0.5))
-                    suggested_stake = min(float(max_stake), float(round(raw_stake / 10) * 10))
+                    raw_stake = (sys_bankroll * (kelly * 0.5))
+                    suggested_stake = min(float(sys_max_stake), float(round(raw_stake / 10) * 10))
                     
                     if "讓球" in best_bet['bet_type']:
                         if 0 < suggested_stake < 200:
@@ -1089,7 +1124,6 @@ def main():
                 
                 st.success("✅ 結合火力與剩餘時間的即場 EV 精算完成！")
                 
-                # --- 新增：顯示所有即場盤口評估明細清單 ---
                 if res.get('candidates'):
                     st.markdown("#### 📊 所有即場盤口評估明細 (系統決策依據)")
                     df_inplay_show = pd.DataFrame(res['candidates'])
@@ -1105,7 +1139,6 @@ def main():
                         return [''] * len(row)
                         
                     st.dataframe(df_inplay_show.style.apply(highlight_first_inplay, axis=1), use_container_width=True)
-                # ----------------------------------------
                 
                 if best_bet:
                     st.info("系統已成功納入進攻火力效率與得分率，為您挑選出最佳價值的即場盤口：")
@@ -1113,7 +1146,6 @@ def main():
                     mc1.metric("💡 首選推薦", f"{best_bet['bet_type']} - {best_bet['label']}")
                     mc2.metric(f"🎯 動態勝率預測", f"{best_bet['prob']*100:.1f}%")
                     mc3.metric("📊 即場 EV", f"{best_bet['ev']:.3f}")
-                    st.markdown(f"**建議即場注碼**：`${res['stake']:,.2f}`")
                     
                     if res.get('upgrade_msg'):
                         if "放棄" in res['upgrade_msg']:
@@ -1122,10 +1154,14 @@ def main():
                             st.info(res['upgrade_msg'])
                     
                     with st.form("inplay_bet_form"):
-                        bc1, bc2, bc3 = st.columns(3)
+                        bc1, bc2 = st.columns(2)
                         final_btype = bc1.selectbox("最終投注項目", [c['bet_type'] for c in res['candidates']], index=0)
                         final_sel = bc2.selectbox("最終投注方向", ["Home", "Away", "Over", "Under"], index=["Home", "Away", "Over", "Under"].index(best_bet['selection']))
-                        final_stake = bc3.number_input("實際下注金額 ($)", min_value=0.0, step=10.0, value=float(res['stake'] if res['stake'] > 0 else 0.0))
+                        
+                        bc3, bc4 = st.columns(2)
+                        final_sys_stake = float(res['stake'] if res['stake'] > 0 else 0.0)
+                        bc3.text_input("🤖 系統建議下注金額 (System Stake) - 供分析學習用", f"${final_sys_stake:,.2f}", disabled=True)
+                        final_user_stake = bc4.number_input("👤 用家真實下注金額 (User Actual Stake) ($)", min_value=0.0, step=10.0, value=float(final_sys_stake))
                         
                         if st.form_submit_button("✅ 確認即場投注並扣除本金"):
                             final_row = next((r for r in st.session_state.inplay_odds_history if r['type'] == final_btype), st.session_state.inplay_odds_history[-1])
@@ -1138,7 +1174,8 @@ def main():
                             new_record.update({
                                 'ID': new_id, 'Date': datetime.now().strftime('%Y-%m-%d %H:%M'),
                                 'Bet_Type': f"{final_btype} (即場)", 'Selection': final_sel,
-                                'Initial_Line': line, 'Initial_Odds': odds, 'Stake': final_stake,
+                                'Initial_Line': line, 'Initial_Odds': odds, 
+                                'System_Stake': final_sys_stake, 'User_Stake': final_user_stake,
                                 'Status': 'Open', 'Odds_History': json.dumps(st.session_state.inplay_odds_history, ensure_ascii=False),
                                 'InPlay_Minute': minute, 'Home_Goal': h_g, 'Away_Goal': a_g, 'Home_Corner': h_c, 'Away_Corner': a_c,
                                 'Home_DA': h_da, 'Away_DA': a_da, 'Home_SoT': h_sot, 'Away_SoT': a_sot,
@@ -1146,7 +1183,7 @@ def main():
                                 'Home_Sub': h_sub, 'Away_Sub': a_sub, 'Home_Possession': h_poss, 'Away_Possession': a_poss,
                                 'Home_Goal_Conversion': h_conv, 'Away_Goal_Conversion': a_conv, 
                                 'Home_Firepower': h_fire, 'Away_Firepower': a_fire,
-                                'Result_Label': '', 'Profit': 0, 'Unit_Profit': 0, 'Payout': 0
+                                'Result_Label': '', 'System_Profit': 0, 'User_Profit': 0, 'Unit_Profit': 0, 'System_Payout': 0, 'User_Payout': 0
                             })
                             
                             match_mask = st.session_state.df_db['Match'] == match_info['Match']
@@ -1199,9 +1236,10 @@ def main():
                         a_c = col4.number_input("全場客隊角球數", min_value=0, value=int(row.get('Away_Corner', 0)) if pd.notna(row.get('Away_Corner')) else 0, key=f"ac_{row['ID']}")
                         
                         if st.form_submit_button("確認賽果並雲端結算"):
-                            prof, payout, u_prof, lbl, diff = calculate_settlement(
+                            sys_p, usr_p, sys_pay, usr_pay, u_prof, lbl, diff = calculate_settlement(
                                 row['Bet_Type'], row['Selection'], float(row['Initial_Line']), 
-                                float(row['Initial_Odds']), float(row['Stake']), h_g, a_g, h_c, a_c
+                                float(row['Initial_Odds']), float(row.get('System_Stake', 0)), float(row.get('User_Stake', 0)), 
+                                h_g, a_g, h_c, a_c
                             )
                             st.session_state.df_db['Result_Label'] = st.session_state.df_db['Result_Label'].astype('object')
                             st.session_state.df_db['Status'] = st.session_state.df_db['Status'].astype('object')
@@ -1211,9 +1249,11 @@ def main():
                             st.session_state.df_db.loc[idx, 'Home_Corner'] = h_c
                             st.session_state.df_db.loc[idx, 'Away_Corner'] = a_c
                             st.session_state.df_db.loc[idx, 'Result_Label'] = str(lbl)
-                            st.session_state.df_db.loc[idx, 'Profit'] = float(prof)
+                            st.session_state.df_db.loc[idx, 'System_Profit'] = float(sys_p)
+                            st.session_state.df_db.loc[idx, 'User_Profit'] = float(usr_p)
+                            st.session_state.df_db.loc[idx, 'System_Payout'] = float(sys_pay)
+                            st.session_state.df_db.loc[idx, 'User_Payout'] = float(usr_pay)
                             st.session_state.df_db.loc[idx, 'Unit_Profit'] = float(u_prof)
-                            st.session_state.df_db.loc[idx, 'Payout'] = float(payout)
                             st.session_state.df_db.loc[idx, 'Status'] = 'Settled'
                             
                             save_db(st.session_state.df_db, db_file, db_table)
@@ -1229,7 +1269,7 @@ def main():
         if not settled_bets.empty:
             rollback_options = []
             for _, r in settled_bets.iterrows():
-                rollback_options.append(f"{r['ID']} | [{r['Date']}] {r['Match']} | 結算狀態: {r['Result_Label']} | 盈虧: ${r['Profit']}")
+                rollback_options.append(f"{r['ID']} | [{r['Date']}] {r['Match']} | 結算狀態: {r['Result_Label']} | 用家盈虧: ${r.get('User_Profit', 0)}")
                 
             sel_rollback = st.selectbox("請選擇要撤銷結算的最近紀錄：", rollback_options)
             
@@ -1239,9 +1279,11 @@ def main():
                 idx_mask = st.session_state.df_db['ID'] == rollback_id
                 st.session_state.df_db.loc[idx_mask, 'Status'] = 'Open'
                 st.session_state.df_db.loc[idx_mask, 'Result_Label'] = ''
-                st.session_state.df_db.loc[idx_mask, 'Profit'] = 0.0
+                st.session_state.df_db.loc[idx_mask, 'System_Profit'] = 0.0
+                st.session_state.df_db.loc[idx_mask, 'User_Profit'] = 0.0
+                st.session_state.df_db.loc[idx_mask, 'System_Payout'] = 0.0
+                st.session_state.df_db.loc[idx_mask, 'User_Payout'] = 0.0
                 st.session_state.df_db.loc[idx_mask, 'Unit_Profit'] = 0.0
-                st.session_state.df_db.loc[idx_mask, 'Payout'] = 0.0
                 
                 save_db(st.session_state.df_db, db_file, db_table)
                 
