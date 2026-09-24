@@ -670,15 +670,32 @@ def main():
             if not valid_res: best_model['msg'] = "所有維度樣本數不足，降級為純基礎期望值運算。"
 
             best_bet = best_model['best'] if 'best' in best_model else candidates_base[0]
+            
+            # --- 加入讓球最低投注額($200)與風險衡量邏輯 ---
             suggested_stake = 0
+            upgrade_msg = ""
             if 'ev' in best_bet and best_bet['ev'] > 0 and curr_bankroll > 0:
                 b = best_bet['odds'] - 1
                 kelly = max(0.0, min((best_bet['prob'] * b - (1 - best_bet['prob'])) / b, 0.10))
-                suggested_stake = max(10.0, min(float(max_stake), float(round((curr_bankroll * (kelly * 0.5)) / 10) * 10)))
+                raw_stake = (curr_bankroll * (kelly * 0.5))
+                suggested_stake = min(float(max_stake), float(round(raw_stake / 10) * 10))
+                
+                if "讓球" in best_bet['bet_type']:
+                    if 0 < suggested_stake < 200:
+                        # 判斷是否值得升級至 200：EV 大於等於 3% 且 勝率大於等於 50%
+                        if best_bet.get('ev', 0) >= 0.03 and best_bet.get('prob', 0) >= 0.50:
+                            suggested_stake = 200.0
+                            upgrade_msg = "💡 **智能風控提示**：依據凱利公式，原計算注碼不足 $200。但因該讓球盤 EV (≥0.03) 與勝率 (≥50%) 均達標，系統判定具備高投資價值，建議升級至最低投注額 **$200**。"
+                        else:
+                            suggested_stake = 0.0
+                            upgrade_msg = "⚠️ **智能風控提示**：依據凱利公式，原計算注碼不足 $200，且該讓球盤的期望值/勝率未達強制升級標準。系統建議 **放棄** 此次投注 (注碼歸 0)。"
+                else:
+                    suggested_stake = max(10.0, suggested_stake)
 
             st.session_state.analysis_result = {
                 'micro': res_micro, 'meso': res_meso, 'macro': res_macro, 'best_model': best_model,
-                'best_bet': best_bet, 'stake': suggested_stake, 't_name': tournament_name, 't_cat': tournament_category
+                'best_bet': best_bet, 'stake': suggested_stake, 't_name': tournament_name, 't_cat': tournament_category,
+                'upgrade_msg': upgrade_msg
             }
             
         if st.session_state.get('show_analysis', False):
@@ -709,12 +726,19 @@ def main():
             mc2.metric(f"🎯 預期勝率 ({dim_short}修正)", f"{bb.get('prob', bb.get('base_prob',0))*100:.1f}%")
             mc3.metric("📊 修正 EV", f"{bb.get('ev', 0):.3f}")
             st.markdown(f"**建議注碼**：`${res['stake']:,.2f}`")
+            
+            # 顯示智能風控提示訊息
+            if res.get('upgrade_msg'):
+                if "放棄" in res['upgrade_msg']:
+                    st.warning(res['upgrade_msg'])
+                else:
+                    st.info(res['upgrade_msg'])
 
             with st.form("bet_form"):
                 bc1, bc2, bc3 = st.columns(3)
                 final_btype = bc1.selectbox("最終投注項目", [c['bet_type'] for c in bm.get('candidates', [bb])], index=0)
                 final_sel = bc2.selectbox("最終投注方向", ["Home", "Away", "Over", "Under"], index=["Home", "Away", "Over", "Under"].index(bb['selection']))
-                final_stake = bc3.number_input("實際下注金額 ($)", min_value=10.0, step=10.0, value=float(res['stake'] if res['stake'] > 0 else 50.0))
+                final_stake = bc3.number_input("實際下注金額 ($)", min_value=0.0, step=10.0, value=float(res['stake'] if res['stake'] > 0 else 0.0))
                 
                 final_row = next((r for r in st.session_state.odds_history if r['type'] == final_btype), st.session_state.odds_history[-1])
                 line, odds = float(final_row['line']), float(final_row['upper']) if final_sel in ["Home", "Over"] else float(final_row['lower'])
@@ -876,15 +900,30 @@ def main():
                 candidates = sorted(candidates, key=lambda x: x['ev'], reverse=True)
                 best_bet = candidates[0] if candidates else None
                 
+                # --- 加入讓球最低投注額($200)與風險衡量邏輯 (即場版) ---
                 suggested_stake = 0
+                upgrade_msg = ""
                 if best_bet and best_bet['ev'] > 0 and curr_bankroll > 0:
                     b = best_bet['odds'] - 1
                     kelly = max(0.0, min((best_bet['prob'] * b - (1 - best_bet['prob'])) / b, 0.10))
-                    suggested_stake = max(10.0, min(float(max_stake), float(round((curr_bankroll * (kelly * 0.5)) / 10) * 10)))
+                    raw_stake = (curr_bankroll * (kelly * 0.5))
+                    suggested_stake = min(float(max_stake), float(round(raw_stake / 10) * 10))
+                    
+                    if "讓球" in best_bet['bet_type']:
+                        if 0 < suggested_stake < 200:
+                            if best_bet.get('ev', 0) >= 0.03 and best_bet.get('prob', 0) >= 0.50:
+                                suggested_stake = 200.0
+                                upgrade_msg = "💡 **智能風控提示**：依據即場火力與凱利公式，原注碼不足 $200。但因該讓球盤即場 EV (≥0.03) 與勝率 (≥50%) 達標，系統判定具備高價值，建議升級至最低投注額 **$200**。"
+                            else:
+                                suggested_stake = 0.0
+                                upgrade_msg = "⚠️ **智能風控提示**：即場計算注碼不足 $200，且讓球盤期望值/勝率未達強制升級標準。系統建議 **放棄** 此次即場投注 (注碼歸 0)。"
+                    else:
+                        suggested_stake = max(10.0, suggested_stake)
                 
                 st.session_state.inplay_analysis_result = {
                     'candidates': candidates, 'best_bet': best_bet,
-                    'stake': suggested_stake, 'match_row': row.to_dict()
+                    'stake': suggested_stake, 'match_row': row.to_dict(),
+                    'upgrade_msg': upgrade_msg
                 }
 
             if st.session_state.get('show_inplay_analysis', False):
@@ -901,11 +940,18 @@ def main():
                     mc3.metric("📊 即場 EV", f"{best_bet['ev']:.3f}")
                     st.markdown(f"**建議即場注碼**：`${res['stake']:,.2f}`")
                     
+                    # 顯示智能風控提示訊息 (即場)
+                    if res.get('upgrade_msg'):
+                        if "放棄" in res['upgrade_msg']:
+                            st.warning(res['upgrade_msg'])
+                        else:
+                            st.info(res['upgrade_msg'])
+                    
                     with st.form("inplay_bet_form"):
                         bc1, bc2, bc3 = st.columns(3)
                         final_btype = bc1.selectbox("最終投注項目", [c['bet_type'] for c in res['candidates']], index=0)
                         final_sel = bc2.selectbox("最終投注方向", ["Home", "Away", "Over", "Under"], index=["Home", "Away", "Over", "Under"].index(best_bet['selection']))
-                        final_stake = bc3.number_input("實際下注金額 ($)", min_value=10.0, step=10.0, value=float(res['stake'] if res['stake'] > 0 else 50.0))
+                        final_stake = bc3.number_input("實際下注金額 ($)", min_value=0.0, step=10.0, value=float(res['stake'] if res['stake'] > 0 else 0.0))
                         
                         if st.form_submit_button("✅ 確認即場投注並扣除本金"):
                             final_row = next((r for r in st.session_state.inplay_odds_history if r['type'] == final_btype), st.session_state.inplay_odds_history[-1])
