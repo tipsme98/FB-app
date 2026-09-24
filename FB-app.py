@@ -276,19 +276,23 @@ def prepare_ml_dataset(df, rating_map):
 
 def evaluate_dimension(df_subset, dim_name, candidates_base, rating_map, h_data):
     n_samples = len(df_subset)
-    if n_samples < 15:
-        return {'dim': dim_name, 'valid': False, 'msg': f"樣本數不足 ({n_samples} < 15場)", 'roi': 0, 'acc': 0, 'n': n_samples}
+    valid = n_samples >= 15
+    msg = "運算成功" if valid else f"樣本數不足 ({n_samples} < 15場)"
     
-    total_stake = pd.to_numeric(df_subset['Stake'], errors='coerce').sum()
-    total_profit = pd.to_numeric(df_subset['Profit'], errors='coerce').sum()
-    roi = (total_profit / total_stake) if total_stake > 0 else 0
-    wins = len(df_subset[pd.to_numeric(df_subset['Unit_Profit'], errors='coerce') > 0])
-    acc = wins / n_samples if n_samples > 0 else 0
+    if valid:
+        total_stake = pd.to_numeric(df_subset['Stake'], errors='coerce').sum()
+        total_profit = pd.to_numeric(df_subset['Profit'], errors='coerce').sum()
+        roi = (total_profit / total_stake) if total_stake > 0 else 0
+        wins = len(df_subset[pd.to_numeric(df_subset['Unit_Profit'], errors='coerce') > 0])
+        acc = wins / n_samples if n_samples > 0 else 0
+    else:
+        roi = 0
+        acc = 0
 
     candidates = [c.copy() for c in candidates_base]
     
     model_success = False
-    if HAS_AI_MODULES:
+    if valid and HAS_AI_MODULES:
         X, y = prepare_ml_dataset(df_subset, rating_map)
         if X is not None and len(np.unique(y)) > 1:
             try:
@@ -304,17 +308,17 @@ def evaluate_dimension(df_subset, dim_name, candidates_base, rating_map, h_data)
 
     if not model_success:
         for c in candidates:
-            shift = (acc - 0.5) * 0.2 + (roi * 0.1)
+            shift = ((acc - 0.5) * 0.2 + (roi * 0.1)) if valid else 0
             c['prob'] = max(0.05, min(0.95, c['base_prob'] + shift))
 
     for c in candidates:
         c['ev'] = c['prob'] * (c['odds'] - 1) - (1 - c['prob'])
 
     candidates = sorted(candidates, key=lambda x: x['ev'], reverse=True)
-    score = (roi * 0.7) + (acc * 0.3)
+    score = (roi * 0.7) + (acc * 0.3) if valid else -1
     
     return {
-        'dim': dim_name, 'valid': True, 'msg': "運算成功", 'roi': roi, 'acc': acc, 
+        'dim': dim_name, 'valid': valid, 'msg': msg, 'roi': roi, 'acc': acc, 
         'n': n_samples, 'candidates': candidates, 'best': candidates[0], 'score': score
     }
 
