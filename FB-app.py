@@ -801,12 +801,11 @@ def main():
         st.session_state.last_bet_id = None
         
     st.sidebar.header("⚙️ 系統設定與資金管理")
-    mode = st.sidebar.radio("運作模式選擇", ["🧪 測試模式", "🟢 真實模式"])
     
-    db_file = "football_betting_db_test.csv" if mode == "🧪 測試模式" else "football_betting_db.csv"
-    capital_file = "football_capital_db_test.csv" if mode == "🧪 測試模式" else "football_capital_db.csv"
-    db_table = "football_bets_test" if mode == "🧪 測試模式" else "football_bets"
-    cap_table = "football_cap_test" if mode == "🧪 測試模式" else "football_cap"
+    db_file = "football_betting_db.csv"
+    capital_file = "football_capital_db.csv"
+    db_table = "football_bets"
+    cap_table = "football_cap"
     
     st.session_state.df_db = load_db(db_file, DB_COLUMNS, db_table)
     st.session_state.df_cap = load_db(capital_file, CAPITAL_COLUMNS, cap_table)
@@ -1518,29 +1517,36 @@ def main():
             sel_rollback = st.selectbox("請選擇要撤銷結算的最近紀錄：", rollback_options)
             
             if st.button("↩️ 撤銷結算並恢復為未結算狀態", type="primary"):
-                rollback_id = sel_rollback.split(" | ")[0]
-                
-                idx_mask = st.session_state.df_db['ID'] == rollback_id
-                st.session_state.df_db.loc[idx_mask, 'Status'] = 'Open'
-                st.session_state.df_db.loc[idx_mask, 'Result_Label'] = ''
-                st.session_state.df_db.loc[idx_mask, 'System_Profit'] = 0.0
-                st.session_state.df_db.loc[idx_mask, 'User_Profit'] = 0.0
-                st.session_state.df_db.loc[idx_mask, 'System_Payout'] = 0.0
-                st.session_state.df_db.loc[idx_mask, 'User_Payout'] = 0.0
-                st.session_state.df_db.loc[idx_mask, 'Unit_Profit'] = 0.0
-                
+                target_id = sel_rollback.split(" | ")[0]
+                mask = st.session_state.df_db['ID'] == target_id
+                st.session_state.df_db.loc[mask, 'Status'] = 'Open'
+                st.session_state.df_db.loc[mask, 'Result_Label'] = ''
+                st.session_state.df_db.loc[mask, 'System_Profit'] = 0.0
+                st.session_state.df_db.loc[mask, 'User_Profit'] = 0.0
+                st.session_state.df_db.loc[mask, 'System_Payout'] = 0.0
+                st.session_state.df_db.loc[mask, 'User_Payout'] = 0.0
+                st.session_state.df_db.loc[mask, 'Unit_Profit'] = 0.0
                 save_db(st.session_state.df_db, db_file, db_table)
-                
-                st.success("✅ 已成功撤銷結算！該賽事已恢復至上方列表，資金池已自動重構，請重新輸入正確賽果。")
+                st.toast(f"✅ 已成功撤銷注單 {target_id} 的結算，恢復為 Open 狀態！", icon="↩️")
                 st.rerun()
-        else:
-            st.write("目前沒有可供撤銷的已結算紀錄。")
 
     with t_ai:
-        st.header("🤖 全局預測模型監控")
-        df_settled = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
-        st.write(f"當前可供訓練的歷史結算數據：**{len(df_settled)}** 筆")
-        st.write(f"機器學習模組狀態 (Scikit-Learn): **{'🟢 已啟用' if HAS_AI_MODULES else '🔴 未偵測到，使用啟發式算法'}**")
+        st.subheader("🤖 全局機器學習模型與策略分析")
+        df_settled = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled']
+        
+        if len(df_settled) < 15:
+            st.info(f"📊 目前已結算樣本數為 {len(df_settled)} 場。當前已結算數據未達 15 場門檻，模型將以基礎機率與期望值運算為主。")
+        else:
+            st.success(f"🎉 目前共有 {len(df_settled)} 筆已結算賽事紀錄，全局機器學習模型運算中。")
+            
+        st.markdown("##### 📈 系統勝率與盈虧走勢看板")
+        if not df_settled.empty:
+            df_chart = df_settled.copy()
+            df_chart['Cum_Sys_Profit'] = pd.to_numeric(df_chart['System_Profit'], errors='coerce').cumsum()
+            df_chart['Cum_User_Profit'] = pd.to_numeric(df_chart['User_Profit'], errors='coerce').cumsum()
+            st.line_chart(df_chart[['Cum_Sys_Profit', 'Cum_User_Profit']])
+        else:
+            st.caption("尚無已結算數據可供展示走勢圖。")
 
 if __name__ == "__main__":
     main()
