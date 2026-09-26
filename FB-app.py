@@ -223,21 +223,40 @@ def parse_and_fill_pre_match(match_id):
 
 def parse_and_fill_inplay(match_id):
     """將抓取到的 API 數據填入 Session State (即場與賽果)"""
-    stats = get_match_fixtures(match_id)
-    if stats:
-        # 同樣需要根據實際 JSON 欄位微調，例如 stats.get('homeScore')
-        st.session_state.edit_h_g = int(stats.get('homeScore', 0))
-        st.session_state.edit_a_g = int(stats.get('awayScore', 0))
-        st.session_state.edit_h_c = int(stats.get('homeCorner', 0))
-        st.session_state.edit_a_c = int(stats.get('awayCorner', 0))
+    data = get_match_fixtures(match_id)
+    
+    if data and "teamStats" in data:
+        # 從 teamStats.ft (全場統計) 中提取數據
+        # 如果是即場，這裡的 ft 會隨著比賽進行而更新
+        team_stats_ft = data["teamStats"].get("ft", {})
         
-        # 統計數據 (紅牌、射門等)
-        st.session_state.edit_h_red = int(stats.get('homeRedCard', 0))
-        st.session_state.edit_a_red = int(stats.get('awayRedCard', 0))
-        st.session_state.edit_h_sot = int(stats.get('homeShotOnTarget', 0))
-        st.session_state.edit_a_sot = int(stats.get('awayShotOnTarget', 0))
-        st.session_state.edit_h_poss = int(stats.get('homePossession', 50))
-        return True
+        if team_stats_ft:
+            # "1" 代表入球: [主隊入球, 客隊入球]
+            goals = team_stats_ft.get("1", [0, 0])
+            st.session_state.edit_h_g = int(goals[0])
+            st.session_state.edit_a_g = int(goals[1])
+            
+            # "2" 代表角球: [主隊角球, 客隊角球]
+            corners = team_stats_ft.get("2", [0, 0])
+            st.session_state.edit_h_c = int(corners[0])
+            st.session_state.edit_a_c = int(corners[1])
+            
+            # "4" 代表紅牌: [主隊紅牌, 客隊紅牌]
+            red_cards = team_stats_ft.get("4", [0, 0])
+            st.session_state.edit_h_red = int(red_cards[0])
+            st.session_state.edit_a_red = int(red_cards[1])
+            
+            # "21" 代表射正 (Shot on Target): [主隊射正, 客隊射正]
+            sot = team_stats_ft.get("21", [0, 0])
+            st.session_state.edit_h_sot = int(sot[0])
+            st.session_state.edit_a_sot = int(sot[1])
+            
+            # "25" 代表控球率 (Possession): [主隊控球率, 客隊控球率]
+            poss = team_stats_ft.get("25", [50, 50])
+            st.session_state.edit_h_poss = int(poss[0])
+            
+            return True
+            
     return False
 
 # ==========================================
