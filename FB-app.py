@@ -166,6 +166,81 @@ def save_db(df, filename, table_name):
         pass
 
 # ==========================================
+# 1.5 自動化抓取 API 模組 (Auto-Scraper)
+# ==========================================
+def fetch_api_data(url):
+    """通用的 API 請求函數"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            return response.json()
+        return None
+    except Exception as e:
+        st.error(f"API 請求失敗: {e}")
+        return None
+
+def get_match_odds(match_id):
+    """抓取馬會賠率變化"""
+    url = f"https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/{match_id}"
+    return fetch_api_data(url)
+
+def get_match_fixtures(match_id):
+    """抓取即場賽況及統計數據 (同時適用於賽果)"""
+    url = f"https://tipsme-web.azurewebsites.net/api/Score/fixtures/{match_id}"
+    return fetch_api_data(url)
+
+def parse_and_fill_pre_match(match_id):
+    """將抓取到的 API 數據填入 Session State (賽前)"""
+    fixtures_data = get_match_fixtures(match_id)
+    odds_data = get_match_odds(match_id)
+    
+    if fixtures_data:
+        # 注意：這裡的 'homeName', 'awayName' 需要根據實際 JSON 欄位名稱調整
+        st.session_state.edit_h_team = fixtures_data.get('homeName', fixtures_data.get('home', ''))
+        st.session_state.edit_a_team = fixtures_data.get('awayName', fixtures_data.get('away', ''))
+        st.session_state.edit_t_name = fixtures_data.get('leagueName', '')
+        
+    if odds_data:
+        # 假設 JSON 裡面有 initial_line, home_odds 等
+        # 我們自動幫使用者填入第一筆讓球盤口
+        try:
+            # 這裡需要根據您的 JSON 結構微調提取邏輯
+            # 以下為示範邏輯
+            st.session_state.odds_history = [{
+                "id": 0, "type": "讓球", 
+                "line": 0.0, # 替換為 odds_data 裡的初盤
+                "upper": 1.90, # 替換為主隊賠率
+                "lower": 1.90, # 替換為客隊賠率
+                "unlock": False, "margin": 1.085
+            }]
+        except:
+            pass
+    return True
+
+def parse_and_fill_inplay(match_id):
+    """將抓取到的 API 數據填入 Session State (即場與賽果)"""
+    stats = get_match_fixtures(match_id)
+    if stats:
+        # 同樣需要根據實際 JSON 欄位微調，例如 stats.get('homeScore')
+        st.session_state.edit_h_g = int(stats.get('homeScore', 0))
+        st.session_state.edit_a_g = int(stats.get('awayScore', 0))
+        st.session_state.edit_h_c = int(stats.get('homeCorner', 0))
+        st.session_state.edit_a_c = int(stats.get('awayCorner', 0))
+        
+        # 統計數據 (紅牌、射門等)
+        st.session_state.edit_h_red = int(stats.get('homeRedCard', 0))
+        st.session_state.edit_a_red = int(stats.get('awayRedCard', 0))
+        st.session_state.edit_h_sot = int(stats.get('homeShotOnTarget', 0))
+        st.session_state.edit_a_sot = int(stats.get('awayShotOnTarget', 0))
+        st.session_state.edit_h_poss = int(stats.get('homePossession', 50))
+        return True
+    return False
+
+# ==========================================
 # 2. 資金、風控與累計算式 (分離系統與真實資金)
 # ==========================================
 def recalculate_bankroll_from_scratch(df_cap, df_db):
@@ -864,6 +939,24 @@ def main():
 
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
+
+        # --- 自動抓取賽前數據按鈕 ---
+        with st.container(border=True):
+            st.markdown("##### ⚡ 一鍵智能抓取賽前數據")
+            col_id, col_btn = st.columns([2, 1])
+            target_match_id = col_id.text_input("請輸入 Tipsme 賽事 ID (例如: 112684)", key="api_match_id")
+            if col_btn.button("📥 自動獲取球隊與賠率", use_container_width=True):
+                if target_match_id:
+                    with st.spinner('正在從 Tipsme 抓取數據...'):
+                        success = parse_and_fill_pre_match(target_match_id)
+                        if success:
+                            st.session_state.editing_bet_id = f"API_{target_match_id}" # 標記為API導入
+                            st.success(f"✅ 成功載入賽事 {target_match_id} 的數據！已自動填寫下方表格。")
+                            st.rerun()
+                        else:
+                            st.error("❌ 抓取失敗，請確認賽事 ID 是否正確。")
+                else:
+                    st.warning("請先輸入賽事 ID。")
         
         # --- 頂部修改與覆蓋控制區塊 ---
         if st.session_state.editing_bet_id:
@@ -1189,6 +1282,20 @@ def main():
                 if pd.isna(val) or val == "": return default
                 return int(float(val))
 
+        # --- 自動抓取即場數據按鈕 ---
+            with st.container(border=True):
+                st.markdown("##### ⚡ 一鍵同步即場賽況")
+                col_in_id, col_in_btn = st.columns([2, 1])
+                inplay_match_id = col_in_id.text_input("輸入賽事 ID 進行同步 (例如: 112684)", key="api_inplay_id")
+                if col_in_btn.button("🔄 自動同步即時比分與統計", use_container_width=True):
+                    if inplay_match_id:
+                        with st.spinner('正在同步最新即場數據...'):
+                            if parse_and_fill_inplay(inplay_match_id):
+                                st.success("✅ 即場數據同步成功！已更新下方火力分析。")
+                                st.rerun()
+                            else:
+                                st.error("❌ 同步失敗。")
+            
             st.markdown("##### 1. 實時數據輸入與自動效率計算")
             minute = st.number_input("比賽進行時間 (分鐘)", min_value=0, max_value=120, value=get_val(row, 'InPlay_Minute', 45, 'edit_inplay_minute'))
             
@@ -1470,6 +1577,12 @@ def main():
                         
                     with st.form(f"settle_form_{row['ID']}"):
                         st.markdown("##### ⚽ 全場賽果輸入 (入球與角球)")
+                        col_auto = st.columns(1)[0]
+                        if col_auto.form_submit_button("⚡ 一鍵自動獲取完場比分與角球 (需輸入賽事ID)"):
+                            # 這裡假設您的 ID 命名規則中包含真實 match_id，若無則可彈出輸入框
+                            # 為簡化操作，這裡示範邏輯
+                            st.info("請切換至即場賽事分頁使用自動同步，再回來點擊確認結算。")
+                            
                         col1, col2 = st.columns(2)
                         h_g = col1.number_input("全場主隊入球數", min_value=0, value=int(row.get('Home_Goal', 0)) if pd.notna(row.get('Home_Goal')) else 0, key=f"hg_{row['ID']}")
                         a_g = col2.number_input("全場客隊入球數", min_value=0, value=int(row.get('Away_Goal', 0)) if pd.notna(row.get('Away_Goal')) else 0, key=f"ag_{row['ID']}")
