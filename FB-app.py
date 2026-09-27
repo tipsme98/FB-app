@@ -128,56 +128,82 @@ def save_db(df, filename, table_name):
     except: pass
 
 # ==========================================
-# 1.5 自動化抓取 API 模組 (優化防阻擋機制)
+# 1.5 自動化抓取 API 模組 (優化防阻擋與多端點容錯機制)
 # ==========================================
 def fetch_api_data(url):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Referer": "https://www.tipsme.hk/",
         "Origin": "https://www.tipsme.hk",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Connection": "keep-alive"
     }
     try:
         response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200: return response.json(), 200
+        if response.status_code == 200: 
+            try:
+                return response.json(), 200
+            except:
+                return None, "JSON Parse Error"
         return None, response.status_code
     except Exception as e:
         return None, str(e)
 
 def get_match_odds(match_id):
-    data, _ = fetch_api_data(f"https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/{match_id}")
-    return data
+    # 多端點降落機制，解決特定端點失效問題
+    urls = [
+        f"https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/{match_id}",
+        f"https://tipsme-web.azurewebsites.net/api/Score/odds/macau/{match_id}",
+        f"https://tipsme-web.azurewebsites.net/api/Score/odds/{match_id}",
+        f"https://tipsme-web.azurewebsites.net/api/Score/hkjc/odds/{match_id}"
+    ]
+    for url in urls:
+        data, status = fetch_api_data(url)
+        if status == 200 and data:
+            return data
+    return None
 
 def get_match_fixtures(match_id):
-    data, _ = fetch_api_data(f"https://tipsme-web.azurewebsites.net/api/Score/fixtures/{match_id}")
-    return data
+    # 多端點降落機制
+    urls = [
+        f"https://tipsme-web.azurewebsites.net/api/Score/fixtures/{match_id}",
+        f"https://tipsme-web.azurewebsites.net/api/Score/match/{match_id}",
+        f"https://tipsme-web.azurewebsites.net/api/Score/matchInfo/{match_id}"
+    ]
+    for url in urls:
+        data, status = fetch_api_data(url)
+        if status == 200 and data:
+            return data
+    return None
 
 def get_matches_schedule(date_str):
-    """具備多重格式降落機制，解決 404 問題"""
     date_nodash = date_str.replace("-", "")
-    
-    # 嘗試 1: YYYY-MM-DD
-    url1 = f"https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc/{date_str}"
-    data, status = fetch_api_data(url1)
-    if status == 200 and data: return data, status
-    
-    # 嘗試 2: YYYYMMDD
-    url2 = f"https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc/{date_nodash}"
-    data, status = fetch_api_data(url2)
-    if status == 200 and data: return data, status
-    
-    # 嘗試 3: 不加日期 (自動返回今日)
-    url3 = "https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc"
-    data, status = fetch_api_data(url3)
-    return data, status
+    urls = [
+        f"https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc/{date_str}",
+        f"https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc/{date_nodash}",
+        "https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc"
+    ]
+    for url in urls:
+        data, status = fetch_api_data(url)
+        if status == 200 and data: 
+            return data, status
+    return None, 404
 
 def extract_odds_history(odds_data):
     new_history = []
     row_id = 0
+    
+    # 強制解構巢狀 JSON
+    if isinstance(odds_data, dict):
+        if 'data' in odds_data: odds_data = odds_data['data']
+        elif 'list' in odds_data: odds_data = odds_data['list']
+        elif 'odds' in odds_data: odds_data = odds_data['odds']
+
     def parse_line(line_str):
         try:
-            line_str = str(line_str).replace('[', '').replace(']', '').replace('球', '')
+            line_str = str(line_str).replace('[', '').replace(']', '').replace('球', '').strip()
+            if not line_str: return 0.0
             if '/' in line_str:
                 parts = line_str.split('/')
                 return (float(parts[0]) + float(parts[1])) / 2
@@ -189,11 +215,18 @@ def extract_odds_history(odds_data):
         except: return 1.90
             
     def get_odds(item, keys, default=1.90):
+        if not isinstance(item, dict): return default
         for k in keys:
-            if k in item and item[k] is not None: return parse_odds_val(item[k])
+            for actual_k, v in item.items():
+                if k.lower() == actual_k.lower() and v is not None:
+                    return parse_odds_val(v)
         return default
 
-    mapping = {"讓球": ["letting", "hdc", "ah", "handicap", "讓球"], "入球大小": ["ou", "hil", "overunder", "入球大細", "入球大小"], "角球大小": ["corner", "chl", "corners", "角球大細", "角球大小"]}
+    mapping = {
+        "讓球": ["letting", "hdc", "ah", "handicap", "讓球", "asian_handicap"], 
+        "入球大小": ["ou", "hil", "overunder", "入球大細", "入球大小", "total", "goals"], 
+        "角球大小": ["corner", "chl", "corners", "角球大細", "角球大小"]
+    }
     upper_keys = ['h', 'home', 'homeOdds', 'up', 'upper', 'over', 'overOdds', 'high', '大', '主']
     lower_keys = ['a', 'away', 'awayOdds', 'low', 'lower', 'under', 'underOdds', '小', '客', 'l']
     line_keys = ['line', 'goal', 'p', '盤', 'handicap']
@@ -201,14 +234,16 @@ def extract_odds_history(odds_data):
     for bet_type_cn, possible_keys in mapping.items():
         target_data = []
         if isinstance(odds_data, dict):
-            for k in possible_keys:
-                if k in odds_data: target_data = odds_data[k]; break
+            for k, v in odds_data.items():
+                if any(pk.lower() in k.lower() for pk in possible_keys):
+                    target_data = v
+                    break
         elif isinstance(odds_data, list):
             for item in odds_data:
                 if isinstance(item, dict):
-                    t = item.get('type', '').lower()
+                    t = str(item.get('type', item.get('betType', item.get('name', '')))).lower()
                     if any(pk.lower() in t for pk in possible_keys):
-                        target_data = item.get('history', [item])
+                        target_data = item.get('history', item.get('odds', [item]))
                         break
                         
         if isinstance(target_data, dict):
@@ -216,16 +251,22 @@ def extract_odds_history(odds_data):
             elif 'odds' in target_data: target_data = target_data['odds']
             else: target_data = [target_data]
                 
-        if isinstance(target_data, list):
+        if isinstance(target_data, list) and len(target_data) > 0:
             if len(target_data) > 12:
                 step = len(target_data) // 10
                 target_data = [target_data[0]] + target_data[1:-1:step] + [target_data[-1]]
                 
             for item in target_data:
                 if not isinstance(item, dict): continue
+                
                 line_val = 0.0
                 for lk in line_keys:
-                    if lk in item: line_val = item[lk]; break
+                    for actual_k, v in item.items():
+                        if lk.lower() == actual_k.lower() and v is not None:
+                            line_val = v
+                            break
+                    if line_val != 0.0: break
+                        
                 line = parse_line(line_val)
                 upper = get_odds(item, upper_keys, 1.90)
                 lower = get_odds(item, lower_keys, 1.90)
@@ -239,20 +280,33 @@ def parse_and_fill_pre_match(match_id):
     odds_data = get_match_odds(match_id)
     success = False
     details = {}
+    
+    # 解構 Fixtures (球隊資料) 容錯處理
     if fixtures_data:
-        h_name = fixtures_data.get('homeName', fixtures_data.get('home', ''))
-        a_name = fixtures_data.get('awayName', fixtures_data.get('away', ''))
-        l_name = fixtures_data.get('leagueName', '')
-        if h_name: st.session_state.edit_h_team = h_name
-        if a_name: st.session_state.edit_a_team = a_name
-        if l_name: st.session_state.edit_t_name = l_name
-        details = {'h': h_name, 'a': a_name, 'l': l_name}
-        if h_name or a_name: success = True
+        if isinstance(fixtures_data, dict) and 'data' in fixtures_data:
+            fixtures_data = fixtures_data['data']
+        if isinstance(fixtures_data, list) and len(fixtures_data) > 0:
+            fixtures_data = fixtures_data[0]
+            
+        if isinstance(fixtures_data, dict):
+            h_name = fixtures_data.get('homeName') or fixtures_data.get('home') or fixtures_data.get('homeTeamName') or ''
+            a_name = fixtures_data.get('awayName') or fixtures_data.get('away') or fixtures_data.get('awayTeamName') or ''
+            l_name = fixtures_data.get('leagueName') or fixtures_data.get('league') or fixtures_data.get('tournamentName') or ''
+            
+            if h_name: st.session_state.edit_h_team = h_name
+            if a_name: st.session_state.edit_a_team = a_name
+            if l_name: st.session_state.edit_t_name = l_name
+            
+            details = {'h': h_name, 'a': a_name, 'l': l_name}
+            if h_name or a_name: success = True
+
+    # 解構 Odds (賠率資料) 容錯處理
     if odds_data:
         new_history = extract_odds_history(odds_data)
         if new_history:
             st.session_state.odds_history = new_history
-            success = True
+            success = True # 只要抓到盤口或球隊其中之一，即視為成功抓取
+            
     return success, details
 
 # ==========================================
@@ -486,7 +540,7 @@ def main():
                             st.session_state.current_tipsme_id = target_match_id
                             st.success(f"✅ 成功載入賽事 {target_match_id}！歷史盤口變化已自動填入下方表格。")
                             st.rerun()
-                        else: st.error(f"❌ 抓取失敗，請確認賽事 ID 是否正確。")
+                        else: st.error(f"❌ 抓取失敗，請確認賽事 ID 是否正確，或該場次目前無資料。")
                 else: st.warning("請先輸入賽事 ID。")
 
         with pre_t2:
@@ -503,7 +557,7 @@ def main():
                     if not schedule_data or type(schedule_data) != list:
                         st.error(f"❌ 無法取得該日賽程表 (狀態碼: {status_code})。該日期可能已無資料提供，或網站啟用防禦機制。請確認所選日期是否超出合理範圍。")
                     else:
-                        match_ids = [str(item.get('matchId', '')) for item in schedule_data if 'matchId' in item]
+                        match_ids = [str(item.get('matchId', item.get('id', ''))) for item in schedule_data if item.get('matchId') or item.get('id')]
                         if not match_ids: st.warning("當日沒有賽程。")
                         else:
                             progress_bar = st.progress(0)
@@ -515,7 +569,7 @@ def main():
                                 if success:
                                     success_count += 1
                                     if not (st.session_state.df_db['Tipsme_ID'] == m_id).any():
-                                        new_rec = {'ID': f"B{datetime.now().strftime('%Y%m%d%H%M%S%f')}", 'Tipsme_ID': m_id, 'Date': date_str, 'Status': 'Open', 'Match': f"{details.get('h')} vs {details.get('a')}", 'Tournament_Name': details.get('l'), 'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False)}
+                                        new_rec = {'ID': f"B{datetime.now().strftime('%Y%m%d%H%M%S%f')}", 'Tipsme_ID': m_id, 'Date': date_str, 'Status': 'Open', 'Match': f"{details.get('h', 'Unknown')} vs {details.get('a', 'Unknown')}", 'Tournament_Name': details.get('l', ''), 'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False)}
                                         st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame([new_rec])], ignore_index=True)
                                     else:
                                         mask = st.session_state.df_db['Tipsme_ID'] == m_id
