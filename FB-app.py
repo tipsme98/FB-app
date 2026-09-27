@@ -155,7 +155,9 @@ def get_match_odds(match_id):
         f"https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/{match_id}",
         f"https://tipsme-web.azurewebsites.net/api/Score/odds/macau/{match_id}",
         f"https://tipsme-web.azurewebsites.net/api/Score/odds/{match_id}",
-        f"https://tipsme-web.azurewebsites.net/api/Score/hkjc/odds/{match_id}"
+        f"https://tipsme-web.azurewebsites.net/api/Score/hkjc/odds/{match_id}",
+        f"https://api.tipsme.hk/api/Score/odds/hkjc/{match_id}",
+        f"https://api.tipsme.hk/api/Score/odds/{match_id}"
     ]
     for url in urls:
         data, status = fetch_api_data(url)
@@ -166,7 +168,9 @@ def get_match_fixtures(match_id):
     urls = [
         f"https://tipsme-web.azurewebsites.net/api/Score/fixtures/{match_id}",
         f"https://tipsme-web.azurewebsites.net/api/Score/match/{match_id}",
-        f"https://tipsme-web.azurewebsites.net/api/Score/matchInfo/{match_id}"
+        f"https://tipsme-web.azurewebsites.net/api/Score/matchInfo/{match_id}",
+        f"https://api.tipsme.hk/api/Score/fixtures/{match_id}",
+        f"https://api.tipsme.hk/api/Score/match/{match_id}"
     ]
     for url in urls:
         data, status = fetch_api_data(url)
@@ -179,7 +183,8 @@ def get_matches_schedule(date_str):
         f"https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc/{date_str}",
         f"https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc/{date_nodash}",
         f"https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc?date={date_str}",
-        "https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc"
+        "https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc",
+        f"https://api.tipsme.hk/api/Score/schedule/hkjc/{date_str}"
     ]
     for url in urls:
         data, status = fetch_api_data(url)
@@ -527,6 +532,7 @@ def main():
             target_match_id = col_id.text_input("請輸入 Tipsme 賽事 ID (例如: 112684)", key="api_match_id")
             if col_btn.button("📥 獲取球隊與全盤口", use_container_width=True):
                 if target_match_id:
+                    target_match_id = target_match_id.strip() # 修正：自動去除前後空白，防止複製貼上產生的錯誤
                     with st.spinner('正在從 Tipsme 抓取數據與深度解析盤口...'):
                         success, _ = parse_and_fill_pre_match(target_match_id)
                         if success:
@@ -564,7 +570,8 @@ def main():
                             if date_str in item_str or date_nodash in item_str or target_date.strftime("%d/%m/%Y") in item_str:
                                 valid_items.append(item)
                             # 如果字串真的找不到，但使用者剛好是選今天，才放行 (當作 Fallback)
-                            elif target_date.date() == datetime.today().date():
+                            # 修正：解決 datetime.date object 錯誤
+                            elif target_date == datetime.today().date():
                                 valid_items.append(item)
 
                         # 去重複
