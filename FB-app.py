@@ -151,13 +151,16 @@ def fetch_api_data(url):
         return None, str(e)
 
 def get_match_odds(match_id):
+    # 擴充路由：優先使用 api.tipsme.hk
     urls = [
-        f"https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/{match_id}",
-        f"https://tipsme-web.azurewebsites.net/api/Score/odds/macau/{match_id}",
-        f"https://tipsme-web.azurewebsites.net/api/Score/odds/{match_id}",
-        f"https://tipsme-web.azurewebsites.net/api/Score/hkjc/odds/{match_id}",
         f"https://api.tipsme.hk/api/Score/odds/hkjc/{match_id}",
-        f"https://api.tipsme.hk/api/Score/odds/{match_id}"
+        f"https://api.tipsme.hk/api/Score/hkjc/odds/{match_id}",
+        f"https://api.tipsme.hk/api/Score/odds/macau/{match_id}",
+        f"https://api.tipsme.hk/api/Score/odds/{match_id}",
+        f"https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/{match_id}",
+        f"https://tipsme-web.azurewebsites.net/api/Score/hkjc/odds/{match_id}",
+        f"https://tipsme-web.azurewebsites.net/api/Score/odds/macau/{match_id}",
+        f"https://tipsme-web.azurewebsites.net/api/Score/odds/{match_id}"
     ]
     for url in urls:
         data, status = fetch_api_data(url)
@@ -165,12 +168,14 @@ def get_match_odds(match_id):
     return None
 
 def get_match_fixtures(match_id):
+    # 擴充路由
     urls = [
+        f"https://api.tipsme.hk/api/Score/fixtures/{match_id}",
+        f"https://api.tipsme.hk/api/Score/match/{match_id}",
+        f"https://api.tipsme.hk/api/Score/matchInfo/{match_id}",
         f"https://tipsme-web.azurewebsites.net/api/Score/fixtures/{match_id}",
         f"https://tipsme-web.azurewebsites.net/api/Score/match/{match_id}",
-        f"https://tipsme-web.azurewebsites.net/api/Score/matchInfo/{match_id}",
-        f"https://api.tipsme.hk/api/Score/fixtures/{match_id}",
-        f"https://api.tipsme.hk/api/Score/match/{match_id}"
+        f"https://tipsme-web.azurewebsites.net/api/Score/matchInfo/{match_id}"
     ]
     for url in urls:
         data, status = fetch_api_data(url)
@@ -179,12 +184,12 @@ def get_match_fixtures(match_id):
 
 def get_matches_schedule(date_str):
     date_nodash = date_str.replace("-", "")
+    # 針對指定日期發起請求
     urls = [
+        f"https://api.tipsme.hk/api/Score/schedule/hkjc/{date_str}",
         f"https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc/{date_str}",
         f"https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc/{date_nodash}",
-        f"https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc?date={date_str}",
-        "https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc",
-        f"https://api.tipsme.hk/api/Score/schedule/hkjc/{date_str}"
+        f"https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc?date={date_str}"
     ]
     for url in urls:
         data, status = fetch_api_data(url)
@@ -192,8 +197,24 @@ def get_matches_schedule(date_str):
             if isinstance(data, dict):
                 if 'data' in data: data = data['data']
                 elif 'list' in data: data = data['list']
-            if isinstance(data, list):
+            if isinstance(data, list) and len(data) > 0:
                 return data, 200
+                
+    # 只有當查詢的日期是「今天」時，才允許呼叫無日期參數的 API 當作 Fallback (避免舊日賽程混入今日賽事)
+    if date_str == datetime.today().strftime("%Y-%m-%d"):
+        fallback_urls = [
+            "https://api.tipsme.hk/api/Score/schedule/hkjc",
+            "https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc"
+        ]
+        for url in fallback_urls:
+            data, status = fetch_api_data(url)
+            if status == 200 and data: 
+                if isinstance(data, dict):
+                    if 'data' in data: data = data['data']
+                    elif 'list' in data: data = data['list']
+                if isinstance(data, list) and len(data) > 0:
+                    return data, 200
+
     return None, 404
 
 def extract_odds_history(odds_data):
@@ -532,7 +553,7 @@ def main():
             target_match_id = col_id.text_input("請輸入 Tipsme 賽事 ID (例如: 112684)", key="api_match_id")
             if col_btn.button("📥 獲取球隊與全盤口", use_container_width=True):
                 if target_match_id:
-                    target_match_id = target_match_id.strip() # 修正：自動去除前後空白，防止複製貼上產生的錯誤
+                    target_match_id = target_match_id.strip() # 自動去除前後空白防呆
                     with st.spinner('正在從 Tipsme 抓取數據與深度解析盤口...'):
                         success, _ = parse_and_fill_pre_match(target_match_id)
                         if success:
@@ -550,7 +571,6 @@ def main():
             c_date, c_sync = st.columns([2, 1])
             target_date = c_date.date_input("選擇賽事日期", value=datetime.today())
             date_str = target_date.strftime("%Y-%m-%d")
-            date_nodash = target_date.strftime("%Y%m%d")
             
             if c_sync.button("🔄 同步該日所有賽事", type="primary", use_container_width=True):
                 with st.spinner(f"正在與伺服器連線並掃描 {date_str} 賽事列表..."):
@@ -559,32 +579,17 @@ def main():
                     if not schedule_data or not isinstance(schedule_data, list):
                         st.error(f"❌ 無法取得該日賽程表 (狀態碼: {status_code})。")
                     else:
-                        # 嚴格日期過濾：防止 API 無視參數一直回傳"今日賽程"
-                        valid_items = []
-                        for item in schedule_data:
-                            m_id = str(item.get('matchId', item.get('id', '')))
-                            if not m_id: continue
-                            
-                            item_str = json.dumps(item)
-                            # 若 JSON 中包含所選日期的任何格式，才算有效
-                            if date_str in item_str or date_nodash in item_str or target_date.strftime("%d/%m/%Y") in item_str:
-                                valid_items.append(item)
-                            # 如果字串真的找不到，但使用者剛好是選今天，才放行 (當作 Fallback)
-                            # 修正：解決 datetime.date object 錯誤
-                            elif target_date == datetime.today().date():
-                                valid_items.append(item)
-
-                        # 去重複
+                        # 移除嚴格的字串比對，因為 API 已透過 URL 過濾出正確日期的資料，直接讀取 matchId
                         seen_ids = set()
                         unique_valid_items = []
-                        for item in valid_items:
+                        for item in schedule_data:
                             mid = str(item.get('matchId', item.get('id', '')))
-                            if mid not in seen_ids:
+                            if mid and mid not in seen_ids:
                                 unique_valid_items.append(item)
                                 seen_ids.add(mid)
 
                         if not unique_valid_items:
-                            st.warning(f"⚠️ 找到了 {len(schedule_data)} 場賽事，但經過過濾，沒有屬於 {date_str} 的賽程。可能 API 尚未提供該日資料。")
+                            st.warning(f"⚠️ 找到了 {len(schedule_data)} 場賽事，但未能解析出有效的賽事 ID。")
                         else:
                             progress_bar = st.progress(0)
                             status_text = st.empty()
