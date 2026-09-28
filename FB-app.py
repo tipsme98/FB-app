@@ -132,9 +132,10 @@ def save_db(df, filename, table_name):
 # ==========================================
 def fetch_api_data(url):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://www.tipsme.hk/",
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8"
     }
     try:
         response = requests.get(url, headers=headers, timeout=10)
@@ -148,15 +149,11 @@ def fetch_api_data(url):
         return None, str(e)
 
 def get_match_odds(match_id):
-    # 擴展 API 路由池，應對 Tipsme 不同的端點
     urls = [
         f"https://api.tipsme.hk/api/Score/matchOdds/{match_id}",
         f"https://api.tipsme.hk/api/Score/odds/hkjc/{match_id}",
         f"https://api.tipsme.hk/api/Score/hkjc/odds/{match_id}",
         f"https://api.tipsme.hk/api/Score/match/{match_id}/odds",
-        f"https://api.tipsme.hk/api/v1/match/{match_id}/odds",
-        f"https://api.tipsme.hk/api/Score/odds/macau/{match_id}",
-        f"https://api.tipsme.hk/api/Score/odds/{match_id}",
         f"https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/{match_id}"
     ]
     for url in urls:
@@ -165,15 +162,10 @@ def get_match_odds(match_id):
     return None
 
 def get_match_fixtures(match_id):
-    # 擴展 API 路由池
     urls = [
         f"https://api.tipsme.hk/api/Score/matchInfo/{match_id}",
         f"https://api.tipsme.hk/api/Score/match/{match_id}",
-        f"https://api.tipsme.hk/api/Score/match/detail/{match_id}",
-        f"https://api.tipsme.hk/api/v1/match/{match_id}",
-        f"https://api.tipsme.hk/api/Score/fixtures/{match_id}",
-        f"https://tipsme-web.azurewebsites.net/api/Score/matchInfo/{match_id}",
-        f"https://tipsme-web.azurewebsites.net/api/Score/match/{match_id}"
+        f"https://tipsme-web.azurewebsites.net/api/Score/matchInfo/{match_id}"
     ]
     for url in urls:
         data, status = fetch_api_data(url)
@@ -185,8 +177,7 @@ def get_matches_schedule(date_str):
     urls = [
         f"https://api.tipsme.hk/api/Score/schedule/hkjc/{date_str}",
         f"https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc/{date_str}",
-        f"https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc/{date_nodash}",
-        f"https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc?date={date_str}"
+        f"https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc/{date_nodash}"
     ]
     for url in urls:
         data, status = fetch_api_data(url)
@@ -196,97 +187,94 @@ def get_matches_schedule(date_str):
                 elif 'list' in data: data = data['list']
             if isinstance(data, list) and len(data) > 0:
                 return data, 200
-                
-    if date_str == datetime.today().strftime("%Y-%m-%d"):
-        fallback_urls = [
-            "https://api.tipsme.hk/api/Score/schedule/hkjc",
-            "https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc"
-        ]
-        for url in fallback_urls:
-            data, status = fetch_api_data(url)
-            if status == 200 and data: 
-                if isinstance(data, dict):
-                    if 'data' in data: data = data['data']
-                    elif 'list' in data: data = data['list']
-                if isinstance(data, list) and len(data) > 0:
-                    return data, 200
-
     return None, 404
 
 def extract_odds_history(odds_data):
-    """深度遞迴搜尋 JSON，強制找出所有的賠率與盤口數據"""
+    """深度遞迴搜尋 JSON，強制找出所有的賠率與盤口數據，並抓取變動時間"""
     new_history = []
-    row_id = 0
     
-    def find_target_array(node, keys):
+    def find_odds_arrays(node):
+        found = {}
         if isinstance(node, dict):
             for k, v in node.items():
-                if any(pk.lower() in k.lower() for pk in keys):
-                    if isinstance(v, list): return v
-                    if isinstance(v, dict) and 'history' in v and isinstance(v['history'], list): return v['history']
-                    if isinstance(v, dict) and 'odds' in v and isinstance(v['odds'], list): return v['odds']
-            for v in node.values():
-                res = find_target_array(v, keys)
-                if res: return res
+                k_lower = k.lower()
+                # 尋找典型的盤口陣列
+                if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
+                    if any(pk in k_lower for pk in ["letting", "hdc", "ah", "handicap", "asian", "讓球"]):
+                        found["讓球"] = v
+                    elif any(pk in k_lower for pk in ["ou", "hil", "overunder", "total", "goals", "入球"]):
+                        found["入球大小"] = v
+                    elif any(pk in k_lower for pk in ["corner", "chl", "corners", "角球"]):
+                        found["角球大小"] = v
+                elif isinstance(v, dict):
+                    # 遞迴往下層尋找
+                    sub_found = find_odds_arrays(v)
+                    for sk, sv in sub_found.items():
+                        if sk not in found: found[sk] = sv
         elif isinstance(node, list):
             for item in node:
-                res = find_target_array(item, keys)
-                if res: return res
-        return []
+                sub_found = find_odds_arrays(item)
+                for sk, sv in sub_found.items():
+                    if sk not in found: found[sk] = sv
+        return found
 
-    mapping = {
-        "讓球": ["letting", "hdc", "ah", "handicap", "asian", "讓球"], 
-        "入球大小": ["ou", "hil", "overunder", "total", "goals", "入球"], 
-        "角球大小": ["corner", "chl", "corners", "角球"]
-    }
-
-    try:
-        for bet_type_cn, possible_keys in mapping.items():
-            target_array = find_target_array(odds_data, possible_keys)
+    arrays = find_odds_arrays(odds_data)
+    row_id = 0
+    
+    for bet_type_cn, target_array in arrays.items():
+        if not isinstance(target_array, list): continue
+        
+        for item in target_array:
+            if not isinstance(item, dict): continue
             
-            if target_array and isinstance(target_array, list):
-                if len(target_array) > 15:
-                    step = len(target_array) // 10
-                    target_array = [target_array[0]] + target_array[1:-1:step] + [target_array[-1]]
-                    
-                for item in target_array:
-                    if not isinstance(item, dict): continue
-                    
-                    def get_val_from_keys(d, possible_keys_list, default=0.0):
-                        for k, v in d.items():
-                            if k.lower() in possible_keys_list and v is not None:
-                                try:
-                                    if isinstance(v, (int, float)): return float(v)
-                                    s = str(v).replace('[', '').replace(']', '').replace('球', '').strip()
-                                    if '/' in s:
-                                        parts = s.split('/')
-                                        return (float(parts[0]) + float(parts[1])) / 2
-                                    return float(re.sub(r'[^\d\.\-]', '', s))
-                                except: pass
-                        return default
+            def get_val(d, keys, default):
+                for k, v in d.items():
+                    if k.lower() in keys and v is not None:
+                        try:
+                            if isinstance(default, float):
+                                s = str(v).replace('[', '').replace(']', '').replace('球', '').strip()
+                                if '/' in s:
+                                    parts = s.split('/')
+                                    return (float(parts[0]) + float(parts[1])) / 2
+                                return float(re.sub(r'[^\d\.\-]', '', s))
+                            elif isinstance(default, str):
+                                return str(v)
+                        except: pass
+                return default
 
-                    line = get_val_from_keys(item, ['line', 'goal', 'p', 'handicap', 'matchgoal', 'ratio', 'goals'], 0.0)
-                    upper = get_val_from_keys(item, ['h', 'home', 'homeodds', 'up', 'upper', 'over', 'overodds', 'high', 'h_odds', '大', '主'], 1.90)
-                    lower = get_val_from_keys(item, ['a', 'away', 'awayodds', 'low', 'lower', 'under', 'underodds', 'a_odds', '小', '客'], 1.90)
-                    
-                    if upper != 1.90 or lower != 1.90 or line != 0.0:
-                        new_history.append({"id": row_id, "type": bet_type_cn, "line": line, "upper": upper, "lower": lower, "unlock": True, "margin": 1.085})
-                        row_id += 1
-    except Exception as e:
-        print("Odds extraction warning:", e)
-                    
+            line = get_val(item, ['line', 'goal', 'p', 'handicap', 'matchgoal', 'ratio', 'goals', 'point'], 0.0)
+            upper = get_val(item, ['h', 'home', 'homeodds', 'up', 'upper', 'over', 'overodds', 'high', 'h_odds', '大', '主'], 1.90)
+            lower = get_val(item, ['a', 'away', 'awayodds', 'low', 'lower', 'under', 'underodds', 'a_odds', '小', '客'], 1.90)
+            
+            # 抓取並格式化時間
+            time_str = get_val(item, ['time', 'updatedat', 'modifytime', 'date', 'updatetime'], "")
+            if time_str:
+                try:
+                    time_str = pd.to_datetime(str(time_str).replace('T', ' ').replace('Z', '')).strftime("%d-%m %H:%M")
+                except:
+                    time_str = str(time_str)[:16]
+            
+            # 過濾無效資料
+            if upper != 1.90 or lower != 1.90 or line != 0.0:
+                new_history.append({
+                    "id": row_id, 
+                    "type": bet_type_cn, 
+                    "time": time_str,
+                    "line": line, 
+                    "upper": upper, 
+                    "lower": lower, 
+                    "unlock": True
+                })
+                row_id += 1
+                
     return new_history
 
-# 加入 fallback_data 機制：防止迴圈批量執行時因 API Rate Limit 而被全部清零
 def parse_and_fill_pre_match(match_id, default_h='', default_a='', default_l='', fallback_data=None):
     fixtures_data = get_match_fixtures(match_id)
     if not fixtures_data and fallback_data:
         fixtures_data = fallback_data
         
     odds_data = get_match_odds(match_id)
-    if not odds_data and fallback_data:
-        odds_data = fallback_data
-
     success = False
     details = {}
     
@@ -306,7 +294,7 @@ def parse_and_fill_pre_match(match_id, default_h='', default_a='', default_l='',
     details = {'h': h_name, 'a': a_name, 'l': l_name}
     if h_name or a_name: success = True
 
-    # 解析盤口資料 (解耦 session_state，統一回傳)
+    # 獲取賠率 (不再強塞假資料，防止批量同步污染 DB)
     odds_history_res = []
     if odds_data:
         new_history = extract_odds_history(odds_data)
@@ -314,10 +302,11 @@ def parse_and_fill_pre_match(match_id, default_h='', default_a='', default_l='',
             odds_history_res = new_history
             success = True 
             
-    # 若抓不到任何盤口，填寫一個預設值，避免 UI 崩潰
-    if not odds_history_res:
-        odds_history_res = [{"id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}]
-        
+    # 如果抓不到，檢查 fallback_data 內是否隱含簡易賠率
+    if not odds_history_res and fallback_data:
+        new_history = extract_odds_history({"fallback": fallback_data})
+        if new_history: odds_history_res = new_history
+
     return success, details, odds_history_res
 
 # ==========================================
@@ -464,13 +453,14 @@ def clear_edit_mode():
     for k in list(st.session_state.keys()):
         if k.startswith('edit_'): del st.session_state[k]
 
-def render_odds_section(odds_history_state, prefix="pre"):
-    for i, row in enumerate(odds_history_state):
-        r_id = row['id']
+def render_odds_section(odds_list, prefix="pre"):
+    """渲染最終投注盤口的編輯區 (單一橫列)"""
+    for i, row in enumerate(odds_list):
+        r_id = row.get('id', i)
         up_key, type_key, unlock_key = f"{prefix}_up_{r_id}", f"{prefix}_t_{r_id}", f"{prefix}_u_{r_id}"
-        margin_key, low_key, line_key = f"{prefix}_l_{r_id}", f"{prefix}_low_{r_id}", f"{prefix}_line_{r_id}"
+        low_key, line_key = f"{prefix}_low_{r_id}", f"{prefix}_line_{r_id}"
         
-        c1, c2, c3, c4, c5, c6 = st.columns([2, 1.5, 1.5, 2, 1.5, 1])
+        c1, c2, c3, c4, c5, c6 = st.columns([2, 1.5, 1.5, 1.5, 1.5, 1])
         type_idx = ["讓球", "入球大小", "角球大小"].index(row['type']) if row['type'] in ["讓球", "入球大小", "角球大小"] else 0
         row['type'] = c1.selectbox(f"盤口類型", ["讓球", "入球大小", "角球大小"], key=type_key, index=type_idx)
         
@@ -483,7 +473,7 @@ def render_odds_section(odds_history_state, prefix="pre"):
         else: row['lower'] = c5.number_input(f"{low_lbl} 賠率", value=float(row['lower']), step=0.01, key=low_key)
             
         if c6.button("❌", key=f"{prefix}_del_{r_id}"):
-            odds_history_state.pop(i)
+            odds_list.pop(i)
             st.rerun()
 
 def load_bet_to_edit(bet_id):
@@ -503,8 +493,14 @@ def load_bet_to_edit(bet_id):
     
     try:
         oh = json.loads(str(row.get('Odds_History', '[]')))
-        if isinstance(oh, list) and len(oh) > 0: st.session_state.odds_history = oh
+        if isinstance(oh, list) and len(oh) > 0: 
+            st.session_state.odds_history = oh
+            # 取出最新的作為當前投注依據
+            latest = {}
+            for r in oh: latest[r['type']] = r.copy()
+            st.session_state.current_odds = list(latest.values())
     except: pass
+    
     st.session_state.edit_user_stake = float(row.get('User_Stake', 0.0))
     st.session_state.edit_bet_type = str(row.get('Bet_Type', '')).replace(" (即場)", "")
     st.session_state.edit_selection = str(row.get('Selection', 'Home'))
@@ -517,7 +513,8 @@ def main():
     
     if 'undo_stack' not in st.session_state: st.session_state.undo_stack = []
     if 'editing_bet_id' not in st.session_state: st.session_state.editing_bet_id = None
-    if 'last_bet_id' not in st.session_state: st.session_state.last_bet_id = None
+    if 'odds_history' not in st.session_state: st.session_state.odds_history = []
+    if 'current_odds' not in st.session_state: st.session_state.current_odds = [{"id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False}]
         
     db_file, capital_file = "football_betting_db.csv", "football_capital_db.csv"
     db_table, cap_table = "football_bets", "football_cap"
@@ -556,7 +553,7 @@ def main():
             target_match_id = col_id.text_input("請輸入 Tipsme 賽事 ID (例如: 112684)", key="api_match_id")
             if col_btn.button("📥 獲取球隊與全盤口", use_container_width=True):
                 if target_match_id:
-                    target_match_id = target_match_id.strip() # 自動去除前後空白防呆
+                    target_match_id = target_match_id.strip()
                     with st.spinner('正在從 Tipsme 抓取數據與深度解析盤口...'):
                         success, details, odds_res = parse_and_fill_pre_match(target_match_id)
                         if success:
@@ -566,7 +563,16 @@ def main():
                             st.session_state.edit_a_team = details.get('a', '')
                             st.session_state.edit_t_name = details.get('l', '')
                             st.session_state.odds_history = odds_res
-                            st.success(f"✅ 成功載入賽事 {target_match_id}！歷史盤口與球隊資料已自動填入下方表格。")
+                            
+                            # 從歷史走勢中提取最新盤口作為使用者目前編輯的依據
+                            latest = {}
+                            for r in odds_res: latest[r['type']] = r.copy()
+                            if latest:
+                                st.session_state.current_odds = list(latest.values())
+                            else:
+                                st.session_state.current_odds = [{"id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False}]
+                            
+                            st.success(f"✅ 成功載入賽事 {target_match_id}！歷史盤口與球隊資料已自動填入下方。")
                             st.rerun()
                         else: 
                             st.error(f"❌ 抓取失敗。可能原因：(1) 賽事 ID 錯誤 (2) 該賽事尚無開盤資料 (3) 官方 API 已阻擋。")
@@ -574,7 +580,7 @@ def main():
 
         with pre_t2:
             st.markdown("##### 📅 自動掃描與批量建檔")
-            st.caption("系統將自動抓取該日所有賽程，並深度解析所有盤口寫入資料庫。")
+            st.caption("系統將自動抓取該日所有賽程，並深度解析所有盤口寫入資料庫。(已包含防阻擋降速機制)")
             c_date, c_sync = st.columns([2, 1])
             target_date = c_date.date_input("選擇賽事日期", value=datetime.today())
             date_str = target_date.strftime("%Y-%m-%d")
@@ -609,31 +615,39 @@ def main():
                                 
                                 status_text.text(f"正在同步: {m_id} ({i+1}/{len(unique_valid_items)})...")
                                 
-                                # 加入 Rate Limit 防護：傳入 item 作為 fallback，並減緩請求速度
                                 success, details, odds_res = parse_and_fill_pre_match(m_id, default_h=dh, default_a=da, default_l=dl, fallback_data=item)
                                 
-                                if success:
+                                if success and odds_res: # 確保有抓到盤口才算成功
                                     success_count += 1
                                     current_odds_json = json.dumps(odds_res, ensure_ascii=False)
                                     match_title = f"{details.get('h', 'Unknown')} vs {details.get('a', 'Unknown')}"
+                                    
+                                    # 抓取最新一筆盤口當作初始值存入 DB
+                                    latest_odds = {}
+                                    for r in odds_res: latest_odds[r['type']] = r
+                                    init_l = float(latest_odds.get('讓球', {}).get('line', 0.0))
+                                    init_u = float(latest_odds.get('讓球', {}).get('upper', 1.90))
                                     
                                     if not (st.session_state.df_db['Tipsme_ID'] == m_id).any():
                                         new_rec = {
                                             'ID': f"B{datetime.now().strftime('%Y%m%d%H%M%S%f')}", 
                                             'Tipsme_ID': m_id, 'Date': date_str, 'Status': 'Open', 
                                             'Match': match_title, 'Tournament_Name': details.get('l', ''), 
-                                            'Odds_History': current_odds_json
+                                            'Odds_History': current_odds_json,
+                                            'Initial_Line': init_l, 'Initial_Odds': init_u
                                         }
                                         st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame([new_rec])], ignore_index=True)
                                     else:
                                         mask = st.session_state.df_db['Tipsme_ID'] == m_id
                                         st.session_state.df_db.loc[mask, 'Odds_History'] = current_odds_json
+                                        st.session_state.df_db.loc[mask, 'Initial_Line'] = init_l
+                                        st.session_state.df_db.loc[mask, 'Initial_Odds'] = init_u
                                         
                                 progress_bar.progress((i + 1) / len(unique_valid_items))
-                                time.sleep(0.2) # API 限速防護
+                                time.sleep(0.8) # 延長延遲以避開 Tipsme 的 403 Rate Limit
                                 
                             save_db(st.session_state.df_db, db_file, db_table)
-                            st.success(f"✅ 批量同步完成！針對 {date_str} 掃描了 {len(unique_valid_items)} 場，成功更新 {success_count} 場賽事的球隊資料與盤口。")
+                            st.success(f"✅ 批量同步完成！針對 {date_str} 掃描了 {len(unique_valid_items)} 場，成功寫入 {success_count} 場賽事的歷史走勢。")
 
         with pre_t3:
             st.markdown("##### 🎯 AI 系統自動推薦 (勝率達標且 EV > 0)")
@@ -650,17 +664,22 @@ def main():
                                 if not history: continue
                             except: continue
                             
+                            # 取出各盤口的最新賠率
+                            latest = {}
+                            for r in history: latest[r['type']] = r
+                            
                             hr_val = rating_map.get(row.get('Home_Rating', 'C'), 3)
                             ar_val = rating_map.get(row.get('Away_Rating', 'C'), 3)
-                            for r in history:
-                                b_type, line_val = r['type'], float(r['line'])
+                            
+                            for b_type, r in latest.items():
+                                line_val = float(r['line'])
                                 u_odds, l_odds = float(r['upper']), float(r['lower'])
                                 if b_type == "讓球":
                                     p_up = max(0.1, min(0.9, 0.5 + ((hr_val - ar_val) * 0.03)))
                                     ev_up = p_up * (u_odds - 1) - (1 - p_up)
                                     ev_down = (1 - p_up) * (l_odds - 1) - p_up
-                                    if ev_up > 0.02 and p_up > 0.5: recommendations.append({"賽事": row['Match'], "盤口": f"讓球 {line_val}", "推薦": "主隊(上盤)", "勝率": f"{p_up*100:.1f}%", "EV": f"{ev_up:.3f}", "賠率": u_odds})
-                                    elif ev_down > 0.02 and (1-p_up) > 0.5: recommendations.append({"賽事": row['Match'], "盤口": f"讓球 {line_val}", "推薦": "客隊(下盤)", "勝率": f"{(1-p_up)*100:.1f}%", "EV": f"{ev_down:.3f}", "賠率": l_odds})
+                                    if ev_up > 0.02 and p_up > 0.5: recommendations.append({"賽事": row['Match'], "盤口": f"讓球 [{line_val:+g}]", "推薦": "主隊(上盤)", "勝率": f"{p_up*100:.1f}%", "EV": f"{ev_up:.3f}", "賠率": u_odds})
+                                    elif ev_down > 0.02 and (1-p_up) > 0.5: recommendations.append({"賽事": row['Match'], "盤口": f"讓球 [{line_val:+g}]", "推薦": "客隊(下盤)", "勝率": f"{(1-p_up)*100:.1f}%", "EV": f"{ev_down:.3f}", "賠率": l_odds})
                     if recommendations:
                         st.success(f"🔥 系統發現 {len(recommendations)} 個具備投資價值的黃金盤口！")
                         df_rec = pd.DataFrame(recommendations).sort_values(by="EV", ascending=False)
@@ -691,10 +710,28 @@ def main():
         home_form = f"{f1.number_input('主勝',0,10,hw_val)}W{f2.number_input('主和',0,10,hd_val)}D{f3.number_input('主敗',0,10,hl_val)}L"
         away_form = f"{f4.number_input('客勝',0,10,aw_val)}W{f5.number_input('客和',0,10,ad_val)}D{f6.number_input('客敗',0,10,al_val)}L"
 
+        # --- 歷史走勢純展示區塊 (如 Tipsme 般表列) ---
         st.markdown("##### 3. 賽前盤口與賠率走勢紀錄")
-        if 'odds_history' not in st.session_state or not st.session_state.odds_history: 
-            st.session_state.odds_history = [{"id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}]
-        render_odds_section(st.session_state.odds_history, "pre")
+        if 'odds_history' in st.session_state and st.session_state.odds_history:
+            df_hist = pd.DataFrame(st.session_state.odds_history)
+            if not df_hist.empty:
+                for b_type in df_hist['type'].unique():
+                    sub_df = df_hist[df_hist['type'] == b_type].copy()
+                    sub_df['時間'] = sub_df.get('time', '').fillna('-')
+                    sub_df['盤口線'] = sub_df['line'].apply(lambda x: f"[{x:+g}]")
+                    sub_df['主/大'] = sub_df['upper'].apply(lambda x: f"{float(x):.2f}")
+                    sub_df['客/小'] = sub_df['lower'].apply(lambda x: f"{float(x):.2f}")
+                    
+                    st.markdown(f"**🟢 {b_type} 走勢**")
+                    st.dataframe(sub_df[['時間', '主/大', '盤口線', '客/小']], use_container_width=True, hide_index=True)
+        else:
+            st.caption("尚無歷史走勢資料。")
+
+        # --- 最終投注編輯區 ---
+        st.markdown("##### ✏️ 確認最終投注盤口 (AI 計算基準)")
+        if 'current_odds' not in st.session_state or not st.session_state.current_odds: 
+            st.session_state.current_odds = [{"id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False}]
+        render_odds_section(st.session_state.current_odds, "pre")
         
         st.markdown("---")
         
@@ -705,8 +742,9 @@ def main():
             rating_map = {"S": 5, "A": 4, "B": 3, "C": 2, "D": 1}
             hr_val = rating_map.get(home_rating, 3); ar_val = rating_map.get(away_rating, 3)
             
+            # 使用 current_odds (最後確認的盤口) 進行運算
             candidates_base = []
-            for r in st.session_state.odds_history:
+            for r in st.session_state.current_odds:
                 b_type, line_val = r['type'], float(r['line'])
                 if b_type == "讓球":
                     p_up = max(0.1, min(0.9, 0.5 + ((hr_val - ar_val) * 0.03)))
@@ -746,7 +784,7 @@ def main():
 
             with st.form("bet_form"):
                 bc1, bc2 = st.columns(2)
-                final_btype = bc1.selectbox("最終投注項目", [c['type'] for c in st.session_state.odds_history])
+                final_btype = bc1.selectbox("最終投注項目", [c['type'] for c in st.session_state.current_odds])
                 final_sel = bc2.selectbox("最終投注方向", ["Home", "Away", "Over", "Under"])
                 
                 bc3, bc4 = st.columns(2)
@@ -759,7 +797,7 @@ def main():
                     target_id = st.session_state.get('editing_bet_id')
                     new_id = target_id if target_id and target_id.startswith('B') else f"B{datetime.now().strftime('%Y%m%d%H%M%S')}"
                     tipsme_id = st.session_state.get('current_tipsme_id', '')
-                    final_row = next((r for r in st.session_state.odds_history if r['type'] == final_btype), st.session_state.odds_history[-1])
+                    final_row = next((r for r in st.session_state.current_odds if r['type'] == final_btype), st.session_state.current_odds[-1])
                     line, odds = float(final_row['line']), float(final_row['upper']) if final_sel in ["Home", "Over"] else float(final_row['lower'])
                     
                     new_record = {
@@ -769,7 +807,7 @@ def main():
                         'Home_Rating': home_rating, 'Away_Rating': away_rating, 'Home_Form': home_form, 'Away_Form': away_form,
                         'Bet_Type': final_btype, 'Selection': final_sel, 'Initial_Line': line, 'Initial_Odds': odds, 
                         'System_Stake': res['stake'], 'User_Stake': final_user_stake,
-                        'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False)
+                        'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False) # 保存完整歷史紀錄
                     }
                     
                     if target_id and (st.session_state.df_db['ID'] == target_id).any():
