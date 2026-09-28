@@ -128,17 +128,20 @@ def save_db(df, filename, table_name):
     except: pass
 
 # ==========================================
-# 1.5 自動化抓取 API 模組 (深度解構與強力過濾)
+# 1.5 自動化抓取 API 模組 (深度擴展路由池)
 # ==========================================
 def fetch_api_data(url):
+    # 強化防禦繞過
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://www.tipsme.hk/",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8"
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Origin": "https://www.tipsme.hk",
+        "Referer": "https://www.tipsme.hk/",
+        "Connection": "keep-alive"
     }
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=8)
         if response.status_code == 200: 
             try:
                 return response.json(), 200
@@ -149,12 +152,17 @@ def fetch_api_data(url):
         return None, str(e)
 
 def get_match_odds(match_id):
+    # 擴展多種可能的賠率端點
     urls = [
+        f"https://api.tipsme.hk/api/v1/match/{match_id}/odds",
         f"https://api.tipsme.hk/api/Score/matchOdds/{match_id}",
         f"https://api.tipsme.hk/api/Score/odds/hkjc/{match_id}",
         f"https://api.tipsme.hk/api/Score/hkjc/odds/{match_id}",
         f"https://api.tipsme.hk/api/Score/match/{match_id}/odds",
-        f"https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/{match_id}"
+        f"https://api.tipsme.hk/api/Score/odds/{match_id}",
+        f"https://api.tipsme.hk/api/Score/odds/macau/{match_id}",
+        f"https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/{match_id}",
+        f"https://tipsme-web.azurewebsites.net/api/v1/match/{match_id}/odds"
     ]
     for url in urls:
         data, status = fetch_api_data(url)
@@ -162,9 +170,13 @@ def get_match_odds(match_id):
     return None
 
 def get_match_fixtures(match_id):
+    # 擴展多種可能的賽事資訊端點
     urls = [
+        f"https://api.tipsme.hk/api/v1/match/{match_id}",
         f"https://api.tipsme.hk/api/Score/matchInfo/{match_id}",
         f"https://api.tipsme.hk/api/Score/match/{match_id}",
+        f"https://api.tipsme.hk/api/Score/match/detail/{match_id}",
+        f"https://api.tipsme.hk/api/Score/fixtures/{match_id}",
         f"https://tipsme-web.azurewebsites.net/api/Score/matchInfo/{match_id}"
     ]
     for url in urls:
@@ -174,10 +186,16 @@ def get_match_fixtures(match_id):
 
 def get_matches_schedule(date_str):
     date_nodash = date_str.replace("-", "")
+    # 擴展多種可能的賽程表端點，解決 404 問題
     urls = [
+        f"https://api.tipsme.hk/api/v1/match/schedule/hkjc/{date_str}",
+        f"https://api.tipsme.hk/api/v1/schedule/hkjc/{date_str}",
         f"https://api.tipsme.hk/api/Score/schedule/hkjc/{date_str}",
+        f"https://api.tipsme.hk/api/Score/schedule/hkjc/{date_nodash}",
+        f"https://api.tipsme.hk/api/Score/schedule/{date_str}",
+        f"https://api.tipsme.hk/api/Score/schedule/hkjc?date={date_str}",
         f"https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc/{date_str}",
-        f"https://tipsme-web.azurewebsites.net/api/Score/schedule/hkjc/{date_nodash}"
+        f"https://tipsme-web.azurewebsites.net/api/v1/match/schedule/hkjc/{date_str}"
     ]
     for url in urls:
         data, status = fetch_api_data(url)
@@ -185,6 +203,7 @@ def get_matches_schedule(date_str):
             if isinstance(data, dict):
                 if 'data' in data: data = data['data']
                 elif 'list' in data: data = data['list']
+                elif 'matches' in data: data = data['matches']
             if isinstance(data, list) and len(data) > 0:
                 return data, 200
     return None, 404
@@ -573,6 +592,7 @@ def main():
                                 st.session_state.current_odds = [{"id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False}]
                             
                             st.success(f"✅ 成功載入賽事 {target_match_id}！歷史盤口與球隊資料已自動填入下方。")
+                            time.sleep(1) # 讓使用者看見成功訊息
                             st.rerun()
                         else: 
                             st.error(f"❌ 抓取失敗。可能原因：(1) 賽事 ID 錯誤 (2) 該賽事尚無開盤資料 (3) 官方 API 已阻擋。")
@@ -590,7 +610,7 @@ def main():
                     schedule_data, status_code = get_matches_schedule(date_str)
                     
                     if not schedule_data or not isinstance(schedule_data, list):
-                        st.error(f"❌ 無法取得該日賽程表 (狀態碼: {status_code})。")
+                        st.error(f"❌ 無法取得該日賽程表 (狀態碼: {status_code})。可能是 API 路由已變更或被阻擋。")
                     else:
                         seen_ids = set()
                         unique_valid_items = []
@@ -644,7 +664,7 @@ def main():
                                         st.session_state.df_db.loc[mask, 'Initial_Odds'] = init_u
                                         
                                 progress_bar.progress((i + 1) / len(unique_valid_items))
-                                time.sleep(0.8) # 延長延遲以避開 Tipsme 的 403 Rate Limit
+                                time.sleep(0.8) # 延長延遲以避開 Rate Limit
                                 
                             save_db(st.session_state.df_db, db_file, db_table)
                             st.success(f"✅ 批量同步完成！針對 {date_str} 掃描了 {len(unique_valid_items)} 場，成功寫入 {success_count} 場賽事的歷史走勢。")
@@ -844,7 +864,7 @@ def main():
                         a_c = col4.number_input("全場客隊角球數", min_value=0, value=int(row.get('Away_Corner', 0)) if pd.notna(row.get('Away_Corner')) else 0, key=f"ac_{row['ID']}")
                         
                         if st.form_submit_button("確認賽果並雲端結算"):
-                            sys_p, usr_p, sys_pay, usr_pay, u_prof, lbl, diff = calculate_settlement(
+                            sys_p, usr_p, sys_pay, usr_pay, u_prof, lbl, diff = calculate_calculate(
                                 row['Bet_Type'], row['Selection'], float(row['Initial_Line']), float(row['Initial_Odds']), 
                                 float(row.get('System_Stake', 0)), float(row.get('User_Stake', 0)), h_g, a_g, h_c, a_c
                             )
