@@ -44,7 +44,6 @@ DB_COLUMNS = [
     'Result_Label', 'System_Profit', 'User_Profit', 'Unit_Profit', 'System_Payout', 'User_Payout'
 ]
 CAPITAL_COLUMNS = ['ID', 'Date', 'Type', 'Account', 'Amount', 'Note']
-LOG_COLUMNS = ['ID', 'Date', 'Match', 'Analysis_Content', 'Confidence_Level']
 CATEGORY_OPTIONS = ["國內聯賽 (Domestic League)", "國際聯賽 (International League)", "國際盃賽 (Cup)", "國內盃賽 (Domestic Cup)", "友誼賽 (Friendly)"]
 
 # GitHub API 讀取與寫入輔助函式
@@ -164,6 +163,187 @@ def save_db(df, filename, table_name):
         df.to_csv(filename, index=False)
     except Exception:
         pass
+
+# ==========================================
+# 1.5 自動化抓取 API 模組 (Auto-Scraper)
+# ==========================================
+def fetch_api_data(url):
+    """通用的 API 請求函數"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            return response.json()
+        return None
+    except Exception as e:
+        return None
+
+def get_match_odds(match_id):
+    """抓取馬會賠率變化"""
+    url = f"https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/{match_id}"
+    return fetch_api_data(url)
+
+def get_match_fixtures(match_id):
+    """抓取即場賽況及統計數據 (同時適用於賽果)"""
+    url = f"https://tipsme-web.azurewebsites.net/api/Score/fixtures/{match_id}"
+    return fetch_api_data(url)
+
+def extract_odds_history(odds_data):
+    """強大的盤口/賠率走勢萃取器，負責解構深層次 JSON 並轉換成系統需要的格式"""
+    new_history = []
+    row_id = 0
+    
+    def parse_line(line_str):
+        try:
+            line_str = str(line_str).replace('[', '').replace(']', '').replace('球', '')
+            if '/' in line_str:
+                parts = line_str.split('/')
+                return (float(parts[0]) + float(parts[1])) / 2
+            return float(line_str)
+        except:
+            return 0.0
+            
+    def parse_odds_val(val):
+        try:
+            # 清洗 1.91↑, 1.85↓ 等帶有特殊符號的字串
+            clean_val = re.sub(r'[^\d\.]', '', str(val))
+            return float(clean_val)
+        except:
+            return 1.90
+            
+    def get_odds(item, keys, default=1.90):
+        for k in keys:
+            if k in item and item[k] is not None:
+                return parse_odds_val(item[k])
+        return default
+
+    # 對應 JSON 中可能出現的代號名稱
+    mapping = {
+        "讓球": ["letting", "hdc", "ah", "handicap", "讓球"],
+        "入球大小": ["ou", "hil", "overunder", "入球大細", "入球大小"],
+        "角球大小": ["corner", "chl", "corners", "角球大細", "角球大小"]
+    }
+    
+    upper_keys = ['h', 'home', 'homeOdds', 'up', 'upper', 'over', 'overOdds', 'high', '大', '主']
+    lower_keys = ['a', 'away', 'awayOdds', 'low', 'lower', 'under', 'underOdds', '小', '客', 'l']
+    line_keys = ['line', 'goal', 'p', '盤', 'handicap']
+
+    for bet_type_cn, possible_keys in mapping.items():
+        target_data = []
+        if isinstance(odds_data, dict):
+            for k in possible_keys:
+                if k in odds_data:
+                    target_data = odds_data[k]
+                    break
+        elif isinstance(odds_data, list):
+            for item in odds_data:
+                if isinstance(item, dict):
+                    t = item.get('type', '').lower()
+                    if any(pk.lower() in t for pk in possible_keys):
+                        target_data = item.get('history', [item])
+                        break
+                        
+        if isinstance(target_data, dict):
+            if 'history' in target_data:
+                target_data = target_data['history']
+            elif 'odds' in target_data:
+                target_data = target_data['odds']
+            else:
+                target_data = [target_data]
+                
+        if isinstance(target_data, list):
+            # 若走勢變化過多（超過12筆），精簡採樣避免UI過長，但保留最新趨勢
+            if len(target_data) > 12:
+                step = len(target_data) // 10
+                target_data = [target_data[0]] + target_data[1:-1:step] + [target_data[-1]]
+                
+            for item in target_data:
+                if not isinstance(item, dict): continue
+                
+                line_val = 0.0
+                for lk in line_keys:
+                    if lk in item:
+                        line_val = item[lk]
+                        break
+                line = parse_line(line_val)
+                
+                upper = get_odds(item, upper_keys, 1.90)
+                lower = get_odds(item, lower_keys, 1.90)
+                
+                if upper != 1.90 or lower != 1.90 or line != 0.0: 
+                    new_history.append({
+                        "id": row_id, "type": bet_type_cn, "line": line,
+                        "upper": upper, "lower": lower, "unlock": True, "margin": 1.085
+                    })
+                    row_id += 1
+                    
+    return new_history
+
+def parse_and_fill_pre_match(match_id):
+    """將抓取到的 API 數據填入 Session State (賽前)"""
+    fixtures_data = get_match_fixtures(match_id)
+    odds_data = get_match_odds(match_id)
+    
+    success = False
+    if fixtures_data:
+        h_name = fixtures_data.get('homeName', fixtures_data.get('home', ''))
+        a_name = fixtures_data.get('awayName', fixtures_data.get('away', ''))
+        l_name = fixtures_data.get('leagueName', '')
+        
+        if h_name: st.session_state.edit_h_team = h_name
+        if a_name: st.session_state.edit_a_team = a_name
+        if l_name: st.session_state.edit_t_name = l_name
+        if h_name or a_name:
+            success = True
+        
+    if odds_data:
+        new_history = extract_odds_history(odds_data)
+        if new_history:
+            st.session_state.odds_history = new_history
+            success = True
+
+    return success
+
+def parse_and_fill_inplay(match_id):
+    """將抓取到的 API 數據填入 Session State (即場與賽果)"""
+    data = get_match_fixtures(match_id)
+    odds_data = get_match_odds(match_id)
+    
+    success = False
+    
+    if data and "teamStats" in data:
+        team_stats_ft = data["teamStats"].get("ft", {})
+        if team_stats_ft:
+            goals = team_stats_ft.get("1", [0, 0])
+            st.session_state.edit_h_g = int(goals[0])
+            st.session_state.edit_a_g = int(goals[1])
+            
+            corners = team_stats_ft.get("2", [0, 0])
+            st.session_state.edit_h_c = int(corners[0])
+            st.session_state.edit_a_c = int(corners[1])
+            
+            red_cards = team_stats_ft.get("4", [0, 0])
+            st.session_state.edit_h_red = int(red_cards[0])
+            st.session_state.edit_a_red = int(red_cards[1])
+            
+            sot = team_stats_ft.get("21", [0, 0])
+            st.session_state.edit_h_sot = int(sot[0])
+            st.session_state.edit_a_sot = int(sot[1])
+            
+            poss = team_stats_ft.get("25", [50, 50])
+            st.session_state.edit_h_poss = int(poss[0])
+            success = True
+            
+    if odds_data:
+        new_history = extract_odds_history(odds_data)
+        if new_history:
+            st.session_state.inplay_odds_history = new_history
+            success = True
+            
+    return success
 
 # ==========================================
 # 2. 資金、風控與累計算式 (分離系統與真實資金)
@@ -704,88 +884,154 @@ def get_last_odds_state(history, target_type, default_line):
         "margin": 1.085
     }
 
-def render_odds_section(odds_history_state, prefix="pre"):
-    for i, row in enumerate(odds_history_state):
-        r_id = row['id']
-        up_key, type_key, unlock_key = f"{prefix}_up_{r_id}", f"{prefix}_t_{r_id}", f"{prefix}_u_{r_id}"
-        margin_key, low_key, line_key = f"{prefix}_m_{r_id}", f"{prefix}_low_{r_id}", f"{prefix}_l_{r_id}"
-
-        if type_key in st.session_state:
-            old_type, new_type = row['type'], st.session_state[type_key]
-            if old_type != new_type:
-                row['type'] = new_type
-                if new_type == "入球大小": row['line'] = 2.5
-                elif new_type == "角球大小": row['line'] = 9.5
-                elif new_type == "讓球": row['line'] = 0.0
-                st.session_state[line_key] = float(row['line'])
-                
-        if line_key in st.session_state: row['line'] = st.session_state[line_key]
-        if up_key in st.session_state: row['upper'] = st.session_state[up_key]
-        if unlock_key in st.session_state: row['unlock'] = st.session_state[unlock_key]
-        if margin_key in st.session_state: row['margin'] = st.session_state[margin_key]
-        if low_key in st.session_state and row['unlock']: row['lower'] = st.session_state[low_key]
-
-        if not row['unlock']:
-            m_val, u_val = float(row.get('margin', 1.085)), float(row.get('upper', 1.90))
-            try:
-                calc_lower = round(1 / (m_val - (1 / u_val)), 2)
-                row['lower'] = calc_lower if calc_lower > 1 else 1.01
-            except:
-                row['lower'] = 1.90
-            st.session_state[low_key] = float(row['lower'])
-        else:
-            try:
-                row['margin'] = (1 / float(row.get('upper', 1.90))) + (1 / float(row.get('lower', 1.90)))
-            except:
-                row['margin'] = 1.085
-            st.session_state[margin_key] = float(row['margin'])
-
-        c1, c2, c3, c4, c5, c6 = st.columns([2, 1.5, 1.5, 2, 1.5, 1])
-        type_idx = ["讓球", "入球大小", "角球大小"].index(row['type']) if row['type'] in ["讓球", "入球大小", "角球大小"] else 0
-        row['type'] = c1.selectbox(f"盤口類型 {i+1}", ["讓球", "入球大小", "角球大小"], key=type_key, index=type_idx)
-        
-        line_step = 1.0 if row['type'] == "角球大小" else 0.25
-        row['line'] = c2.number_input("盤口線", step=line_step, value=float(row['line']), key=line_key)
-        
-        up_lbl, low_lbl = ("主隊", "客隊") if row['type'] == "讓球" else ("大盤(Over)", "小盤(Under)")
-        row['upper'] = c3.number_input(f"{up_lbl} 賠率", min_value=1.01, value=float(row['upper']), step=0.01, key=up_key)
-        row['unlock'] = c4.checkbox("🔓 解鎖", value=row.get('unlock', False), key=unlock_key)
-        
-        if not row['unlock']:
-            row['margin'] = c4.number_input("抽水(Margin)", min_value=1.00, value=float(row.get('margin', 1.085)), step=0.005, format="%.3f", key=margin_key)
-            margin_pct = (row['margin'] - 1) * 100
-            c4.caption(f"抽水率: **{margin_pct:.2f}%**")
-            row['lower'] = c5.number_input(f"{low_lbl} 賠率", value=float(row['lower']), disabled=True, key=low_key)
-        else:
-            row['lower'] = c5.number_input(f"{low_lbl} 賠率", min_value=1.01, step=0.01, value=float(row['lower']), key=low_key)
-            margin_pct = (row['margin'] - 1) * 100
-            c4.caption(f"隱含抽水: **{row['margin']:.3f} ({margin_pct:.2f}%)**")
-
-        if len(odds_history_state) > 1:
-            if c6.button("❌", key=f"{prefix}_d_{r_id}"):
-                odds_history_state.pop(i)
-                st.rerun()
-
-    ac1, ac2, ac3 = st.columns(3)
-    max_id = max([r['id'] for r in odds_history_state]) if odds_history_state else 0
+def parse_raw_odds_text(text):
+    if not text or not text.strip(): return []
     
-    if ac1.button("➕ 新增讓球盤", key=f"{prefix}_add_hand", use_container_width=True):
-        new_row = get_last_odds_state(odds_history_state, "讓球", 0.0)
-        new_row["id"] = max_id + 1
-        odds_history_state.append(new_row)
-        st.rerun()
+    current_type = "讓球"
+    if "大小" in text and "角球" not in text: current_type = "入球大小"
+    elif "角球" in text: current_type = "角球大小"
+    
+    # 清理時間字串以防黏在一起 (例如 11:411.99 -> 11:41 1.99)
+    text_clean = re.sub(r'(\d{2}:\d{2})(\d+\.\d+)', r'\1 \2', text)
+    # 移除日期時間 29-09 11:41 格式
+    text_clean = re.sub(r'\d{2}-\d{2}\s*\d{2}:\d{2}', ' ', text_clean)
+    
+    # 找出所有包含中括號的盤口線
+    lines_matches = re.findall(r'\[(.*?)\]', text_clean)
+    
+    if lines_matches:
+        text_no_lines = re.sub(r'\[.*?\]', ' ', text_clean)
+    else:
+        # 若沒有中括號，但有 '球' 字 (例如 2.5/3球)
+        lines_matches = re.findall(r'([+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?)\s*球', text_clean)
+        text_no_lines = re.sub(r'[+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?\s*球', ' ', text_clean)
         
-    if ac2.button("➕ 新增入球大小", key=f"{prefix}_add_goal", use_container_width=True):
-        new_row = get_last_odds_state(odds_history_state, "入球大小", 2.5)
-        new_row["id"] = max_id + 1
-        odds_history_state.append(new_row)
-        st.rerun()
+    # 取出所有的賠率 (通常為 1.xx ~ 9.xx)
+    odds_matches = re.findall(r'\d+\.\d+', text_no_lines)
+    
+    def parse_line_str(l_str):
+        l_str = str(l_str).replace('球', '').replace('+', '').strip()
+        if '/' in l_str:
+            try:
+                parts = l_str.split('/')
+                return (float(parts[0]) + float(parts[1])) / 2
+            except: return 0.0
+        try: return float(l_str)
+        except: return 0.0
+
+    parsed_data = []
+    
+    # 如果正則匹配到成對的賠率
+    if len(odds_matches) >= 2 and len(odds_matches) % 2 == 0:
+        for i in range(0, len(odds_matches), 2):
+            up = float(odds_matches[i])
+            lw = float(odds_matches[i+1])
+            
+            l_val = 0.0
+            line_idx = i // 2
+            if line_idx < len(lines_matches):
+                l_val = parse_line_str(lines_matches[line_idx])
+            elif len(lines_matches) > 0:
+                l_val = parse_line_str(lines_matches[-1]) 
+                
+            parsed_data.append({
+                "id": line_idx,
+                "type": current_type,
+                "line": l_val,
+                "upper": up,
+                "lower": lw,
+                "unlock": True,
+                "margin": round((1/up) + (1/lw), 3)
+            })
+        return parsed_data
+    
+    # 如果沒有中括號，但有 Tab (從 Excel 複製的整齊表格)
+    if '\t' in text:
+        for idx, line in enumerate(text.strip().split('\n')):
+            parts = line.split('\t')
+            nums = re.findall(r'-?\d+\.?\d*', line)
+            if len(nums) >= 3:
+                try:
+                    lw = float(nums[-1])
+                    up = float(nums[-2])
+                    l_val = float(nums[-3]) if len(nums) >= 3 else 0.0
+                    parsed_data.append({
+                        "id": idx, "type": current_type, "line": l_val, 
+                        "upper": up, "lower": lw, "unlock": True, "margin": round((1/up)+(1/lw), 3)
+                    })
+                except: pass
+        return parsed_data
         
-    if ac3.button("➕ 新增角球大小", key=f"{prefix}_add_corn", use_container_width=True):
-        new_row = get_last_odds_state(odds_history_state, "角球大小", 9.5)
-        new_row["id"] = max_id + 1
-        odds_history_state.append(new_row)
-        st.rerun()
+    return []
+
+def render_odds_section(odds_history_state, prefix="pre"):
+    st.markdown("💡 **智能貼上與表格編輯：** 您可將原始賠率文字貼在下方，系統會自動解析排版；或直接在表格內貼上 Excel 數據。")
+    
+    # 1. 智能貼上解析區
+    paste_text = st.text_area("📋 智能解析區 (請貼上如 HKJC 網站的盤口文字，或從 Excel 複製的數據)", height=100, key=f"{prefix}_paste_area")
+    
+    col_btn, _ = st.columns([1, 4])
+    if col_btn.button("🪄 自動解析並匯入表格", key=f"{prefix}_parse_btn", use_container_width=True):
+        if paste_text:
+            parsed = parse_raw_odds_text(paste_text)
+            if parsed:
+                odds_history_state.clear()
+                odds_history_state.extend(parsed)
+                st.success(f"✅ 成功解析 {len(parsed)} 筆盤口數據並排版至下方表格！")
+                st.rerun()
+            else:
+                st.error("❌ 無法解析，請確認文字內包含賠率 (如 1.90) 及盤口線 (如 [0/+0.5])。")
+
+    # 2. 表格編輯區
+    if not odds_history_state:
+        odds_history_state.append({
+            "id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": True, "margin": 1.085
+        })
+        
+    df = pd.DataFrame(odds_history_state)
+    
+    for col, default in [('type', '讓球'), ('line', 0.0), ('upper', 1.90), ('lower', 1.90)]:
+        if col not in df.columns: df[col] = default
+            
+    df_display = df[['type', 'line', 'upper', 'lower']].copy()
+    df_display.columns = ['盤口類型', '盤口線', '主隊/大盤賠率', '客隊/小盤賠率']
+    
+    st.markdown("##### 📝 盤口與賠率走勢表 (可直接點擊修改或於儲存格使用 `Ctrl+V` 貼上)")
+    edited_df = st.data_editor(
+        df_display,
+        num_rows="dynamic",
+        column_config={
+            "盤口類型": st.column_config.SelectboxColumn("盤口類型", options=["讓球", "入球大小", "角球大小"], required=True),
+            "盤口線": st.column_config.NumberColumn("盤口線", format="%.2f", required=True),
+            "主隊/大盤賠率": st.column_config.NumberColumn("主隊/大盤賠率", min_value=1.01, format="%.2f", required=True),
+            "客隊/小盤賠率": st.column_config.NumberColumn("客隊/小盤賠率", min_value=1.01, format="%.2f", required=True)
+        },
+        use_container_width=True,
+        key=f"{prefix}_odds_editor"
+    )
+    
+    # 同步 edited_df 回 state
+    new_history = []
+    for i, row in edited_df.iterrows():
+        try:
+            up = float(row["主隊/大盤賠率"]) if pd.notna(row["主隊/大盤賠率"]) else 1.90
+            lw = float(row["客隊/小盤賠率"]) if pd.notna(row["客隊/小盤賠率"]) else 1.90
+            margin = (1/up) + (1/lw)
+        except:
+            up, lw, margin = 1.90, 1.90, 1.085
+            
+        new_history.append({
+            "id": i,
+            "type": str(row["盤口類型"]) if pd.notna(row["盤口類型"]) else "讓球",
+            "line": float(row["盤口線"]) if pd.notna(row["盤口線"]) else 0.0,
+            "upper": up,
+            "lower": lw,
+            "unlock": True,
+            "margin": margin
+        })
+        
+    odds_history_state.clear()
+    odds_history_state.extend(new_history)
 
 # ==========================================
 # 6. 主程式 UI 
@@ -864,6 +1110,24 @@ def main():
 
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
+
+        # --- 自動抓取賽前數據按鈕 ---
+        with st.container(border=True):
+            st.markdown("##### ⚡ 一鍵智能抓取賽前數據與盤口走勢")
+            col_id, col_btn = st.columns([2, 1])
+            target_match_id = col_id.text_input("請輸入 Tipsme 賽事 ID (例如: 112684)", key="api_match_id")
+            if col_btn.button("📥 自動獲取球隊與全盤口走勢", use_container_width=True):
+                if target_match_id:
+                    with st.spinner('正在從 Tipsme 抓取盤口歷史走勢與數據...'):
+                        success = parse_and_fill_pre_match(target_match_id)
+                        if success:
+                            st.session_state.editing_bet_id = f"API_{target_match_id}" 
+                            st.success(f"✅ 成功載入賽事 {target_match_id}！歷史盤口變化已全數自動填入下方表格。")
+                            st.rerun()
+                        else:
+                            st.error("❌ 抓取失敗，請確認賽事 ID 是否正確，或該場賽事尚未開盤。")
+                else:
+                    st.warning("請先輸入賽事 ID。")
         
         # --- 頂部修改與覆蓋控制區塊 ---
         if st.session_state.editing_bet_id:
@@ -1189,6 +1453,20 @@ def main():
                 if pd.isna(val) or val == "": return default
                 return int(float(val))
 
+        # --- 自動抓取即場數據與盤口按鈕 ---
+            with st.container(border=True):
+                st.markdown("##### ⚡ 一鍵同步即場賽況與走地盤口")
+                col_in_id, col_in_btn = st.columns([2, 1])
+                inplay_match_id = col_in_id.text_input("輸入賽事 ID 進行同步 (例如: 112684)", key="api_inplay_id")
+                if col_in_btn.button("🔄 自動同步即時比分與走地盤賠率", use_container_width=True):
+                    if inplay_match_id:
+                        with st.spinner('正在同步最新即場數據與賠率...'):
+                            if parse_and_fill_inplay(inplay_match_id):
+                                st.success("✅ 即場數據與走地盤口同步成功！已更新下方火力分析。")
+                                st.rerun()
+                            else:
+                                st.error("❌ 同步失敗。請確認 ID 或是檢查該賽事是否提供即場盤口。")
+            
             st.markdown("##### 1. 實時數據輸入與自動效率計算")
             minute = st.number_input("比賽進行時間 (分鐘)", min_value=0, max_value=120, value=get_val(row, 'InPlay_Minute', 45, 'edit_inplay_minute'))
             
@@ -1258,7 +1536,7 @@ def main():
                 st.rerun()
 
             st.divider()
-            st.markdown("##### 2. 即場盤口與賠率計算 (手動/自動抽水)")
+            st.markdown("##### 2. 即場盤口與賠率走勢紀錄 (JSON結構儲存)")
             render_odds_section(st.session_state.inplay_odds_history, "inplay")
 
             if st.button("🚀 結合火力與剩餘時間計算 EV 智能推薦", type="primary", use_container_width=True):
@@ -1470,6 +1748,10 @@ def main():
                         
                     with st.form(f"settle_form_{row['ID']}"):
                         st.markdown("##### ⚽ 全場賽果輸入 (入球與角球)")
+                        col_auto = st.columns(1)[0]
+                        if col_auto.form_submit_button("⚡ 一鍵自動獲取完場比分與角球 (需輸入賽事ID)"):
+                            st.info("請切換至即場賽事分頁使用自動同步，再回來點擊確認結算。")
+                            
                         col1, col2 = st.columns(2)
                         h_g = col1.number_input("全場主隊入球數", min_value=0, value=int(row.get('Home_Goal', 0)) if pd.notna(row.get('Home_Goal')) else 0, key=f"hg_{row['ID']}")
                         a_g = col2.number_input("全場客隊入球數", min_value=0, value=int(row.get('Away_Goal', 0)) if pd.notna(row.get('Away_Goal')) else 0, key=f"ag_{row['ID']}")
