@@ -208,7 +208,6 @@ def extract_odds_history(odds_data):
             
     def parse_odds_val(val):
         try:
-            # 清洗 1.91↑, 1.85↓ 等帶有特殊符號的字串
             clean_val = re.sub(r'[^\d\.]', '', str(val))
             return float(clean_val)
         except:
@@ -220,7 +219,6 @@ def extract_odds_history(odds_data):
                 return parse_odds_val(item[k])
         return default
 
-    # 對應 JSON 中可能出現的代號名稱
     mapping = {
         "讓球": ["letting", "hdc", "ah", "handicap", "讓球"],
         "入球大小": ["ou", "hil", "overunder", "入球大細", "入球大小"],
@@ -255,7 +253,6 @@ def extract_odds_history(odds_data):
                 target_data = [target_data]
                 
         if isinstance(target_data, list):
-            # 若走勢變化過多（超過12筆），精簡採樣避免UI過長，但保留最新趨勢
             if len(target_data) > 12:
                 step = len(target_data) // 10
                 target_data = [target_data[0]] + target_data[1:-1:step] + [target_data[-1]]
@@ -281,31 +278,6 @@ def extract_odds_history(odds_data):
                     row_id += 1
                     
     return new_history
-
-def parse_and_fill_pre_match(match_id):
-    """將抓取到的 API 數據填入 Session State (賽前)"""
-    fixtures_data = get_match_fixtures(match_id)
-    odds_data = get_match_odds(match_id)
-    
-    success = False
-    if fixtures_data:
-        h_name = fixtures_data.get('homeName', fixtures_data.get('home', ''))
-        a_name = fixtures_data.get('awayName', fixtures_data.get('away', ''))
-        l_name = fixtures_data.get('leagueName', '')
-        
-        if h_name: st.session_state.edit_h_team = h_name
-        if a_name: st.session_state.edit_a_team = a_name
-        if l_name: st.session_state.edit_t_name = l_name
-        if h_name or a_name:
-            success = True
-        
-    if odds_data:
-        new_history = extract_odds_history(odds_data)
-        if new_history:
-            st.session_state.odds_history = new_history
-            success = True
-
-    return success
 
 def parse_and_fill_inplay(match_id):
     """將抓取到的 API 數據填入 Session State (即場與賽果)"""
@@ -884,119 +856,138 @@ def get_last_odds_state(history, target_type, default_line):
         "margin": 1.085
     }
 
-def parse_raw_odds_text(text):
-    if not text or not text.strip(): return []
+def parse_single_type_text(text, bet_type):
+    """強大精準解析單一盤口類型的文字 (讓球、入球大小、角球大小)"""
+    if not text or not text.strip():
+        return []
     
-    current_type = "讓球"
-    if "大小" in text and "角球" not in text: current_type = "入球大小"
-    elif "角球" in text: current_type = "角球大小"
+    # 1. 預處理：11:411.99 -> 11:41 1.99
+    t_clean = re.sub(r'(\d{1,2}:\d{2})(\d+\.\d+)', r'\1 \2', text)
+    # 2. 移除日期時間：如 29-09 11:41, 01-10 07:00, 2026-09-29 11:41 等
+    t_clean = re.sub(r'\d{1,4}[-/.]\d{1,2}(?:[-/.]\d{1,4})?\s*\d{1,2}:\d{2}', ' ', t_clean)
     
-    # 清理時間字串以防黏在一起 (例如 11:411.99 -> 11:41 1.99)
-    text_clean = re.sub(r'(\d{2}:\d{2})(\d+\.\d+)', r'\1 \2', text)
-    # 移除日期時間 29-09 11:41 格式
-    text_clean = re.sub(r'\d{2}-\d{2}\s*\d{2}:\d{2}', ' ', text_clean)
-    
-    # 找出所有包含中括號的盤口線
-    lines_matches = re.findall(r'\[(.*?)\]', text_clean)
-    
-    if lines_matches:
-        text_no_lines = re.sub(r'\[.*?\]', ' ', text_clean)
-    else:
-        # 若沒有中括號，但有 '球' 字 (例如 2.5/3球)
-        lines_matches = re.findall(r'([+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?)\s*球', text_clean)
-        text_no_lines = re.sub(r'[+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?\s*球', ' ', text_clean)
+    parsed_items = []
+    last_line_val = 0.0
+    if bet_type == "入球大小":
+        last_line_val = 2.5
+    elif bet_type == "角球大小":
+        last_line_val = 9.5
         
-    # 取出所有的賠率 (通常為 1.xx ~ 9.xx)
-    odds_matches = re.findall(r'\d+\.\d+', text_no_lines)
-    
-    def parse_line_str(l_str):
-        l_str = str(l_str).replace('球', '').replace('+', '').strip()
-        if '/' in l_str:
+    def parse_line_val(s):
+        s = str(s).replace('球', '').replace('+', '').replace('[', '').replace(']', '').strip()
+        if '/' in s:
             try:
-                parts = l_str.split('/')
-                return (float(parts[0]) + float(parts[1])) / 2
-            except: return 0.0
-        try: return float(l_str)
-        except: return 0.0
+                parts = s.split('/')
+                return (float(parts[0]) + float(parts[1])) / 2.0
+            except:
+                return 0.0
+        try:
+            return float(s)
+        except:
+            return 0.0
 
-    parsed_data = []
+    lines_raw = [l.strip() for l in t_clean.split('\n') if l.strip()]
     
-    # 如果正則匹配到成對的賠率
-    if len(odds_matches) >= 2 and len(odds_matches) % 2 == 0:
-        for i in range(0, len(odds_matches), 2):
-            up = float(odds_matches[i])
-            lw = float(odds_matches[i+1])
-            
-            l_val = 0.0
-            line_idx = i // 2
-            if line_idx < len(lines_matches):
-                l_val = parse_line_str(lines_matches[line_idx])
-            elif len(lines_matches) > 0:
-                l_val = parse_line_str(lines_matches[-1]) 
+    for line_str in lines_raw:
+        # 檢查是否有盤口標示 [0/+0.5] 或 2.5/3球 等
+        found_brackets = re.findall(r'\[(.*?)\]', line_str)
+        if found_brackets:
+            last_line_val = parse_line_val(found_brackets[0])
+        else:
+            found_goals = re.findall(r'([+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?)\s*球', line_str)
+            if found_goals:
+                last_line_val = parse_line_val(found_goals[0])
                 
-            parsed_data.append({
-                "id": line_idx,
-                "type": current_type,
-                "line": l_val,
-                "upper": up,
-                "lower": lw,
-                "unlock": True,
-                "margin": round((1/up) + (1/lw), 3)
-            })
-        return parsed_data
-    
-    # 如果沒有中括號，但有 Tab (從 Excel 複製的整齊表格)
-    if '\t' in text:
-        for idx, line in enumerate(text.strip().split('\n')):
-            parts = line.split('\t')
-            nums = re.findall(r'-?\d+\.?\d*', line)
-            if len(nums) >= 3:
-                try:
-                    lw = float(nums[-1])
-                    up = float(nums[-2])
-                    l_val = float(nums[-3]) if len(nums) >= 3 else 0.0
-                    parsed_data.append({
-                        "id": idx, "type": current_type, "line": l_val, 
-                        "upper": up, "lower": lw, "unlock": True, "margin": round((1/up)+(1/lw), 3)
-                    })
-                except: pass
-        return parsed_data
+        # 移除非賠率的盤口字串以精準提取賠率
+        clean_for_odds = re.sub(r'\[.*?\]', ' ', line_str)
+        clean_for_odds = re.sub(r'[+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?\s*球', ' ', clean_for_odds)
         
-    return []
+        odds_found = re.findall(r'\d+\.\d+', clean_for_odds)
+        if len(odds_found) >= 2:
+            for i in range(0, len(odds_found) - 1, 2):
+                try:
+                    up = float(odds_found[i])
+                    lw = float(odds_found[i+1])
+                    m = round((1/up) + (1/lw), 3) if (up > 0 and lw > 0) else 1.085
+                    parsed_items.append({
+                        "type": bet_type,
+                        "line": last_line_val,
+                        "upper": up,
+                        "lower": lw,
+                        "unlock": True,
+                        "margin": m
+                    })
+                except:
+                    pass
+                    
+    # 備用全文字掃描 (若逐行未解析出數據)
+    if not parsed_items:
+        all_brackets = re.findall(r'\[(.*?)\]', t_clean)
+        t_no_brackets = re.sub(r'\[.*?\]', ' ', t_clean)
+        all_odds = re.findall(r'\d+\.\d+', t_no_brackets)
+        
+        if len(all_odds) >= 2:
+            for i in range(0, len(all_odds) - 1, 2):
+                up = float(all_odds[i])
+                lw = float(all_odds[i+1])
+                idx = i // 2
+                if idx < len(all_brackets):
+                    l_v = parse_line_val(all_brackets[idx])
+                else:
+                    l_v = last_line_val
+                parsed_items.append({
+                    "type": bet_type,
+                    "line": l_v,
+                    "upper": up,
+                    "lower": lw,
+                    "unlock": True,
+                    "margin": round((1/up) + (1/lw), 3) if (up > 0 and lw > 0) else 1.085
+                })
+
+    return parsed_items
 
 def render_odds_section(odds_history_state, prefix="pre"):
-    st.markdown("💡 **智能貼上與表格編輯：** 您可將原始賠率文字貼在下方，系統會自動解析排版；或直接在表格內貼上 Excel 數據。")
+    st.markdown("💡 **智能解析與動態同步區：** 請分別貼上各盤口數據。**修改或刪除文字時，走勢表會自動更新並妥善紀錄。**")
     
-    # 1. 智能貼上解析區
-    paste_text = st.text_area("📋 智能解析區 (請貼上如 HKJC 網站的盤口文字，或從 Excel 複製的數據)", height=100, key=f"{prefix}_paste_area")
+    col_hd, col_ou, col_cr = st.columns(3)
+    with col_hd:
+        raw_hd = st.text_area("⚽ 讓球 貼上區", height=130, key=f"{prefix}_paste_hd", placeholder="貼上讓球數據\n例如：\n29-09 11:41 1.99\n[0/+0.5] 1.78")
+    with col_ou:
+        raw_ou = st.text_area("⚽ 入球大小 貼上區", height=130, key=f"{prefix}_paste_ou", placeholder="貼上入球大小數據\n例如：\n29-09 11:41 1.85\n[2.5] 1.95")
+    with col_cr:
+        raw_cr = st.text_area("⚽ 角球大小 貼上區", height=130, key=f"{prefix}_paste_cr", placeholder="貼角球大小數據\n例如：\n29-09 11:41 1.90\n[9.5] 1.90")
+        
+    parsed_hd = parse_single_type_text(raw_hd, "讓球")
+    parsed_ou = parse_single_type_text(raw_ou, "入球大小")
+    parsed_cr = parse_single_type_text(raw_cr, "角球大小")
     
-    col_btn, _ = st.columns([1, 4])
-    if col_btn.button("🪄 自動解析並匯入表格", key=f"{prefix}_parse_btn", use_container_width=True):
-        if paste_text:
-            parsed = parse_raw_odds_text(paste_text)
-            if parsed:
-                odds_history_state.clear()
-                odds_history_state.extend(parsed)
-                st.success(f"✅ 成功解析 {len(parsed)} 筆盤口數據並排版至下方表格！")
-                st.rerun()
-            else:
-                st.error("❌ 無法解析，請確認文字內包含賠率 (如 1.90) 及盤口線 (如 [0/+0.5])。")
-
-    # 2. 表格編輯區
-    if not odds_history_state:
+    parsed_all = parsed_hd + parsed_ou + parsed_cr
+    
+    # 動態更新機制：若貼上區有資料或變更，自動重構表格數據
+    if raw_hd.strip() or raw_ou.strip() or raw_cr.strip():
+        odds_history_state.clear()
+        if parsed_all:
+            for idx, item in enumerate(parsed_all):
+                item["id"] = idx
+                odds_history_state.append(item)
+        else:
+            odds_history_state.append({
+                "id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": True, "margin": 1.085
+            })
+    elif not odds_history_state:
         odds_history_state.append({
             "id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": True, "margin": 1.085
         })
         
     df = pd.DataFrame(odds_history_state)
-    
     for col, default in [('type', '讓球'), ('line', 0.0), ('upper', 1.90), ('lower', 1.90)]:
-        if col not in df.columns: df[col] = default
+        if col not in df.columns:
+            df[col] = default
             
     df_display = df[['type', 'line', 'upper', 'lower']].copy()
     df_display.columns = ['盤口類型', '盤口線', '主隊/大盤賠率', '客隊/小盤賠率']
     
-    st.markdown("##### 📝 盤口與賠率走勢表 (可直接點擊修改或於儲存格使用 `Ctrl+V` 貼上)")
+    st.markdown("##### 📝 盤口與賠率走勢表 (動態記錄中，亦可直接於表格修改/增減資料)")
     edited_df = st.data_editor(
         df_display,
         num_rows="dynamic",
@@ -1010,7 +1001,7 @@ def render_odds_section(odds_history_state, prefix="pre"):
         key=f"{prefix}_odds_editor"
     )
     
-    # 同步 edited_df 回 state
+    # 同步表格內直接修改的數據回 odds_history_state
     new_history = []
     for i, row in edited_df.iterrows():
         try:
@@ -1110,24 +1101,6 @@ def main():
 
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
-
-        # --- 自動抓取賽前數據按鈕 ---
-        with st.container(border=True):
-            st.markdown("##### ⚡ 一鍵智能抓取賽前數據與盤口走勢")
-            col_id, col_btn = st.columns([2, 1])
-            target_match_id = col_id.text_input("請輸入 Tipsme 賽事 ID (例如: 112684)", key="api_match_id")
-            if col_btn.button("📥 自動獲取球隊與全盤口走勢", use_container_width=True):
-                if target_match_id:
-                    with st.spinner('正在從 Tipsme 抓取盤口歷史走勢與數據...'):
-                        success = parse_and_fill_pre_match(target_match_id)
-                        if success:
-                            st.session_state.editing_bet_id = f"API_{target_match_id}" 
-                            st.success(f"✅ 成功載入賽事 {target_match_id}！歷史盤口變化已全數自動填入下方表格。")
-                            st.rerun()
-                        else:
-                            st.error("❌ 抓取失敗，請確認賽事 ID 是否正確，或該場賽事尚未開盤。")
-                else:
-                    st.warning("請先輸入賽事 ID。")
         
         # --- 頂部修改與覆蓋控制區塊 ---
         if st.session_state.editing_bet_id:
