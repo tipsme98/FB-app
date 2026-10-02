@@ -737,7 +737,7 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
             usr_cap_summary = {col: None for col in usr_cap_exp.columns}
             if 'ID' in usr_cap_summary: usr_cap_summary['ID'] = "TOTAL (總計)"
             if 'Amount' in usr_cap_summary: usr_cap_summary['Amount'] = round(tot_amt_usr, 2)
-            if 'Note' in usr_cap_summary: usr_cap_summary['Note'] = tot_label_usr.strip(" ()")
+            if 'Note' in usr_cap_summary: usr_cap_summary['Note'] = tot_label_sys.strip(" ()")
             usr_cap_exp = pd.concat([usr_cap_exp, pd.DataFrame([usr_cap_summary])], ignore_index=True)
             
             st.download_button("📥 下載用家資金報表 (CSV)", usr_cap_exp.to_csv(index=False).encode('utf-8-sig'), "user_capital_flow.csv", "text/csv", key="btn_down_usr_cap_csv")
@@ -859,7 +859,7 @@ def get_last_odds_state(history, target_type, default_line):
     }
 
 def parse_single_type_text(text, bet_type):
-    """強大精準解析單一盤口類型的文字，智能提取跨行的日期時間、盤口線與賠率（支援整數與小數賠率）"""
+    """強大精準解析單一盤口類型的文字，智能提取跨行的日期時間、盤口線與賠率（支援整數與小數賠率，並自動過濾連續重複數值）"""
     if not text or not text.strip():
         return []
     
@@ -903,11 +903,14 @@ def parse_single_type_text(text, bet_type):
                 current_line = parse_line_val(found_goals[0])
                 line_str = re.sub(r'[+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?\s*球', ' ', line_str)
 
-        # 3. 提取所有數字（同時支援小數與整數，例如 2、3 或 1.90）作為賠率，加入緩衝區
+        # 3. 提取所有數字（同時支援小數與整數），並自動過濾連續重複的賠率數值
         numbers = re.findall(r'\d+(?:\.\d+)?', line_str)
         for num_str in numbers:
             try:
-                odds_buffer.append(float(num_str))
+                val = float(num_str)
+                # 若當前數值與緩衝區最後一個數值不同，才放入緩衝區（防止複製貼上產生的連續重複賠率）
+                if not odds_buffer or odds_buffer[-1] != val:
+                    odds_buffer.append(val)
             except:
                 pass
             
@@ -971,6 +974,18 @@ def render_odds_section(odds_history_state, prefix="pre"):
     df_display.columns = ['🗑️刪除', '📅日期及時間', '盤口類型', '盤口線', '主隊/大盤賠率', '客隊/小盤賠率']
     
     st.markdown("##### 📝 盤口與賠率走勢表 (可勾選刪除、修改日期時間、盤口或賠率)")
+    
+    sort_col1, sort_col2 = st.columns(2)
+    sort_by_col = sort_col1.selectbox("🔀 選擇排序欄位", ["預設順序", "📅日期及時間", "盤口類型", "盤口線", "主隊/大盤賠率", "客隊/小盤賠率"], key=f"{prefix}_sort_col")
+    sort_order = sort_col2.selectbox("📊 排序方式", ["升序 (正序 / 由小到大 / 近到遠)", "降序 (倒序 / 由大到小 / 遠到近)"], key=f"{prefix}_sort_order")
+    
+    if sort_by_col != "預設順序":
+        ascending_bool = True if "升序" in sort_order else False
+        try:
+            df_display = df_display.sort_values(by=sort_by_col, ascending=ascending_bool, na_position='last')
+        except:
+            pass
+
     edited_df = st.data_editor(
         df_display,
         num_rows="dynamic",
@@ -1094,7 +1109,7 @@ def main():
         
         # --- 頂部修改與覆蓋控制區塊 ---
         if st.session_state.editing_bet_id:
-            st.info(f"🛠️ **【修改/覆蓋模式】** 目前正在編輯未結算注單：`{st.session_state.editing_bet_id}`。修改後提交將**直接覆蓋**資料庫中的原有數據。")
+            st.info(f"🛠️️ **【修改/覆蓋模式】** 目前正在編輯未結算注單：`{st.session_state.editing_bet_id}`。修改後提交將**直接覆蓋**資料庫中的原有數據。")
             if st.button("❌ 取消修改 (恢復為新建注單)", key="cancel_edit_pre"):
                 clear_edit_mode()
                 st.rerun()
@@ -1454,7 +1469,7 @@ def main():
                 st.markdown(f"> ⚡ **主隊進攻火力**: `{h_fire:.1f}%` ({h_sot+h_soff}射門 / {h_da}危險進攻)")
                 
             with c2:
-                st.markdown("##### ✈️ 客隊實時數據")
+                st.markdown("##### ✈️️ 客隊實時數據")
                 a_g = st.number_input("客隊入球", min_value=0, value=get_val(row, 'Away_Goal', 0, 'edit_a_g'))
                 a_c = st.number_input("客隊角球", min_value=0, value=get_val(row, 'Away_Corner', 0, 'edit_a_c'))
                 a_da = st.number_input("客隊危險進攻 (DA)", min_value=0, value=get_val(row, 'Away_DA', 0, 'edit_a_da'))
@@ -1697,7 +1712,7 @@ def main():
                     st.warning("⚠️ 目前該場賽事並無明顯具備 EV 價值的即場盤口推薦。")
 
     with t_settle:
-        st.subheader("⚖️️ 賽果結算與資料庫維護")
+        st.subheader("⚖ 賽果結算與資料庫維護")
         display_cumulative_metrics(st.session_state.df_db)
         open_bets = st.session_state.df_db[st.session_state.df_db['Status'] == 'Open']
         if not open_bets.empty:
@@ -1795,3 +1810,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
