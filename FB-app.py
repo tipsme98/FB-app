@@ -272,7 +272,7 @@ def extract_odds_history(odds_data):
                 
                 if upper != 1.90 or lower != 1.90 or line != 0.0: 
                     new_history.append({
-                        "id": row_id, "type": bet_type_cn, "line": line,
+                        "id": row_id, "type": bet_type_cn, "record_time": "", "line": line,
                         "upper": upper, "lower": lower, "unlock": True, "margin": 1.085
                     })
                     row_id += 1
@@ -841,6 +841,7 @@ def get_last_odds_state(history, target_type, default_line):
         if row['type'] == target_type:
             return {
                 "type": target_type,
+                "record_time": row.get('record_time', ''),
                 "line": float(row.get('line', default_line)),
                 "upper": float(row.get('upper', 1.90)),
                 "lower": float(row.get('lower', 1.90)),
@@ -849,6 +850,7 @@ def get_last_odds_state(history, target_type, default_line):
             }
     return {
         "type": target_type,
+        "record_time": "",
         "line": default_line,
         "upper": 1.90,
         "lower": 1.90,
@@ -857,22 +859,16 @@ def get_last_odds_state(history, target_type, default_line):
     }
 
 def parse_single_type_text(text, bet_type):
-    """強大精準解析單一盤口類型的文字 (讓球、入球大小、角球大小)"""
+    """強大精準解析單一盤口類型的文字，智能提取日期及時間、盤口線與賠率"""
     if not text or not text.strip():
         return []
     
-    # 1. 預處理：11:411.99 -> 11:41 1.99
-    t_clean = re.sub(r'(\d{1,2}:\d{2})(\d+\.\d+)', r'\1 \2', text)
-    # 2. 移除日期時間：如 29-09 11:41, 01-10 07:00, 2026-09-29 11:41 等
-    t_clean = re.sub(r'\d{1,4}[-/.]\d{1,2}(?:[-/.]\d{1,4})?\s*\d{1,2}:\d{2}', ' ', t_clean)
-    
+    lines_raw = [l.strip() for l in text.split('\n') if l.strip()]
     parsed_items = []
-    last_line_val = 0.0
-    if bet_type == "入球大小":
-        last_line_val = 2.5
-    elif bet_type == "角球大小":
-        last_line_val = 9.5
-        
+    
+    last_line_val = 2.5 if bet_type == "入球大小" else (9.5 if bet_type == "角球大小" else 0.0)
+    last_datetime = ""
+    
     def parse_line_val(s):
         s = str(s).replace('球', '').replace('+', '').replace('[', '').replace(']', '').strip()
         if '/' in s:
@@ -886,10 +882,13 @@ def parse_single_type_text(text, bet_type):
         except:
             return 0.0
 
-    lines_raw = [l.strip() for l in t_clean.split('\n') if l.strip()]
-    
     for line_str in lines_raw:
-        # 檢查是否有盤口標示 [0/+0.5] 或 2.5/3球 等
+        # 1. 提取日期及時間 (例如 29-09 11:41 或 2026-09-29 11:41 等格式)
+        dt_match = re.search(r'(\d{1,4}[-/.]\d{1,2}(?:[-/.]\d{1,4})?\s*\d{1,2}:\d{2})', line_str)
+        if dt_match:
+            last_datetime = dt_match.group(1)
+            
+        # 2. 檢查是否有中括號盤口標示
         found_brackets = re.findall(r'\[(.*?)\]', line_str)
         if found_brackets:
             last_line_val = parse_line_val(found_brackets[0])
@@ -898,19 +897,31 @@ def parse_single_type_text(text, bet_type):
             if found_goals:
                 last_line_val = parse_line_val(found_goals[0])
                 
-        # 移除非賠率的盤口字串以精準提取賠率
-        clean_for_odds = re.sub(r'\[.*?\]', ' ', line_str)
+        # 3. 清除日期時間與括號以精確提取賠率
+        clean_for_odds = re.sub(r'\d{1,4}[-/.]\d{1,2}(?:[-/.]\d{1,4})?\s*\d{1,2}:\d{2}', ' ', line_str)
+        clean_for_odds = re.sub(r'\[.*?\]', ' ', clean_for_odds)
         clean_for_odds = re.sub(r'[+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?\s*球', ' ', clean_for_odds)
         
         odds_found = re.findall(r'\d+\.\d+', clean_for_odds)
         if len(odds_found) >= 2:
-            for i in range(0, len(odds_found) - 1, 2):
+            odds_pool = odds_found
+            if not found_brackets and not found_goals and len(odds_found) >= 3:
                 try:
-                    up = float(odds_found[i])
-                    lw = float(odds_found[i+1])
+                    pot_line = float(odds_found[0])
+                    if pot_line < 20 and pot_line not in [1.01, 1.02, 1.03, 1.04, 1.05, 1.06, 1.07, 1.08, 1.09]:
+                        last_line_val = pot_line
+                        odds_pool = odds_found[1:]
+                :
+                    pass
+            
+            for i in range(0, len(odds_pool) - 1, 2):
+                try:
+                    up = float(odds_pool[i])
+                    lw = float(odds_pool[i+1])
                     m = round((1/up) + (1/lw), 3) if (up > 0 and lw > 0) else 1.085
                     parsed_items.append({
                         "type": bet_type,
+                        "record_time": last_datetime,
                         "line": last_line_val,
                         "upper": up,
                         "lower": lw,
@@ -919,43 +930,19 @@ def parse_single_type_text(text, bet_type):
                     })
                 except:
                     pass
-                    
-    # 備用全文字掃描 (若逐行未解析出數據)
-    if not parsed_items:
-        all_brackets = re.findall(r'\[(.*?)\]', t_clean)
-        t_no_brackets = re.sub(r'\[.*?\]', ' ', t_clean)
-        all_odds = re.findall(r'\d+\.\d+', t_no_brackets)
-        
-        if len(all_odds) >= 2:
-            for i in range(0, len(all_odds) - 1, 2):
-                up = float(all_odds[i])
-                lw = float(all_odds[i+1])
-                idx = i // 2
-                if idx < len(all_brackets):
-                    l_v = parse_line_val(all_brackets[idx])
-                else:
-                    l_v = last_line_val
-                parsed_items.append({
-                    "type": bet_type,
-                    "line": l_v,
-                    "upper": up,
-                    "lower": lw,
-                    "unlock": True,
-                    "margin": round((1/up) + (1/lw), 3) if (up > 0 and lw > 0) else 1.085
-                })
 
     return parsed_items
 
 def render_odds_section(odds_history_state, prefix="pre"):
-    st.markdown("💡 **智能解析與動態同步區：** 請分別貼上各盤口數據。**修改或刪除文字時，走勢表會自動更新並妥善紀錄。**")
+    st.markdown("💡 **智能解析與動態同步區：** 請分別貼上各盤口數據（包含日期及時間）。系統會自動智能解析，確保與相應的盤口及賠率保持正確的位置。您亦可直接於下方表格勾選刪除或修改資料。")
     
     col_hd, col_ou, col_cr = st.columns(3)
     with col_hd:
-        raw_hd = st.text_area("⚽ 讓球 貼上區", height=130, key=f"{prefix}_paste_hd", placeholder="貼上讓球數據\n例如：\n29-09 11:41 1.99\n[0/+0.5] 1.78")
+        raw_hd = st.text_area("⚽ 讓球 貼上區", height=130, key=f"{prefix}_paste_hd", placeholder="例如:\n29-09 11:41 [0/+0.5] 1.99 1.78")
     with col_ou:
-        raw_ou = st.text_area("⚽ 入球大小 貼上區", height=130, key=f"{prefix}_paste_ou", placeholder="貼上入球大小數據\n例如：\n29-09 11:41 1.85\n[2.5] 1.95")
+        raw_ou = st.text_area("⚽ 入球大小 貼上區", height=130, key=f"{prefix}_paste_ou", placeholder="例如:\n29-09 11:41 [2.5] 1.85 1.95")
     with col_cr:
-        raw_cr = st.text_area("⚽ 角球大小 貼上區", height=130, key=f"{prefix}_paste_cr", placeholder="貼角球大小數據\n例如：\n29-09 11:41 1.90\n[9.5] 1.90")
+        raw_cr = st.text_area("⚽ 角球大小 貼上區", height=130, key=f"{prefix}_paste_cr", placeholder="例如:\n29-09 11:41 [9.5] 1.90 1.90")
         
     parsed_hd = parse_single_type_text(raw_hd, "讓球")
     parsed_ou = parse_single_type_text(raw_ou, "入球大小")
@@ -963,7 +950,6 @@ def render_odds_section(odds_history_state, prefix="pre"):
     
     parsed_all = parsed_hd + parsed_ou + parsed_cr
     
-    # 動態更新機制：若貼上區有資料或變更，自動重構表格數據
     if raw_hd.strip() or raw_ou.strip() or raw_cr.strip():
         odds_history_state.clear()
         if parsed_all:
@@ -972,26 +958,30 @@ def render_odds_section(odds_history_state, prefix="pre"):
                 odds_history_state.append(item)
         else:
             odds_history_state.append({
-                "id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": True, "margin": 1.085
+                "id": 0, "type": "讓球", "record_time": "", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": True, "margin": 1.085
             })
     elif not odds_history_state:
         odds_history_state.append({
-            "id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": True, "margin": 1.085
+            "id": 0, "type": "讓球", "record_time": "", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": True, "margin": 1.085
         })
         
     df = pd.DataFrame(odds_history_state)
-    for col, default in [('type', '讓球'), ('line', 0.0), ('upper', 1.90), ('lower', 1.90)]:
+    for col, default in [('type', '讓球'), ('record_time', ''), ('line', 0.0), ('upper', 1.90), ('lower', 1.90)]:
         if col not in df.columns:
             df[col] = default
             
-    df_display = df[['type', 'line', 'upper', 'lower']].copy()
-    df_display.columns = ['盤口類型', '盤口線', '主隊/大盤賠率', '客隊/小盤賠率']
+    df['刪除'] = False
+            
+    df_display = df[['刪除', 'record_time', 'type', 'line', 'upper', 'lower']].copy()
+    df_display.columns = ['🗑️刪除', '📅日期及時間', '盤口類型', '盤口線', '主隊/大盤賠率', '客隊/小盤賠率']
     
-    st.markdown("##### 📝 盤口與賠率走勢表 (動態記錄中，亦可直接於表格修改/增減資料)")
+    st.markdown("##### 📝 盤口與賠率走勢表 (可勾選刪除、修改日期時間、盤口或賠率)")
     edited_df = st.data_editor(
         df_display,
         num_rows="dynamic",
         column_config={
+            "🗑️️刪除": st.column_config.CheckboxColumn("刪除", default=False),
+            "📅日期及時間": st.column_config.TextColumn("📅日期及時間", required=False),
             "盤口類型": st.column_config.SelectboxColumn("盤口類型", options=["讓球", "入球大小", "角球大小"], required=True),
             "盤口線": st.column_config.NumberColumn("盤口線", format="%.2f", required=True),
             "主隊/大盤賠率": st.column_config.NumberColumn("主隊/大盤賠率", min_value=1.01, format="%.2f", required=True),
@@ -1001,9 +991,12 @@ def render_odds_section(odds_history_state, prefix="pre"):
         key=f"{prefix}_odds_editor"
     )
     
-    # 同步表格內直接修改的數據回 odds_history_state
     new_history = []
+    new_idx = 0
     for i, row in edited_df.iterrows():
+        if row.get("🗑️刪除", False):
+            continue
+            
         try:
             up = float(row["主隊/大盤賠率"]) if pd.notna(row["主隊/大盤賠率"]) else 1.90
             lw = float(row["客隊/小盤賠率"]) if pd.notna(row["客隊/小盤賠率"]) else 1.90
@@ -1012,14 +1005,16 @@ def render_odds_section(odds_history_state, prefix="pre"):
             up, lw, margin = 1.90, 1.90, 1.085
             
         new_history.append({
-            "id": i,
+            "id": new_idx,
             "type": str(row["盤口類型"]) if pd.notna(row["盤口類型"]) else "讓球",
+            "record_time": str(row["📅日期及時間"]) if pd.notna(row["📅日期及時間"]) else "",
             "line": float(row["盤口線"]) if pd.notna(row["盤口線"]) else 0.0,
             "upper": up,
             "lower": lw,
             "unlock": True,
             "margin": margin
         })
+        new_idx += 1
         
     odds_history_state.clear()
     odds_history_state.extend(new_history)
@@ -1192,7 +1187,7 @@ def main():
 
         st.markdown("##### 3. 賽前盤口與賠率走勢紀錄 (JSON結構儲存)")
         if 'odds_history' not in st.session_state:
-            st.session_state.odds_history = [{"id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}]
+            st.session_state.odds_history = [{"id": 0, "type": "讓球", "record_time": "", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}]
         render_odds_section(st.session_state.odds_history, "pre")
         
         st.markdown("---")
@@ -1369,7 +1364,7 @@ def main():
                     st.session_state.last_bet_id = new_id
                     save_db(st.session_state.df_db, db_file, db_table)
                     clear_edit_mode()
-                    st.session_state.odds_history = [{"id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}] 
+                    st.session_state.odds_history = [{"id": 0, "type": "讓球", "record_time": "", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}] 
                     st.session_state.show_analysis = False
                     st.rerun()
 
@@ -1406,9 +1401,9 @@ def main():
 
         if 'inplay_odds_history' not in st.session_state:
             st.session_state.inplay_odds_history = [
-                {"id": 0, "type": "讓球", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085},
-                {"id": 1, "type": "入球大小", "line": 2.5, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085},
-                {"id": 2, "type": "角球大小", "line": 9.5, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}
+                {"id": 0, "type": "讓球", "record_time": "", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085},
+                {"id": 1, "type": "入球大小", "record_time": "", "line": 2.5, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085},
+                {"id": 2, "type": "角球大小", "record_time": "", "line": 9.5, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}
             ]
 
         pending_df = st.session_state.df_db[st.session_state.df_db['Status'] == 'Open']
