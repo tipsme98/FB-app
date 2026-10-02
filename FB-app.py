@@ -737,7 +737,7 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
             usr_cap_summary = {col: None for col in usr_cap_exp.columns}
             if 'ID' in usr_cap_summary: usr_cap_summary['ID'] = "TOTAL (總計)"
             if 'Amount' in usr_cap_summary: usr_cap_summary['Amount'] = round(tot_amt_usr, 2)
-            if 'Note' in usr_cap_summary: usr_cap_summary['Note'] = tot_label_sys.strip(" ()")
+            if 'Note' in usr_cap_summary: usr_cap_summary['Note'] = tot_label_usr.strip(" ()")
             usr_cap_exp = pd.concat([usr_cap_exp, pd.DataFrame([usr_cap_summary])], ignore_index=True)
             
             st.download_button("📥 下載用家資金報表 (CSV)", usr_cap_exp.to_csv(index=False).encode('utf-8-sig'), "user_capital_flow.csv", "text/csv", key="btn_down_usr_cap_csv")
@@ -971,19 +971,6 @@ def render_odds_section(odds_history_state, prefix="pre"):
     df_display.columns = ['🗑️刪除', '📅日期及時間', '盤口類型', '盤口線', '主隊/大盤賠率', '客隊/小盤賠率']
     
     st.markdown("##### 📝 盤口與賠率走勢表 (可勾選刪除、修改日期時間、盤口或賠率)")
-    
-    # 新增各欄位排序控制項
-    sort_col1, sort_col2 = st.columns(2)
-    sort_by_col = sort_col1.selectbox("🔀 選擇排序欄位", ["預設順序", "📅日期及時間", "盤口類型", "盤口線", "主隊/大盤賠率", "客隊/小盤賠率"], key=f"{prefix}_sort_col")
-    sort_order = sort_col2.selectbox("📊 排序方式", ["升序 (正序 / 由小到大 / 近到遠)", "降序 (倒序 / 由大到小 / 遠到近)"], key=f"{prefix}_sort_order")
-    
-    if sort_by_col != "預設順序":
-        ascending_bool = True if "升序" in sort_order else False
-        try:
-            df_display = df_display.sort_values(by=sort_by_col, ascending=ascending_bool, na_position='last')
-        except:
-            pass
-
     edited_df = st.data_editor(
         df_display,
         num_rows="dynamic",
@@ -1133,7 +1120,7 @@ def main():
                     st.rerun()
         st.divider()
 
-        if sys_bankroll <= 0: st.warning("⚠️️ 目前系統可用資金不足！無法精確計算建議注碼。請先至側邊欄存入本金。")
+        if sys_bankroll <= 0: st.warning("⚠️ 目前系統可用資金不足！無法精確計算建議注碼。請先至側邊欄存入本金。")
         
         is_editing = bool(st.session_state.editing_bet_id)
         opts_tournaments = ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Tournament_Name'].dropna().unique())))
@@ -1256,7 +1243,7 @@ def main():
                             upgrade_msg = "💡 **智能風控提示**：依據凱利公式，原計算注碼不足 $200。但因該讓球盤 EV (≥0.03) 與勝率 (≥50%) 均達標，系統判定具備高投資價值，建議升級至最低投注額 **$200**。"
                         else:
                             suggested_stake = 0.0
-                            upgrade_msg = "⚠️️ **智能風控提示**：依據凱利公式，原計算注碼不足 $200，且該讓球盤的期望值/勝率未達強制升級標準。系統建議 **放棄** 此次投注 (注碼歸 0)。"
+                            upgrade_msg = "⚠️ **智能風控提示**：依據凱利公式，原計算注碼不足 $200，且該讓球盤的期望值/勝率未達強制升級標準。系統建議 **放棄** 此次投注 (注碼歸 0)。"
                 else:
                     suggested_stake = max(10.0, suggested_stake)
 
@@ -1377,7 +1364,7 @@ def main():
                     st.rerun()
 
     with t_inplay:
-        st.subheader("⏱️️ 即場賽事實時更新與智慧火力分析")
+        st.subheader("⏱️ 即場賽事實時更新與智慧火力分析")
         
         # --- 頂部修改與覆蓋控制區塊 ---
         if st.session_state.editing_bet_id:
@@ -1710,7 +1697,7 @@ def main():
                     st.warning("⚠️ 目前該場賽事並無明顯具備 EV 價值的即場盤口推薦。")
 
     with t_settle:
-        st.subheader("⚖️ 賽果結算與資料庫維護")
+        st.subheader("⚖️️ 賽果結算與資料庫維護")
         display_cumulative_metrics(st.session_state.df_db)
         open_bets = st.session_state.df_db[st.session_state.df_db['Status'] == 'Open']
         if not open_bets.empty:
