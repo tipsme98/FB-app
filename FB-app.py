@@ -569,7 +569,7 @@ def load_bet_to_edit(bet_id):
     st.session_state.edit_h_poss = int(float(row.get('Home_Possession', 50))) if pd.notna(row.get('Home_Possession')) else 50
     
     st.session_state.edit_user_stake = float(row.get('User_Stake', 0.0)) if pd.notna(row.get('User_Stake')) else 0.0
-    st.session_state.edit_bet_type = str(row.get('Bet_Type', '')).replace(" (即场)", "") if pd.notna(row.get('Bet_Type')) else ''
+    st.session_state.edit_bet_type = str(row.get('Bet_Type', '')).replace(" (即場)", "") if pd.notna(row.get('Bet_Type')) else ''
     st.session_state.edit_selection = str(row.get('Selection', 'Home')) if pd.notna(row.get('Selection')) else 'Home'
 
 def clear_edit_mode():
@@ -859,7 +859,7 @@ def get_last_odds_state(history, target_type, default_line):
     }
 
 def parse_single_type_text(text, bet_type):
-    """強大精準解析單一盤口類型的文字，智能提取跨行的日期時間、盤口線與賠率"""
+    """強大精準解析單一盤口類型的文字，智能提取跨行的日期時間、盤口線與賠率（支援整數與小數賠率）"""
     if not text or not text.strip():
         return []
     
@@ -903,12 +903,15 @@ def parse_single_type_text(text, bet_type):
                 current_line = parse_line_val(found_goals[0])
                 line_str = re.sub(r'[+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?\s*球', ' ', line_str)
 
-        # 3. 提取所有小數點數字作為賠率，並加入緩衝區進行跨行配對
-        numbers = re.findall(r'\d+\.\d+', line_str)
+        # 3. 提取所有數字（同時支援小數與整數，例如 2、3 或 1.90）作為賠率，加入緩衝區
+        numbers = re.findall(r'\d+(?:\.\d+)?', line_str)
         for num_str in numbers:
-            odds_buffer.append(float(num_str))
+            try:
+                odds_buffer.append(float(num_str))
+            except:
+                pass
             
-        # 當緩衝區累積滿 2 個賠率數字時，組合成一筆走勢紀錄
+        # 當緩衝區累積滿 2 個賠率數字時，組購成一筆走勢紀錄
         while len(odds_buffer) >= 2:
             up = odds_buffer.pop(0)
             lw = odds_buffer.pop(0)
@@ -926,15 +929,15 @@ def parse_single_type_text(text, bet_type):
     return parsed_items
 
 def render_odds_section(odds_history_state, prefix="pre"):
-    st.markdown("💡 **智能解析與動態同步區：** 請分別貼上各盤口數據（包含跨行的日期及時間、盤口、賠率）。系統會自動智能解析，確保與相應的盤口及賠率保持正確的位置。您亦可直接於下方表格勾選刪除或修改資料。")
+    st.markdown("💡 **智能解析與動態同步區：** 請分別貼上各盤口數據（包含跨行的日期及時間、盤口、整數或小數賠率）。系統會自動智能解析，確保與相應的盤口及賠率保持正確的位置。您亦可直接於下方表格勾選刪除或修改資料。")
     
     col_hd, col_ou, col_cr = st.columns(3)
     with col_hd:
-        raw_hd = st.text_area("⚽ 讓球 貼上區", height=130, key=f"{prefix}_paste_hd", placeholder="例如:\n1.85\n01-10 23:40\n1.88\n[0/+0.5]\n1.88")
+        raw_hd = st.text_area("⚽ 讓球 貼上區", height=130, key=f"{prefix}_paste_hd", placeholder="例如:\n2\n01-10 23:40\n1.88\n[0/+0.5]\n1.88")
     with col_ou:
-        raw_ou = st.text_area("⚽ 入球大小 貼上區", height=130, key=f"{prefix}_paste_ou", placeholder="例如:\n01-10 21:05\n2.85\n[2.5]\n1.36")
+        raw_ou = st.text_area("⚽ 入球大小 貼上區", height=130, key=f"{prefix}_paste_ou", placeholder="例如:\n01-10 21:05\n2.5\n[2.5]\n2")
     with col_cr:
-        raw_cr = st.text_area("⚽ 角球大小 貼上區", height=130, key=f"{prefix}_paste_cr", placeholder="例如:\n30-09 01:36 4.15\n[11.5] 1.17")
+        raw_cr = st.text_area("⚽ 角球大小 貼上區", height=130, key=f"{prefix}_paste_cr", placeholder="例如:\n30-09 01:36 4\n[11.5] 1.17")
         
     parsed_hd = parse_single_type_text(raw_hd, "讓球")
     parsed_ou = parse_single_type_text(raw_ou, "入球大小")
@@ -1024,7 +1027,7 @@ def main():
     if 'last_bet_id' not in st.session_state:
         st.session_state.last_bet_id = None
         
-    st.sidebar.header("⚙️️ 系統設定與資金管理")
+    st.sidebar.header("⚙ 系統設定與資金管理")
     
     db_file = "football_betting_db.csv"
     capital_file = "football_capital_db.csv"
@@ -1084,7 +1087,7 @@ def main():
     if st.sidebar.button("🔍 數據庫即時線上預覽與管理", use_container_width=True):
         preview_db_dialog(st.session_state.df_db, st.session_state.df_cap, db_file, capital_file, db_table, cap_table)
 
-    t_pre, t_inplay, t_settle, t_ai = st.tabs(["📝 賽前建檔與投注", "⏱️️ 即場賽事與預測", "⚖️ 賽果結算與管理", "🤖 全局模型"])
+    t_pre, t_inplay, t_settle, t_ai = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖️ 賽果結算與管理", "🤖 全局模型"])
 
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
@@ -1694,7 +1697,7 @@ def main():
                     st.warning("⚠️ 目前該場賽事並無明顯具備 EV 價值的即場盤口推薦。")
 
     with t_settle:
-        st.subheader("⚖️ 賽果結算與資料庫維護")
+        st.subheader("⚖️️ 賽果結算與資料庫維護")
         display_cumulative_metrics(st.session_state.df_db)
         open_bets = st.session_state.df_db[st.session_state.df_db['Status'] == 'Open']
         if not open_bets.empty:
