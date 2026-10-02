@@ -569,7 +569,7 @@ def load_bet_to_edit(bet_id):
     st.session_state.edit_h_poss = int(float(row.get('Home_Possession', 50))) if pd.notna(row.get('Home_Possession')) else 50
     
     st.session_state.edit_user_stake = float(row.get('User_Stake', 0.0)) if pd.notna(row.get('User_Stake')) else 0.0
-    st.session_state.edit_bet_type = str(row.get('Bet_Type', '')).replace(" (即場)", "") if pd.notna(row.get('Bet_Type')) else ''
+    st.session_state.edit_bet_type = str(row.get('Bet_Type', '')).replace(" (即场)", "") if pd.notna(row.get('Bet_Type')) else ''
     st.session_state.edit_selection = str(row.get('Selection', 'Home')) if pd.notna(row.get('Selection')) else 'Home'
 
 def clear_edit_mode():
@@ -859,15 +859,16 @@ def get_last_odds_state(history, target_type, default_line):
     }
 
 def parse_single_type_text(text, bet_type):
-    """強大精準解析單一盤口類型的文字，智能提取日期及時間、盤口線與賠率"""
+    """強大精準解析單一盤口類型的文字，智能提取跨行的日期時間、盤口線與賠率"""
     if not text or not text.strip():
         return []
     
     lines_raw = [l.strip() for l in text.split('\n') if l.strip()]
     parsed_items = []
     
-    last_line_val = 2.5 if bet_type == "入球大小" else (9.5 if bet_type == "角球大小" else 0.0)
-    last_datetime = ""
+    default_line = 2.5 if bet_type == "入球大小" else (9.5 if bet_type == "角球大小" else 0.0)
+    current_line = default_line
+    current_datetime = ""
     
     def parse_line_val(s):
         s = str(s).replace('球', '').replace('+', '').replace('[', '').replace(']', '').strip()
@@ -882,67 +883,58 @@ def parse_single_type_text(text, bet_type):
         except:
             return 0.0
 
+    odds_buffer = []
+
     for line_str in lines_raw:
-        # 1. 提取日期及時間 (例如 29-09 11:41 或 2026-09-29 11:41 等格式)
+        # 1. 提取日期及時間 (例如 01-10 23:40 或 30-09 01:36 等格式)
         dt_match = re.search(r'(\d{1,4}[-/.]\d{1,2}(?:[-/.]\d{1,4})?\s*\d{1,2}:\d{2})', line_str)
         if dt_match:
-            last_datetime = dt_match.group(1)
+            current_datetime = dt_match.group(1)
+            line_str = line_str.replace(dt_match.group(1), '').strip()
             
-        # 2. 檢查是否有中括號盤口標示
+        # 2. 檢查中括號盤口標示 (例如 [2.5] 或 [0/+0.5])
         found_brackets = re.findall(r'\[(.*?)\]', line_str)
         if found_brackets:
-            last_line_val = parse_line_val(found_brackets[0])
+            current_line = parse_line_val(found_brackets[0])
+            line_str = re.sub(r'\[.*?\]', ' ', line_str)
         else:
             found_goals = re.findall(r'([+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?)\s*球', line_str)
             if found_goals:
-                last_line_val = parse_line_val(found_goals[0])
-                
-        # 3. 清除日期時間與括號以精確提取賠率
-        clean_for_odds = re.sub(r'\d{1,4}[-/.]\d{1,2}(?:[-/.]\d{1,4})?\s*\d{1,2}:\d{2}', ' ', line_str)
-        clean_for_odds = re.sub(r'\[.*?\]', ' ', clean_for_odds)
-        clean_for_odds = re.sub(r'[+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?\s*球', ' ', clean_for_odds)
-        
-        odds_found = re.findall(r'\d+\.\d+', clean_for_odds)
-        if len(odds_found) >= 2:
-            odds_pool = odds_found
-            if not found_brackets and not found_goals and len(odds_found) >= 3:
-                try:
-                    pot_line = float(odds_found[0])
-                    if pot_line < 20 and pot_line not in [1.01, 1.02, 1.03, 1.04, 1.05, 1.06, 1.07, 1.08, 1.09]:
-                        last_line_val = pot_line
-                        odds_pool = odds_found[1:]
-                except:
-                    pass
+                current_line = parse_line_val(found_goals[0])
+                line_str = re.sub(r'[+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?\s*球', ' ', line_str)
+
+        # 3. 提取所有小數點數字作為賠率，並加入緩衝區進行跨行配對
+        numbers = re.findall(r'\d+\.\d+', line_str)
+        for num_str in numbers:
+            odds_buffer.append(float(num_str))
             
-            for i in range(0, len(odds_pool) - 1, 2):
-                try:
-                    up = float(odds_pool[i])
-                    lw = float(odds_pool[i+1])
-                    m = round((1/up) + (1/lw), 3) if (up > 0 and lw > 0) else 1.085
-                    parsed_items.append({
-                        "type": bet_type,
-                        "record_time": last_datetime,
-                        "line": last_line_val,
-                        "upper": up,
-                        "lower": lw,
-                        "unlock": True,
-                        "margin": m
-                    })
-                except:
-                    pass
+        # 當緩衝區累積滿 2 個賠率數字時，組合成一筆走勢紀錄
+        while len(odds_buffer) >= 2:
+            up = odds_buffer.pop(0)
+            lw = odds_buffer.pop(0)
+            m = round((1/up) + (1/lw), 3) if (up > 0 and lw > 0) else 1.085
+            parsed_items.append({
+                "type": bet_type,
+                "record_time": current_datetime,
+                "line": current_line,
+                "upper": up,
+                "lower": lw,
+                "unlock": True,
+                "margin": m
+            })
 
     return parsed_items
 
 def render_odds_section(odds_history_state, prefix="pre"):
-    st.markdown("💡 **智能解析與動態同步區：** 請分別貼上各盤口數據（包含日期及時間）。系統會自動智能解析，確保與相應的盤口及賠率保持正確的位置。您亦可直接於下方表格勾選刪除或修改資料。")
+    st.markdown("💡 **智能解析與動態同步區：** 請分別貼上各盤口數據（包含跨行的日期及時間、盤口、賠率）。系統會自動智能解析，確保與相應的盤口及賠率保持正確的位置。您亦可直接於下方表格勾選刪除或修改資料。")
     
     col_hd, col_ou, col_cr = st.columns(3)
     with col_hd:
-        raw_hd = st.text_area("⚽ 讓球 貼上區", height=130, key=f"{prefix}_paste_hd", placeholder="例如:\n29-09 11:41 [0/+0.5] 1.99 1.78")
+        raw_hd = st.text_area("⚽ 讓球 貼上區", height=130, key=f"{prefix}_paste_hd", placeholder="例如:\n1.85\n01-10 23:40\n1.88\n[0/+0.5]\n1.88")
     with col_ou:
-        raw_ou = st.text_area("⚽ 入球大小 貼上區", height=130, key=f"{prefix}_paste_ou", placeholder="例如:\n29-09 11:41 [2.5] 1.85 1.95")
+        raw_ou = st.text_area("⚽ 入球大小 貼上區", height=130, key=f"{prefix}_paste_ou", placeholder="例如:\n01-10 21:05\n2.85\n[2.5]\n1.36")
     with col_cr:
-        raw_cr = st.text_area("⚽ 角球大小 貼上區", height=130, key=f"{prefix}_paste_cr", placeholder="例如:\n29-09 11:41 [9.5] 1.90 1.90")
+        raw_cr = st.text_area("⚽ 角球大小 貼上區", height=130, key=f"{prefix}_paste_cr", placeholder="例如:\n30-09 01:36 4.15\n[11.5] 1.17")
         
     parsed_hd = parse_single_type_text(raw_hd, "讓球")
     parsed_ou = parse_single_type_text(raw_ou, "入球大小")
@@ -1092,7 +1084,7 @@ def main():
     if st.sidebar.button("🔍 數據庫即時線上預覽與管理", use_container_width=True):
         preview_db_dialog(st.session_state.df_db, st.session_state.df_cap, db_file, capital_file, db_table, cap_table)
 
-    t_pre, t_inplay, t_settle, t_ai = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖️ 賽果結算與管理", "🤖 全局模型"])
+    t_pre, t_inplay, t_settle, t_ai = st.tabs(["📝 賽前建檔與投注", "⏱️️ 即場賽事與預測", "⚖️ 賽果結算與管理", "🤖 全局模型"])
 
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
@@ -1125,7 +1117,7 @@ def main():
                     st.rerun()
         st.divider()
 
-        if sys_bankroll <= 0: st.warning("⚠️️ 目前系統可用資金不足！無法精確計算建議注碼。請先至側邊欄存入本金。")
+        if sys_bankroll <= 0: st.warning("⚠️ 目前系統可用資金不足！無法精確計算建議注碼。請先至側邊欄存入本金。")
         
         is_editing = bool(st.session_state.editing_bet_id)
         opts_tournaments = ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Tournament_Name'].dropna().unique())))
