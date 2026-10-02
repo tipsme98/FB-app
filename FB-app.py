@@ -424,8 +424,8 @@ def display_cumulative_metrics(df):
     
     st.markdown("### 📊 數據庫累計總額看板 (Cumulative Summary)")
     m1, m2, m3 = st.columns(3)
-    m1.metric("系統累積淨盈虧 (System Profit)", f"${sys_profit:,.2f}", delta=f"{sys_profit:,.2f}")
-    m2.metric("用家真實淨盈虧 (User Profit)", f"${user_profit:,.2f}", delta=f"{user_profit:,.2f}")
+    m1.metric("系統累積淨盈虧 (System Profit)", f"${sys_profit:,.2f}", delta=f"${sys_profit:,.2f}")
+    m2.metric("用家真實淨盈虧 (User Profit)", f"${user_profit:,.2f}", delta=f"${user_profit:,.2f}")
     m3.metric("用家派彩總額 (User Payout)", f"${user_payout:,.2f}")
     st.divider()
 
@@ -760,7 +760,7 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
         col1, col2 = st.columns(2)
         
         with col1:
-            if st.button("🗑️️ 刪除選中紀錄", use_container_width=True):
+            if st.button("🗑 刪除選中紀錄", use_container_width=True):
                 if selected_to_delete:
                     ids_to_delete = [x.split(" | ")[0] for x in selected_to_delete]
                     df_to_delete = df_target[df_target['ID'].isin(ids_to_delete)]
@@ -859,22 +859,16 @@ def get_last_odds_state(history, target_type, default_line):
     }
 
 def parse_single_type_text(text, bet_type):
-    """強大精準解析單一盤口類型的文字 (讓球、入球大小、角球大小)，並智慧提取時間日期"""
+    """強大精準解析單一盤口類型的文字 (讓球、入球大小、角球大小)，並智慧提取時間日期與盤口線"""
     if not text or not text.strip():
         return []
     
-    # 1. 預處理：11:411.99 -> 11:41 1.99
-    t_clean = re.sub(r'(\d{1,2}:\d{2})(\d+\.\d+)', r'\1 \2', text)
-    
+    lines_raw = [l.strip() for l in text.split('\n') if l.strip()]
     parsed_items = []
-    last_line_val = 0.0
+    
+    last_line_val = 2.5 if bet_type == "入球大小" else (9.5 if bet_type == "角球大小" else 0.0)
     last_datetime = ""
     
-    if bet_type == "入球大小":
-        last_line_val = 2.5
-    elif bet_type == "角球大小":
-        last_line_val = 9.5
-        
     def parse_line_val(s):
         s = str(s).replace('球', '').replace('+', '').replace('[', '').replace(']', '').strip()
         if '/' in s:
@@ -888,34 +882,36 @@ def parse_single_type_text(text, bet_type):
         except:
             return 0.0
 
-    lines_raw = [l.strip() for l in t_clean.split('\n') if l.strip()]
-    
     for line_str in lines_raw:
-        # 嘗試提取日期時間 (例如: 29-09 11:41, 01-10 07:00, 2026-09-29 11:41)
+        # 1. 嘗試提取日期時間
         dt_match = re.search(r'(\d{1,4}[-/.]\d{1,2}(?:[-/.]\d{1,4})?\s*\d{1,2}:\d{2})', line_str)
         if dt_match:
             last_datetime = dt_match.group(1)
             
-        # 檢查是否有盤口標示 [0/+0.5] 或 2.5/3球 等
+        # 2. 檢查是否有中括号盤口標示
         found_brackets = re.findall(r'\[(.*?)\]', line_str)
         if found_brackets:
             last_line_val = parse_line_val(found_brackets[0])
-        else:
-            found_goals = re.findall(r'([+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?)\s*球', line_str)
-            if found_goals:
-                last_line_val = parse_line_val(found_goals[0])
-                
-        # 移除日期時間和非賠率的盤口字串以精準提取賠率
-        clean_for_odds = re.sub(r'\d{1,4}[-/.]\d{1,2}(?:[-/.]\d{1,4})?\s*\d{1,2}:\d{2}', ' ', line_str)
-        clean_for_odds = re.sub(r'\[.*?\]', ' ', clean_for_odds)
-        clean_for_odds = re.sub(r'[+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?\s*球', ' ', clean_for_odds)
+            
+        # 3. 清除日期時間與括號以精確提取數字
+        clean_str = re.sub(r'\d{1,4}[-/.]\d{1,2}(?:[-/.]\d{1,4})?\s*\d{1,2}:\d{2}', ' ', line_str)
+        clean_str = re.sub(r'\[.*?\]', ' ', clean_str)
         
-        odds_found = re.findall(r'\d+\.\d+', clean_for_odds)
-        if len(odds_found) >= 2:
-            for i in range(0, len(odds_found) - 1, 2):
-                try:
-                    up = float(odds_found[i])
-                    lw = float(odds_found[i+1])
+        numbers = re.findall(r'\d+(?:\.\d+)?', clean_str)
+        
+        if len(numbers) >= 3:
+            # 第一個數值為盤口線（如 8.5, 9.5），後面為賠率
+            try:
+                potential_line = float(numbers[0])
+                if potential_line < 50:
+                    last_line_val = potential_line
+                    odds_pool = numbers[1:]
+                else:
+                    odds_pool = numbers
+                
+                if len(odds_pool) >= 2:
+                    up = float(odds_pool[0])
+                    lw = float(odds_pool[1])
                     m = round((1/up) + (1/lw), 3) if (up > 0 and lw > 0) else 1.085
                     parsed_items.append({
                         "type": bet_type,
@@ -926,39 +922,25 @@ def parse_single_type_text(text, bet_type):
                         "unlock": True,
                         "margin": m
                     })
-                except:
-                    pass
-                    
-    # 備用全文字掃描 (若逐行未解析出數據)
-    if not parsed_items:
-        dt_matches = re.findall(r'(\d{1,4}[-/.]\d{1,2}(?:[-/.]\d{1,4})?\s*\d{1,2}:\d{2})', t_clean)
-        dt_val = dt_matches[0] if dt_matches else ""
-        all_brackets = re.findall(r'\[(.*?)\]', t_clean)
-        t_no_brackets = re.sub(r'\[.*?\]', ' ', t_clean)
-        t_no_dt = re.sub(r'\d{1,4}[-/.]\d{1,2}(?:[-/.]\d{1,4})?\s*\d{1,2}:\d{2}', ' ', t_no_brackets)
-        all_odds = re.findall(r'\d+\.\d+', t_no_dt)
-        
-        if len(all_odds) >= 2:
-            for i in range(0, len(all_odds) - 1, 2):
-                up = float(all_odds[i])
-                lw = float(all_odds[i+1])
-                idx = i // 2
-                if idx < len(all_brackets):
-                    l_v = parse_line_val(all_brackets[idx])
-                else:
-                    l_v = last_line_val
-                
-                current_dt = dt_matches[idx] if idx < len(dt_matches) else dt_val
-                
+            except:
+                pass
+        elif len(numbers) == 2:
+            # 只有兩個賠率數值，沿用上一行的盤口線
+            try:
+                up = float(numbers[0])
+                lw = float(numbers[1])
+                m = round((1/up) + (1/lw), 3) if (up > 0 and lw > 0) else 1.085
                 parsed_items.append({
                     "type": bet_type,
-                    "record_time": current_dt,
-                    "line": l_v,
+                    "record_time": last_datetime,
+                    "line": last_line_val,
                     "upper": up,
                     "lower": lw,
                     "unlock": True,
-                    "margin": round((1/up) + (1/lw), 3) if (up > 0 and lw > 0) else 1.085
+                    "margin": m
                 })
+            except:
+                pass
 
     return parsed_items
 
@@ -1124,7 +1106,7 @@ def main():
     if st.sidebar.button("🔍 數據庫即時線上預覽與管理", use_container_width=True):
         preview_db_dialog(st.session_state.df_db, st.session_state.df_cap, db_file, capital_file, db_table, cap_table)
 
-    t_pre, t_inplay, t_settle, t_ai = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖️️ 賽果結算與管理", "🤖 全局模型"])
+    t_pre, t_inplay, t_settle, t_ai = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖️ 賽果結算與管理", "🤖 全局模型"])
 
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
@@ -1280,7 +1262,7 @@ def main():
                             upgrade_msg = "💡 **智能風控提示**：依據凱利公式，原計算注碼不足 $200。但因該讓球盤 EV (≥0.03) 與勝率 (≥50%) 均達標，系統判定具備高投資價值，建議升級至最低投注額 **$200**。"
                         else:
                             suggested_stake = 0.0
-                            upgrade_msg = "⚠️ **智能風控提示**：依據凱利公式，原計算注碼不足 $200，且該讓球盤的期望值/勝率未達強制升級標準。系統建議 **放棄** 此次投注 (注碼歸 0)。"
+                            upgrade_msg = "⚠️️ **智能風控提示**：依據凱利公式，原計算注碼不足 $200，且該讓球盤的期望值/勝率未達強制升級標準。系統建議 **放棄** 此次投注 (注碼歸 0)。"
                 else:
                     suggested_stake = max(10.0, suggested_stake)
 
@@ -1405,7 +1387,7 @@ def main():
         
         # --- 頂部修改與覆蓋控制區塊 ---
         if st.session_state.editing_bet_id:
-            st.info(f"🛠️️ **【修改/覆蓋模式】** 目前正在編輯未結算注單：`{st.session_state.editing_bet_id}`。修改後提交將**直接覆蓋**資料庫中的原有數據。")
+            st.info(f"🛠️ **【修改/覆蓋模式】** 目前正在編輯未結算注單：`{st.session_state.editing_bet_id}`。修改後提交將**直接覆蓋**資料庫中的原有數據。")
             if st.button("❌ 取消修改 (恢復為新增注單)", key="cancel_edit_inplay"):
                 clear_edit_mode()
                 st.rerun()
@@ -1599,7 +1581,7 @@ def main():
                                 upgrade_msg = "💡 **智能風控提示**：依據凱利公式，原計算注碼不足 $200。但因該讓球盤 EV (≥0.03) 與勝率 (≥50%) 均達標，系統判定具備高投資價值，建議升級至最低投注額 **$200**。"
                             else:
                                 suggested_stake = 0.0
-                                upgrade_msg = "⚠️️ **智能風控提示**：依據凱利公式，原計算注碼不足 $200，且該讓球盤的期望值/勝率未達強制升級標準。系統建議 **放棄** 此次投注 (注碼歸 0)。"
+                                upgrade_msg = "⚠️ **智能風控提示**：依據凱利公式，原計算注碼不足 $200，且該讓球盤的期望值/勝率未達強制升級標準。系統建議 **放棄** 此次投注 (注碼歸 0)。"
                     else:
                         suggested_stake = max(10.0, suggested_stake)
                         
