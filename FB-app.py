@@ -911,7 +911,7 @@ def parse_single_type_text(text, bet_type):
                     if pot_line < 20 and pot_line not in [1.01, 1.02, 1.03, 1.04, 1.05, 1.06, 1.07, 1.08, 1.09]:
                         last_line_val = pot_line
                         odds_pool = odds_found[1:]
-                :
+                except:
                     pass
             
             for i in range(0, len(odds_pool) - 1, 2):
@@ -980,7 +980,7 @@ def render_odds_section(odds_history_state, prefix="pre"):
         df_display,
         num_rows="dynamic",
         column_config={
-            "🗑️️刪除": st.column_config.CheckboxColumn("刪除", default=False),
+            "🗑️刪除": st.column_config.CheckboxColumn("刪除", default=False),
             "📅日期及時間": st.column_config.TextColumn("📅日期及時間", required=False),
             "盤口類型": st.column_config.SelectboxColumn("盤口類型", options=["讓球", "入球大小", "角球大小"], required=True),
             "盤口線": st.column_config.NumberColumn("盤口線", format="%.2f", required=True),
@@ -1032,7 +1032,7 @@ def main():
     if 'last_bet_id' not in st.session_state:
         st.session_state.last_bet_id = None
         
-    st.sidebar.header("⚙️ 系統設定與資金管理")
+    st.sidebar.header("⚙️️ 系統設定與資金管理")
     
     db_file = "football_betting_db.csv"
     capital_file = "football_capital_db.csv"
@@ -1125,7 +1125,7 @@ def main():
                     st.rerun()
         st.divider()
 
-        if sys_bankroll <= 0: st.warning("⚠️ 目前系統可用資金不足！無法精確計算建議注碼。請先至側邊欄存入本金。")
+        if sys_bankroll <= 0: st.warning("⚠️️ 目前系統可用資金不足！無法精確計算建議注碼。請先至側邊欄存入本金。")
         
         is_editing = bool(st.session_state.editing_bet_id)
         opts_tournaments = ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Tournament_Name'].dropna().unique())))
