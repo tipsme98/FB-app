@@ -424,8 +424,8 @@ def display_cumulative_metrics(df):
     
     st.markdown("### 📊 數據庫累計總額看板 (Cumulative Summary)")
     m1, m2, m3 = st.columns(3)
-    m1.metric("系統累積淨盈虧 (System Profit)", f"${sys_profit:,.2f}", delta=f"{sys_profit:,.2f}")
-    m2.metric("用家真實淨盈虧 (User Profit)", f"${user_profit:,.2f}", delta=f"{user_profit:,.2f}")
+    m1.metric("系統累積淨盈虧 (System Profit)", f"${sys_profit:,.2f}", delta=f"${sys_profit:,.2f}")
+    m2.metric("用家真實淨盈虧 (User Profit)", f"${user_profit:,.2f}", delta=f"${user_profit:,.2f}")
     m3.metric("用家派彩總額 (User Payout)", f"${user_payout:,.2f}")
     st.divider()
 
@@ -859,12 +859,11 @@ def get_last_odds_state(history, target_type, default_line):
     }
 
 def parse_single_type_text(text, bet_type):
-    """強大精準解析單一盤口類型的文字，智能提取跨行的日期時間、盤口線與賠率（支援整數與小數賠率）"""
+    """強大精準解析單一盤口類型的文字，智能提取跨行的日期時間、盤口線與賠率（自動濾除連續重複賠率）"""
     if not text or not text.strip():
         return []
     
     lines_raw = [l.strip() for l in text.split('\n') if l.strip()]
-    parsed_items = []
     
     default_line = 2.5 if bet_type == "入球大小" else (9.5 if bet_type == "角球大小" else 0.0)
     current_line = default_line
@@ -883,16 +882,17 @@ def parse_single_type_text(text, bet_type):
         except:
             return 0.0
 
-    odds_buffer = []
+    # 第一階段：解析所有行，提取原始 token（包含時間、盤口線與數值）
+    raw_tokens = []
 
     for line_str in lines_raw:
-        # 1. 提取日期及時間 (例如 01-10 23:40 或 30-09 01:36 等格式)
+        # 1. 提取日期及時間
         dt_match = re.search(r'(\d{1,4}[-/.]\d{1,2}(?:[-/.]\d{1,4})?\s*\d{1,2}:\d{2})', line_str)
         if dt_match:
             current_datetime = dt_match.group(1)
             line_str = line_str.replace(dt_match.group(1), '').strip()
             
-        # 2. 檢查中括號盤口標示 (例如 [2.5] 或 [0/+0.5])
+        # 2. 檢查中括號盤口標示
         found_brackets = re.findall(r'\[(.*?)\]', line_str)
         if found_brackets:
             current_line = parse_line_val(found_brackets[0])
@@ -903,34 +903,49 @@ def parse_single_type_text(text, bet_type):
                 current_line = parse_line_val(found_goals[0])
                 line_str = re.sub(r'[+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?\s*球', ' ', line_str)
 
-        # 3. 提取所有數字（同時支援小數與整數，例如 2、3 或 1.90）作為賠率，加入緩衝區
+        # 3. 提取所有數字作為賠率
         numbers = re.findall(r'\d+(?:\.\d+)?', line_str)
         for num_str in numbers:
             try:
                 val = float(num_str)
-                # 針對角球大小，自動刪除貼上去連著重複的賠率數字
-                if bet_type == "角球大小":
-                    if not odds_buffer or odds_buffer[-1] != val:
-                        odds_buffer.append(val)
-                else:
-                    odds_buffer.append(val)
+                raw_tokens.append({
+                    "datetime": current_datetime,
+                    "line": current_line,
+                    "odds": val
+                })
             except:
                 pass
-            
-        # 當緩衝區累積滿 2 個賠率數字時，組購成一筆走勢紀錄
-        while len(odds_buffer) >= 2:
-            up = odds_buffer.pop(0)
-            lw = odds_buffer.pop(0)
-            m = round((1/up) + (1/lw), 3) if (up > 0 and lw > 0) else 1.085
-            parsed_items.append({
-                "type": bet_type,
-                "record_time": current_datetime,
-                "line": current_line,
-                "upper": up,
-                "lower": lw,
-                "unlock": True,
-                "margin": m
-            })
+
+    # 第二階段：全域過濾掉連續重複的賠率數值
+    deduped_tokens = []
+    for token in raw_tokens:
+        if not deduped_tokens or deduped_tokens[-1]["odds"] != token["odds"]:
+            deduped_tokens.append(token)
+
+    # 第三階段：兩兩配對成 (upper, lower) 紀錄
+    parsed_items = []
+    i = 0
+    while i < len(deduped_tokens) - 1:
+        t1 = deduped_tokens[i]
+        t2 = deduped_tokens[i+1]
+        
+        up = t1["odds"]
+        lw = t2["odds"]
+        
+        dt = t2["datetime"] if t2["datetime"] else t1["datetime"]
+        line = t2["line"] if t2["line"] != default_line else t1["line"]
+        
+        m = round((1/up) + (1/lw), 3) if (up > 0 and lw > 0) else 1.085
+        parsed_items.append({
+            "type": bet_type,
+            "record_time": dt,
+            "line": line,
+            "upper": up,
+            "lower": lw,
+            "unlock": True,
+            "margin": m
+        })
+        i += 2
 
     return parsed_items
 
@@ -1374,7 +1389,7 @@ def main():
         
         # --- 頂部修改與覆蓋控制區塊 ---
         if st.session_state.editing_bet_id:
-            st.info(f"🛠️️ **【修改/覆蓋模式】** 目前正在編輯未結算注單：`{st.session_state.editing_bet_id}`。修改後提交將**直接覆蓋**資料庫中的原有數據。")
+            st.info(f"🛠️ **【修改/覆蓋模式】** 目前正在編輯未結算注單：`{st.session_state.editing_bet_id}`。修改後提交將**直接覆蓋**資料庫中的原有數據。")
             if st.button("❌ 取消修改 (恢復為新增注單)", key="cancel_edit_inplay"):
                 clear_edit_mode()
                 st.rerun()
