@@ -760,7 +760,7 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
         col1, col2 = st.columns(2)
         
         with col1:
-            if st.button("🗑️️ 刪除選中紀錄", use_container_width=True):
+            if st.button("🗑️ 刪除選中紀錄", use_container_width=True):
                 if selected_to_delete:
                     ids_to_delete = [x.split(" | ")[0] for x in selected_to_delete]
                     df_to_delete = df_target[df_target['ID'].isin(ids_to_delete)]
@@ -859,7 +859,7 @@ def get_last_odds_state(history, target_type, default_line):
     }
 
 def parse_single_type_text(text, bet_type):
-    """基於時間區塊、上下盤精準分隔與重複去重的解析器"""
+    """基於時間戳記區塊的精準解析器：將文字依時間切割成獨立區塊，各自獨立提取日期時間、盤口與賠率，徹底杜絕跨區汙染與錯位"""
     if not text or not text.strip():
         return []
     
@@ -912,93 +912,38 @@ def parse_single_type_text(text, bet_type):
     
     for block in blocks:
         dt = block["datetime"]
-        block_lines = block["lines_content"]
+        block_text = " ".join(block["lines_content"])
         
-        # 尋找包含盤口線的行索引 (例如 [10.5] 或 10.5球)
-        line_idx = -1
-        found_line_val = None
-        
-        for idx, l_item in enumerate(block_lines):
-            bracket_match = re.search(r'\[(.*?)\]', l_item)
-            if bracket_match:
-                found_line_val = parse_line_val(bracket_match.group(1))
-                line_idx = idx
-                break
-            else:
-                goal_match = re.search(r'([+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?)\s*球', l_item)
-                if goal_match:
-                    found_line_val = parse_line_val(goal_match.group(1))
-                    line_idx = idx
-                    break
-        
-        if found_line_val is not None:
-            active_line = found_line_val
-        
-        # 將區塊內容依盤口線位置切分為「上方/前段 (Upper)」與「下方/後段 (Lower)」
-        if line_idx == -1:
-            before_lines = block_lines
-            after_lines = []
+        # 尋找該區塊中的盤口線
+        bracket_match = re.search(r'\[(.*?)\]', block_text)
+        if bracket_match:
+            active_line = parse_line_val(bracket_match.group(1))
         else:
-            before_lines = block_lines[:line_idx+1]
-            after_lines = block_lines[line_idx+1:]
+            goal_match = re.search(r'([+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?)\s*球', block_text)
+            if goal_match:
+                active_line = parse_line_val(goal_match.group(1))
+                
+        # 提取該區塊內的所有有效賠率數值
+        all_odds = []
+        for line_item in block["lines_content"]:
+            nums = re.findall(r'\b\d+(?:\.\d+)?\b', line_item)
+            for n_str in nums:
+                if '.' in n_str or float(n_str) < 100:
+                    val = parse_odds_val(n_str)
+                    if val is not None:
+                        all_odds.append(val)
+                        
+        if not all_odds:
+            continue
             
-        # 提取盤口前/上的賠率 (主隊/大盤) 並去重
-        upper_odds_list = []
-        for l_item in before_lines:
-            for n_str in re.findall(r'\b\d+(?:\.\d+)?\b', l_item):
-                val = parse_odds_val(n_str)
-                if val is not None and abs(val - active_line) > 1e-4:
-                    upper_odds_list.append(val)
-                    
-        # 提取盤口後/下的賠率 (客隊/小盤) 並去重
-        lower_odds_list = []
-        for l_item in after_lines:
-            for n_str in re.findall(r'\b\d+(?:\.\d+)?\b', l_item):
-                val = parse_odds_val(n_str)
-                if val is not None and abs(val - active_line) > 1e-4:
-                    lower_odds_list.append(val)
-                    
-        # 去除數值重複的項目 (例如 [2.10, 2.1] 僅保留一個)
-        unique_upper = []
-        for u in upper_odds_list:
-            if not any(abs(u - existing) < 1e-4 for existing in unique_upper):
-                unique_upper.append(u)
-                
-        unique_lower = []
-        for l_val in lower_odds_list:
-            if not any(abs(l_val - existing) < 1e-4 for existing in unique_lower):
-                unique_lower.append(l_val)
-                
-        # 決定最終上、下盤賠率
-        if len(unique_upper) > 0 and len(unique_lower) > 0:
-            up = unique_upper[-1]
-            lw = unique_lower[-1]
-        elif len(unique_upper) >= 2:
-            up = unique_upper[0]
-            lw = unique_upper[1]
-        elif len(unique_upper) == 1:
-            up = lw = unique_upper[0]
-        elif len(unique_lower) >= 2:
-            up = unique_lower[0]
-            lw = unique_lower[1]
-        elif len(unique_lower) == 1:
-            up = lw = unique_lower[0]
+        # 取該區塊最後出現的一對賠率作為該時間點的大盤/小盤（或主/客）賠率
+        if len(all_odds) >= 2:
+            up = all_odds[-2]
+            lw = all_odds[-1]
         else:
-            # 備用降級防呆：抓取區塊所有有效數字
-            all_nums = []
-            for l_item in block_lines:
-                for n_str in re.findall(r'\b\d+(?:\.\d+)?\b', l_item):
-                    v = parse_odds_val(n_str)
-                    if v is not None and abs(v - active_line) > 1e-4:
-                        if not any(abs(v - x) < 1e-4 for x in all_nums):
-                            all_nums.append(v)
-            if len(all_nums) >= 2:
-                up, lw = all_nums[0], all_nums[1]
-            elif len(all_nums) == 1:
-                up = lw = all_nums[0]
-            else:
-                up = lw = 1.90
-                
+            up = all_odds[0]
+            lw = all_odds[0]
+            
         margin = round((1/up) + (1/lw), 3) if (up > 0 and lw > 0) else 1.085
         
         parsed_items.append({
@@ -1014,7 +959,7 @@ def parse_single_type_text(text, bet_type):
     return parsed_items
 
 def render_odds_section(odds_history_state, prefix="pre"):
-    st.markdown("💡 **智能解析與動態同步區：** 請分別貼上各盤口數據（包含跨行的日期及時間、盤口、整數或小數賠率）。系統會自動依時間區塊與上下盤位置智慧解析並自動去除重複賠率。您亦可直接於下方表格勾選刪除或修改資料。")
+    st.markdown("💡 **智能解析與動態同步區：** 請分別貼上各盤口數據（包含跨行的日期及時間、盤口、整數或小數賠率）。系統會自動依時間區塊智能解析，確保與相應的盤口及賠率保持正確的位置。您亦可直接於下方表格勾選刪除或修改資料。")
     
     col_hd, col_ou, col_cr = st.columns(3)
     with col_hd:
@@ -1022,7 +967,7 @@ def render_odds_section(odds_history_state, prefix="pre"):
     with col_ou:
         raw_ou = st.text_area("⚽ 入球大小 貼上區", height=130, key=f"{prefix}_paste_ou", placeholder="例如:\n01-10 21:05\n2.5\n[2.5]\n2")
     with col_cr:
-        raw_cr = st.text_area("⚽ 角球大小 貼上區", height=130, key=f"{prefix}_paste_cr", placeholder="例如:\n20-09 05:11 1.85\n1.85\n[10.5] 1.85\n1.85")
+        raw_cr = st.text_area("⚽ 角球大小 貼上區", height=130, key=f"{prefix}_paste_cr", placeholder="例如:\n20-09 05:11 1.85\n[10.5] 1.85")
         
     parsed_hd = parse_single_type_text(raw_hd, "讓球")
     parsed_ou = parse_single_type_text(raw_ou, "入球大小")
