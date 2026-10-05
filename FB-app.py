@@ -1153,11 +1153,8 @@ def main():
         
         if st.button("確認寫入資金紀錄"):
             acc_val = 'Both'
-            if "System" in cap_account: acc_val = '這份更新後的 `FB-app.py` 完整修復了推薦系統未顯示盤口數值的問題[cite: 2]。系統現在會在「首選推薦」區塊中將盤口線（如 3.25）與投注方向（如大盤）合併顯示。此外，我也一併補全了原檔案結尾遭截斷的 `t_inplay`（即場賽事）、`t_settle`（賽果結算）與 `t_ai`（全局模型）相關的程式碼，確保系統可以順利執行。
-
-您可以直接複製以下完整程式碼並貼入 GitHub 覆蓋原有的 `FB-app.py`[cite: 2]：
-
-```python
+            if "System" in cap_account: acc_val = 
+                
 import streamlit as st
 import pandas as pd
 import os
