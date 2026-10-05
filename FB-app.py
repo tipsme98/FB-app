@@ -1031,7 +1031,7 @@ def main():
     if st.sidebar.button("🔍 數據庫即時線上預覽與管理", use_container_width=True):
         preview_db_dialog(st.session_state.df_db, st.session_state.df_cap, db_file, capital_file, db_table, cap_table)
 
-    t_pre, t_inplay, t_settle, t_ai = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖️ 賽果結算與管理", "🤖 全局模型"])
+    t_pre, t_inplay, t_settle, t_ai = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖️️ 賽果結算與管理", "🤖 全局模型"])
 
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
@@ -1066,7 +1066,7 @@ def main():
         if sys_bankroll <= 0: st.warning("⚠️ 目前系統可用資金不足！無法精確計算建議注碼。請先至側邊欄存入本金。")
         
         is_editing = bool(st.session_state.editing_bet_id)
-        opts_tournaments = ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Tournament_Name'].dropna().unique())))
+        opts_tournaments = ["➕ 新增手동輸入..."] if False else ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Tournament_Name'].dropna().unique())))
         opts_teams = ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Home_Team'].dropna().tolist() + st.session_state.df_db['Away_Team'].dropna().tolist())))
         
         st.markdown("##### 1. 賽事與球隊資料")
@@ -1240,7 +1240,7 @@ def main():
                 st.dataframe(df_show.style.apply(highlight_first, axis=1), use_container_width=True)
                 
                 for cat in category_order:
-                    cat_cands = [c for c in cand_list if c.get('bet_type') == cat]
+                    cat_cands = [c for c in cand_list if c.get('bet_type'] == cat]
                     for c in cat_cands:
                         try:
                             line_val = float(c.get('line', 0.0))
@@ -1464,10 +1464,16 @@ def main():
                 target_id = sel_to_settle.split(" | ")[0]
                 target_row = open_df[open_df['ID'] == target_id].iloc[0]
                 
-                s_hg = st.number_input("主隊最終入球 (Full Time Home Goals)", 0, 50, int(target_row.get('Home_Goal', 0)), key="settle_hg")
-                s_ag = st.number_input("客隊最終入球 (Full Time Away Goals)", 0, 50, int(target_row.get('Away_Goal', 0)), key="settle_ag")
-                s_hc = st.number_input("主隊最終角球 (Full Time Home Corners)", 0, 50, int(target_row.get('Home_Corner', 0)), key="settle_hc")
-                s_ac = st.number_input("客隊最終角球 (Full Time Away Corners)", 0, 50, int(target_row.get('Away_Corner', 0)), key="settle_ac")
+                # 修正：安全檢查 NaN 以防 ValueError
+                s_hg_val = target_row.get('Home_Goal', 0)
+                s_ag_val = target_row.get('Away_Goal', 0)
+                s_hc_val = target_row.get('Home_Corner', 0)
+                s_ac_val = target_row.get('Away_Corner', 0)
+                
+                s_hg = st.number_input("主隊最終入球 (Full Time Home Goals)", 0, 50, int(float(s_hg_val)) if pd.notna(s_hg_val) else 0, key="settle_hg")
+                s_ag = st.number_input("客隊最終入球 (Full Time Away Goals)", 0, 50, int(float(s_ag_val)) if pd.notna(s_ag_val) else 0, key="settle_ag")
+                s_hc = st.number_input("主隊最終角球 (Full Time Home Corners)", 0, 50, int(float(s_hc_val)) if pd.notna(s_hc_val) else 0, key="settle_hc")
+                s_ac = st.number_input("客隊最終角球 (Full Time Away Corners)", 0, 50, int(float(s_ac_val)) if pd.notna(s_ac_val) else 0, key="settle_ac")
                 
                 if st.button("⚖️ 確認計算並結算此注單", type="primary"):
                     sys_prof, usr_prof, sys_pay, usr_pay, unit_p, res_lbl, diff_val = calculate_settlement(
