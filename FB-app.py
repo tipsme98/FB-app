@@ -653,7 +653,7 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
                         st.rerun()
                         
         st.divider()
-        st.subheader("2. ↩️ 狀態重置 (Undo 復原中心)")
+        st.subheader("2. ↩️️ 狀態重置 (Undo 復原中心)")
         if not st.session_state.undo_stack:
             st.info("目前沒有可還原的刪除紀錄。")
         else:
@@ -1031,7 +1031,7 @@ def main():
     if st.sidebar.button("🔍 數據庫即時線上預覽與管理", use_container_width=True):
         preview_db_dialog(st.session_state.df_db, st.session_state.df_cap, db_file, capital_file, db_table, cap_table)
 
-    t_pre, t_inplay, t_settle, t_ai = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖️️ 賽果結算與管理", "🤖 全局模型"])
+    t_pre, t_inplay, t_settle, t_ai = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖ 賽果結算與管理", "🤖 全局模型"])
 
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
@@ -1066,7 +1066,7 @@ def main():
         if sys_bankroll <= 0: st.warning("⚠️ 目前系統可用資金不足！無法精確計算建議注碼。請先至側邊欄存入本金。")
         
         is_editing = bool(st.session_state.editing_bet_id)
-        opts_tournaments = ["➕ 新增手동輸入..."] if False else ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Tournament_Name'].dropna().unique())))
+        opts_tournaments = ["➕ 新增手動輸入..."] if False else ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Tournament_Name'].dropna().unique())))
         opts_teams = ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Home_Team'].dropna().tolist() + st.session_state.df_db['Away_Team'].dropna().tolist())))
         
         st.markdown("##### 1. 賽事與球隊資料")
@@ -1240,7 +1240,7 @@ def main():
                 st.dataframe(df_show.style.apply(highlight_first, axis=1), use_container_width=True)
                 
                 for cat in category_order:
-                    cat_cands = [c for c in cand_list if c.get('bet_type') == cat]
+                    cat_cands = [c for c in cand_list if c.get('bet_type'] == cat]
                     for c in cat_cands:
                         try:
                             line_val = float(c.get('line', 0.0))
@@ -1405,8 +1405,12 @@ def main():
         if 'inplay_odds_history' not in st.session_state:
             st.session_state.inplay_odds_history = [{"id": 0, "type": "讓球", "record_time": "", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}]
 
-        st.markdown("##### 1. 實時賽況與進進攻數據")
-        col_ip1, col_ip2, col_ip3 = st.columns(3)
+        st.markdown("##### 1. 實時賽況與進攻數據")
+        
+        # 新增 1. 比賽時間 欄目
+        col_time, col_ip1, col_ip2, col_ip3 = st.columns([2, 3, 3, 3])
+        ip_minute = col_time.number_input("比賽時間 (分鐘)", 0, 120, int(st.session_state.get('edit_inplay_minute', 45)), key="ip_minute")
+        
         h_g = col_ip1.number_input("主隊入球", 0, 50, st.session_state.get('edit_h_g', 0), key="ip_hg")
         a_g = col_ip1.number_input("客隊入球", 0, 50, st.session_state.get('edit_a_g', 0), key="ip_ag")
         h_c = col_ip2.number_input("主隊角球", 0, 50, st.session_state.get('edit_h_c', 0), key="ip_hc")
@@ -1424,11 +1428,41 @@ def main():
         h_poss = c4.number_input("主隊控球率 (%)", 0, 100, st.session_state.get('edit_h_poss', 50), key="ip_hposs")
         a_poss = 100 - h_poss
         st.caption(f"客隊控球率自動計算為: {a_poss}%")
-        
-        if st.session_state.get('editing_bet_id'):
-            if st.button("💾 儲存實時賽況至該注單", type="primary"):
-                target_id = st.session_state.editing_bet_id
+
+        # 自動計算指標 2, 3, 4
+        h_total_shots = h_sot + h_soff
+        a_total_shots = a_sot + a_soff
+
+        # 2. 射球命中率 = 入球數量 / (射正次數 + 射偏次數) * 100%
+        h_conversion = (h_g / h_total_shots * 100.0) if h_total_shots > 0 else 0.0
+        a_conversion = (a_g / a_total_shots * 100.0) if a_total_shots > 0 else 0.0
+
+        # 3. 進攻火力 = (射正次數 + 射偏次數) / 危險進攻次數 * 100%
+        h_firepower = (h_total_shots / h_da * 100.0) if h_da > 0 else 0.0
+        a_firepower = (a_total_shots / a_da * 100.0) if a_da > 0 else 0.0
+
+        # 4. 實際進攻效率 = 進攻火力 / 控球率 * 100%
+        h_efficiency = (h_firepower / h_poss * 100.0) if h_poss > 0 else 0.0
+        a_efficiency = (a_firepower / a_poss * 100.0) if a_poss > 0 else 0.0
+
+        st.markdown("##### 2. 自動計算實時進攻效率與指標看板")
+        m_col1, m_col2 = st.columns(2)
+        with m_col1:
+            st.markdown("**🏠 主隊 (Home Team)**")
+            st.metric("射球命中率", f"{h_conversion:.2f}%", help="入球數量 / (射正次數 + 射偏次數) * 100%")
+            st.metric("進攻火力", f"{h_firepower:.2f}%", help="(射正次數 + 射偏次數) / 危險進攻次數 * 100%")
+            st.metric("實際進攻效率", f"{h_efficiency:.2f}%", help="進攻火力 / 控球率 * 100%")
+        with m_col2:
+            st.markdown("**✈️ 客隊 (Away Team)**")
+            st.metric("射球命中率", f"{a_conversion:.2f}%", help="入球數量 / (射正次數 + 射偏次數) * 100%")
+            st.metric("進攻火力", f"{a_firepower:.2f}%", help="(射正次數 + 射偏次數) / 危險進攻次數 * 100%")
+            st.metric("實際進攻效率", f"{a_efficiency:.2f}%", help="進攻火力 / 控球率 * 100%")
+
+        if st.button("💾 儲存實時賽況與進攻數據至該注單", type="primary"):
+            target_id = st.session_state.get('editing_bet_id')
+            if target_id:
                 mask = st.session_state.df_db['ID'] == target_id
+                st.session_state.df_db.loc[mask, 'InPlay_Minute'] = ip_minute
                 st.session_state.df_db.loc[mask, 'Home_Goal'] = h_g
                 st.session_state.df_db.loc[mask, 'Away_Goal'] = a_g
                 st.session_state.df_db.loc[mask, 'Home_Corner'] = h_c
@@ -1443,10 +1477,16 @@ def main():
                 st.session_state.df_db.loc[mask, 'Away_Red'] = a_red
                 st.session_state.df_db.loc[mask, 'Home_Possession'] = h_poss
                 st.session_state.df_db.loc[mask, 'Away_Possession'] = a_poss
+                st.session_state.df_db.loc[mask, 'Home_Goal_Conversion'] = round(h_conversion, 2)
+                st.session_state.df_db.loc[mask, 'Away_Goal_Conversion'] = round(a_conversion, 2)
+                st.session_state.df_db.loc[mask, 'Home_Firepower'] = round(h_firepower, 2)
+                st.session_state.df_db.loc[mask, 'Away_Firepower'] = round(a_firepower, 2)
                 save_db(st.session_state.df_db, db_file, db_table)
-                st.toast("✅ 即場賽況更新成功！", icon="💾")
+                st.toast("✅ 即場賽況與進攻數據更新成功！", icon="💾")
                 clear_edit_mode()
                 st.rerun()
+            else:
+                st.warning("⚠️ 請先在上方載入並選擇一筆未結算注單進行修改與儲存。")
 
     with t_settle:
         st.subheader("⚖️ 賽果結算與派彩管理")
@@ -1464,7 +1504,6 @@ def main():
                 target_id = sel_to_settle.split(" | ")[0]
                 target_row = open_df[open_df['ID'] == target_id].iloc[0]
                 
-                # 修正：安全檢查 NaN 以防 ValueError
                 s_hg_val = target_row.get('Home_Goal', 0)
                 s_ag_val = target_row.get('Away_Goal', 0)
                 s_hc_val = target_row.get('Home_Corner', 0)
