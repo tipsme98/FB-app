@@ -1053,6 +1053,7 @@ def render_odds_section(odds_history_state, prefix="pre"):
         if col not in df.columns:
             df[col] = default
             
+    # 修正重點：移除原本自訂的刪除欄位，改用 Streamlit 原生功能
     df_display = df[['record_time', 'type', 'line', 'upper', 'lower']].copy()
     df_display.columns = ['📅日期及時間', '盤口類型', '盤口線', '主隊/大盤賠率', '客隊/小盤賠率']
     
@@ -1302,16 +1303,15 @@ def main():
             ar_val = rating_map.get(away_rating, 3)
             
             candidates_base = []
-            for idx, r in enumerate(st.session_state.odds_history):
+            for r in st.session_state.odds_history:
                 b_type, line_val = r['type'], float(r['line'])
-                rec_time = r.get('record_time', '')
                 if b_type == "讓球":
                     p_up = max(0.1, min(0.9, 0.5 + ((hr_val - ar_val) * 0.03)))
                     line_str = f"{line_val:g}"
                     label_h, label_a = (f"{line_str}主隊(上盤)", f"{line_str}客隊(下盤)") if line_val <= 0 else (f"{line_str}主隊(下盤)", f"{line_str}客隊(上盤)")
                     candidates_base.extend([
-                        {'bet_type': b_type, 'selection': 'Home', 'base_prob': p_up, 'odds': float(r['upper']), 'line': line_val, 'label': label_h, 'history_idx': idx, 'record_time': rec_time},
-                        {'bet_type': b_type, 'selection': 'Away', 'base_prob': 1-p_up, 'odds': float(r['lower']), 'line': line_val, 'label': label_a, 'history_idx': idx, 'record_time': rec_time}
+                        {'bet_type': b_type, 'selection': 'Home', 'base_prob': p_up, 'odds': float(r['upper']), 'line': line_val, 'label': label_h},
+                        {'bet_type': b_type, 'selection': 'Away', 'base_prob': 1-p_up, 'odds': float(r['lower']), 'line': line_val, 'label': label_a}
                     ])
                 else:
                     p_up = max(0.1, min(0.9, 0.5 + ((hr_val + ar_val - (6 if b_type=="入球大小" else 5)) * (0.02 if b_type=="入球大小" else 0.01))))
@@ -1319,8 +1319,8 @@ def main():
                     label_over = f"{line_str}大盤(Over)"
                     label_under = f"{line_str}小盤(Under)"
                     candidates_base.extend([
-                        {'bet_type': b_type, 'selection': 'Over', 'base_prob': p_up, 'odds': float(r['upper']), 'line': line_val, 'label': label_over, 'history_idx': idx, 'record_time': rec_time},
-                        {'bet_type': b_type, 'selection': 'Under', 'base_prob': 1-p_up, 'odds': float(r['lower']), 'line': line_val, 'label': label_under, 'history_idx': idx, 'record_time': rec_time}
+                        {'bet_type': b_type, 'selection': 'Over', 'base_prob': p_up, 'odds': float(r['upper']), 'line': line_val, 'label': label_over},
+                        {'bet_type': b_type, 'selection': 'Under', 'base_prob': 1-p_up, 'odds': float(r['lower']), 'line': line_val, 'label': label_under}
                     ])
 
             h_data = {'hr': hr_val, 'ar': ar_val, 'hf': extract_form_points(home_form), 'af': extract_form_points(away_form)}
@@ -1348,16 +1348,6 @@ def main():
             res = st.session_state.analysis_result
             st.success("✅ 三維度數據分析與 EV 運算完成！")
             
-            # 建立每個 (盤口類型, 盤口線) 最新記錄的歷史 index 對照表
-            latest_history_map = {}
-            for idx, r in enumerate(st.session_state.odds_history):
-                b_type = str(r.get('type', '讓球'))
-                try:
-                    line_val = float(r.get('line', 0.0))
-                except:
-                    line_val = 0.0
-                latest_history_map[(b_type, line_val)] = idx
-
             c1, c2, c3 = st.columns(3)
             for col, r, title in zip([c1, c2, c3], [res['micro'], res['meso'], res['macro']], ["A. 微觀 (賽事名稱)", "B. 中觀 (賽事分類)", "C. 宏觀 (全局數據)"]):
                 with col.container(border=True):
@@ -1379,6 +1369,7 @@ def main():
             st.markdown("#### 📊 所有盤口評估明細 (系統決策依據)")
             cand_list = bm.get('candidates', [])
             
+            # 建構完整可選項清單供後續分流選擇
             all_options = []
             option_map = {}
             if cand_list:
@@ -1396,34 +1387,11 @@ def main():
                     
                 st.dataframe(df_show.style.apply(highlight_first, axis=1), use_container_width=True)
                 
-                # 構建下拉選項：每個 (盤口類型, 盤口線) 只提供最新時間點的一個
                 for c in cand_list:
-                    b_type = c.get('bet_type')
-                    try:
-                        line_val = float(c.get('line', 0.0))
-                    except:
-                        line_val = 0.0
-                    c_idx = c.get('history_idx')
-                    
-                    if c_idx is None or c_idx == latest_history_map.get((b_type, line_val)):
-                        opt_str = f"{c['bet_type']} | {c['label']} @ {c['odds']}"
-                        if opt_str not in option_map:
-                            all_options.append(opt_str)
-                            option_map[opt_str] = c
-
-                # 修正：編輯模式下確保原本舊注單的選項包含在內，避免 Streamlit 報錯
-                if is_editing:
-                    eb = st.session_state.get('edit_bet_type')
-                    el = st.session_state.get('edit_line')
-                    es = st.session_state.get('edit_selection')
-                    if eb and el is not None and es:
-                        for c in cand_list:
-                            if c['bet_type'] == eb and float(c['line']) == float(el) and c['selection'] == es:
-                                opt_str = f"{c['bet_type']} | {c['label']} @ {c['odds']}"
-                                if opt_str not in option_map:
-                                    all_options.append(opt_str)
-                                    option_map[opt_str] = c
-                                break
+                    opt_str = f"{c['bet_type']} | {c['label']} @ {c['odds']}"
+                    if opt_str not in option_map:
+                        all_options.append(opt_str)
+                        option_map[opt_str] = c
             
             st.info(f"系統分析顯示，針對『{res['t_name']}』，採用『{bm['dim']}』級別的模型進行運算，其歷史準確率與 EV 獲利期望值最高，故本次投注策略依據此模型生成。")
             
@@ -1453,9 +1421,7 @@ def main():
                 elif not is_editing and cand_list:
                     best_c = cand_list[0]
                     if best_c.get('ev', 0) > 0:
-                        opt_candidate = f"{best_c['bet_type']} | {best_c['label']} @ {best_c['odds']}"
-                        if opt_candidate in all_options:
-                            default_sys.append(opt_candidate)
+                        default_sys.append(f"{best_c['bet_type']} | {best_c['label']} @ {best_c['odds']}")
                 
                 sys_selected = st.multiselect("選擇系統投注項目", all_options, default=default_sys, key="sys_multi")
                 sys_stakes = {}
@@ -1467,7 +1433,7 @@ def main():
                         if cand.get('ev', 0) >= 0.03 and cand.get('prob', 0) >= 0.50:
                             st.caption(f"💡 `{cand['bet_type']}` EV/勝率達標，系統自動升級最低注碼 $200")
                         else:
-                            st.caption(f"⚠️️ `{cand['bet_type']}` EV未達標，系統建議放棄 (注碼 $0)")
+                            st.caption(f"⚠️ `{cand['bet_type']}` EV未達標，系統建議放棄 (注碼 $0)")
             
             with col_usr:
                 st.markdown("#### 👤 用家投注 (User)")
@@ -1652,6 +1618,7 @@ def main():
                         
                 st.markdown("##### 手動或確認最終賽果")
                 
+                # 修正：加入防呆機制，避免 target_row 取出 NaN 或空值時造成 int() 轉換錯誤
                 def get_safe_val(sess_key, row_key):
                     val = st.session_state.get(sess_key)
                     if val is None:
