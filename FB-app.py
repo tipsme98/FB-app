@@ -1617,10 +1617,21 @@ def main():
                         st.rerun()
                         
                 st.markdown("##### 手動或確認最終賽果")
-                h_g_fin = st.number_input("最終主隊入球", min_value=0, value=int(st.session_state.get('edit_h_g', target_row.get('Home_Goal', 0))), key="fin_h_g")
-                a_g_fin = st.number_input("最終客隊入球", min_value=0, value=int(st.session_state.get('edit_a_g', target_row.get('Away_Goal', 0))), key="fin_a_g")
-                h_c_fin = st.number_input("最終主隊角球", min_value=0, value=int(st.session_state.get('edit_h_c', target_row.get('Home_Corner', 0))), key="fin_h_c")
-                a_c_fin = st.number_input("最終客隊角球", min_value=0, value=int(st.session_state.get('edit_a_c', target_row.get('Away_Corner', 0))), key="fin_a_c")
+                
+                # 修正：加入防呆機制，避免 target_row 取出 NaN 或空值時造成 int() 轉換錯誤
+                def get_safe_val(sess_key, row_key):
+                    val = st.session_state.get(sess_key)
+                    if val is None:
+                        val = target_row.get(row_key)
+                    try:
+                        return int(float(val)) if pd.notna(val) and str(val).strip() != '' else 0
+                    except:
+                        return 0
+
+                h_g_fin = st.number_input("最終主隊入球", min_value=0, value=get_safe_val('edit_h_g', 'Home_Goal'), key="fin_h_g")
+                a_g_fin = st.number_input("最終客隊入球", min_value=0, value=get_safe_val('edit_a_g', 'Away_Goal'), key="fin_a_g")
+                h_c_fin = st.number_input("最終主隊角球", min_value=0, value=get_safe_val('edit_h_c', 'Home_Corner'), key="fin_h_c")
+                a_c_fin = st.number_input("最終客隊角球", min_value=0, value=get_safe_val('edit_a_c', 'Away_Corner'), key="fin_a_c")
                 
                 if st.button("⚖️ 確認結算此注單", type="primary"):
                     sp, up, spo, upo, u_prof, res_lbl, diff = calculate_settlement(
