@@ -1240,7 +1240,7 @@ def main():
                 st.dataframe(df_show.style.apply(highlight_first, axis=1), use_container_width=True)
                 
                 for cat in category_order:
-                    cat_cands = [c for c in cand_list if c.get('bet_type'] == cat]
+                    cat_cands = [c for c in cand_list if c.get('bet_type') == cat]
                     for c in cat_cands:
                         try:
                             line_val = float(c.get('line', 0.0))
