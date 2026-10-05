@@ -568,18 +568,16 @@ def load_bet_to_edit(bet_id):
     st.session_state.edit_a_sub = int(float(row.get('Away_Sub', 0))) if pd.notna(row.get('Away_Sub')) else 0
     st.session_state.edit_h_poss = int(float(row.get('Home_Possession', 50))) if pd.notna(row.get('Home_Possession')) else 50
     
-    st.session_state.edit_sys_stake = float(row.get('System_Stake', 0.0)) if pd.notna(row.get('System_Stake')) else 0.0
     st.session_state.edit_user_stake = float(row.get('User_Stake', 0.0)) if pd.notna(row.get('User_Stake')) else 0.0
     st.session_state.edit_bet_type = str(row.get('Bet_Type', '')).replace(" (即場)", "") if pd.notna(row.get('Bet_Type')) else ''
     st.session_state.edit_selection = str(row.get('Selection', 'Home')) if pd.notna(row.get('Selection')) else 'Home'
-    st.session_state.edit_line = float(row.get('Initial_Line', 0.0)) if pd.notna(row.get('Initial_Line')) else 0.0
 
 def clear_edit_mode():
     """清除修改模式狀態"""
     st.session_state.editing_bet_id = None
-    keys_to_del = [k for k in st.session_state.keys() if k.startswith('edit_')]
-    for k in keys_to_del:
-        del st.session_state[k]
+    for k in list(st.session_state.keys()):
+        if k.startswith('edit_'):
+            del st.session_state[k]
 
 # ==========================================
 # 5. 資金流水 HTML 構建
@@ -762,7 +760,7 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
         col1, col2 = st.columns(2)
         
         with col1:
-            if st.button("🗑 刪除選中紀錄", use_container_width=True):
+            if st.button("🗑️ 刪除選中紀錄", use_container_width=True):
                 if selected_to_delete:
                     ids_to_delete = [x.split(" | ")[0] for x in selected_to_delete]
                     df_to_delete = df_target[df_target['ID'].isin(ids_to_delete)]
@@ -861,12 +859,15 @@ def get_last_odds_state(history, target_type, default_line):
     }
 
 def parse_single_type_text(text, bet_type):
-    """基於時間區塊、上下盤精準分隔與重複去重的解析器"""
+    """強大精準解析單一盤口類型的文字，智能提取跨行的日期時間、盤口線與賠率（自動濾除連續重複賠率）"""
     if not text or not text.strip():
         return []
     
     lines_raw = [l.strip() for l in text.split('\n') if l.strip()]
+    
     default_line = 2.5 if bet_type == "入球大小" else (9.5 if bet_type == "角球大小" else 0.0)
+    current_line = default_line
+    current_datetime = ""
     
     def parse_line_val(s):
         s = str(s).replace('球', '').replace('+', '').replace('[', '').replace(']', '').strip()
@@ -881,143 +882,75 @@ def parse_single_type_text(text, bet_type):
         except:
             return 0.0
 
-    def parse_odds_val(s):
-        try:
-            clean = re.sub(r'[^\d\.]', '', str(s))
-            val = float(clean)
-            return val if val >= 1.01 else None
-        except:
-            return None
+    # 第一階段：解析所有行，提取原始 token（包含時間、盤口線與數值）
+    raw_tokens = []
 
-    # 1. 以時間戳記作為區塊分界點
-    dt_pattern = re.compile(r'(\d{1,4}[-/.]\d{1,2}(?:[-/.]\d{1,4})?\s*\d{1,2}:\d{2})')
-    
-    blocks = []
-    current_block = {"datetime": "", "lines_content": []}
-    
-    for l in lines_raw:
-        m = dt_pattern.search(l)
-        if m:
-            if current_block["datetime"] or current_block["lines_content"]:
-                blocks.append(current_block)
-            dt_str = m.group(1)
-            remaining = l.replace(dt_str, '').strip()
-            current_block = {"datetime": dt_str, "lines_content": [remaining] if remaining else []}
-        else:
-            current_block["lines_content"].append(l)
+    for line_str in lines_raw:
+        # 1. 提取日期及時間
+        dt_match = re.search(r'(\d{1,4}[-/.]\d{1,2}(?:[-/.]\d{1,4})?\s*\d{1,2}:\d{2})', line_str)
+        if dt_match:
+            current_datetime = dt_match.group(1)
+            line_str = line_str.replace(dt_match.group(1), '').strip()
             
-    if current_block["datetime"] or current_block["lines_content"]:
-        blocks.append(current_block)
-        
+        # 2. 檢查中括號盤口標示
+        found_brackets = re.findall(r'\[(.*?)\]', line_str)
+        if found_brackets:
+            current_line = parse_line_val(found_brackets[0])
+            line_str = re.sub(r'\[.*?\]', ' ', line_str)
+        else:
+            found_goals = re.findall(r'([+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?)\s*球', line_str)
+            if found_goals:
+                current_line = parse_line_val(found_goals[0])
+                line_str = re.sub(r'[+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?\s*球', ' ', line_str)
+
+        # 3. 提取所有數字作為賠率
+        numbers = re.findall(r'\d+(?:\.\d+)?', line_str)
+        for num_str in numbers:
+            try:
+                val = float(num_str)
+                raw_tokens.append({
+                    "datetime": current_datetime,
+                    "line": current_line,
+                    "odds": val
+                })
+            except:
+                pass
+
+    # 第二階段：全域過濾掉連續重複的賠率數值
+    deduped_tokens = []
+    for token in raw_tokens:
+        if not deduped_tokens or deduped_tokens[-1]["odds"] != token["odds"]:
+            deduped_tokens.append(token)
+
+    # 第三階段：兩兩配對成 (upper, lower) 紀錄
     parsed_items = []
-    active_line = default_line
-    
-    for block in blocks:
-        dt = block["datetime"]
-        block_lines = block["lines_content"]
+    i = 0
+    while i < len(deduped_tokens) - 1:
+        t1 = deduped_tokens[i]
+        t2 = deduped_tokens[i+1]
         
-        # 尋找包含盤口線的行索引 (例如 [10.5] 或 10.5球)
-        line_idx = -1
-        found_line_val = None
+        up = t1["odds"]
+        lw = t2["odds"]
         
-        for idx, l_item in enumerate(block_lines):
-            bracket_match = re.search(r'\[(.*?)\]', l_item)
-            if bracket_match:
-                found_line_val = parse_line_val(bracket_match.group(1))
-                line_idx = idx
-                break
-            else:
-                goal_match = re.search(r'([+-]?\d+(?:\.\d+)?(?:/[+-]?\d+(?:\.\d+)?)?)\s*球', l_item)
-                if goal_match:
-                    found_line_val = parse_line_val(goal_match.group(1))
-                    line_idx = idx
-                    break
+        dt = t2["datetime"] if t2["datetime"] else t1["datetime"]
+        line = t2["line"] if t2["line"] != default_line else t1["line"]
         
-        if found_line_val is not None:
-            active_line = found_line_val
-        
-        # 嚴格區分上下盤：盤口線之前歸上盤，盤口線所在行及之後歸下盤
-        if line_idx == -1:
-            upper_lines = block_lines
-            lower_lines = []
-        else:
-            upper_lines = block_lines[:line_idx]
-            lower_lines = block_lines[line_idx:]
-            
-        # 提取上盤賠率 (主隊/大盤) 並去重
-        upper_odds_list = []
-        for l_item in upper_lines:
-            for n_str in re.findall(r'\b\d+(?:\.\d+)?\b', l_item):
-                val = parse_odds_val(n_str)
-                if val is not None and abs(val - active_line) > 1e-4:
-                    upper_odds_list.append(val)
-                    
-        # 提取下盤賠率 (客隊/小盤) 並去重 (過濾掉中括號盤口數值)
-        lower_odds_list = []
-        for l_item in lower_lines:
-            cleaned_l_item = re.sub(r'\[.*?\]', '', l_item)
-            for n_str in re.findall(r'\b\d+(?:\.\d+)?\b', cleaned_l_item):
-                val = parse_odds_val(n_str)
-                if val is not None and abs(val - active_line) > 1e-4:
-                    lower_odds_list.append(val)
-                    
-        # 去除數值重複的項目
-        unique_upper = []
-        for u in upper_odds_list:
-            if not any(abs(u - existing) < 1e-4 for existing in unique_upper):
-                unique_upper.append(u)
-                
-        unique_lower = []
-        for l_val in lower_odds_list:
-            if not any(abs(l_val - existing) < 1e-4 for existing in unique_lower):
-                unique_lower.append(l_val)
-                
-        # 決定最終上、下盤賠率
-        if len(unique_upper) > 0:
-            up = unique_upper[-1]
-        elif len(upper_odds_list) > 0:
-            up = upper_odds_list[-1]
-        else:
-            up = 1.90
-            
-        if len(unique_lower) > 0:
-            lw = unique_lower[-1]
-        elif len(lower_odds_list) > 0:
-            lw = lower_odds_list[-1]
-        else:
-            lw = 1.90
-            
-        # 若其中一邊抓不到，從區塊所有數字中按順序互補
-        if up == 1.90 or lw == 1.90:
-            all_nums = []
-            for l_item in block_lines:
-                clean_item = re.sub(r'\[.*?\]', '', l_item)
-                for n_str in re.findall(r'\b\d+(?:\.\d+)?\b', clean_item):
-                    v = parse_odds_val(n_str)
-                    if v is not None and abs(v - active_line) > 1e-4:
-                        if not any(abs(v - x) < 1e-4 for x in all_nums):
-                            all_nums.append(v)
-            if len(all_nums) >= 2:
-                up, lw = all_nums[0], all_nums[1]
-            elif len(all_nums) == 1:
-                up = lw = all_nums[0]
-                
-        margin = round((1/up) + (1/lw), 3) if (up > 0 and lw > 0) else 1.085
-        
+        m = round((1/up) + (1/lw), 3) if (up > 0 and lw > 0) else 1.085
         parsed_items.append({
             "type": bet_type,
             "record_time": dt,
-            "line": active_line,
+            "line": line,
             "upper": up,
             "lower": lw,
             "unlock": True,
-            "margin": margin
+            "margin": m
         })
-        
+        i += 2
+
     return parsed_items
 
 def render_odds_section(odds_history_state, prefix="pre"):
-    st.markdown("💡 **智能解析與動態同步區：** 請分別貼上各盤口數據（包含跨行的日期及時間、盤口、整數或小數賠率）。系統會自動依時間區塊與上下盤位置智慧解析並自動去除重複賠率。")
+    st.markdown("💡 **智能解析與動態同步區：** 請分別貼上各盤口數據（包含跨行的日期及時間、盤口、整數或小數賠率）。系統會自動智能解析，確保與相應的盤口及賠率保持正確的位置。您亦可直接於下方表格勾選刪除或修改資料。")
     
     col_hd, col_ou, col_cr = st.columns(3)
     with col_hd:
@@ -1025,7 +958,7 @@ def render_odds_section(odds_history_state, prefix="pre"):
     with col_ou:
         raw_ou = st.text_area("⚽ 入球大小 貼上區", height=130, key=f"{prefix}_paste_ou", placeholder="例如:\n01-10 21:05\n2.5\n[2.5]\n2")
     with col_cr:
-        raw_cr = st.text_area("⚽ 角球大小 貼上區", height=130, key=f"{prefix}_paste_cr", placeholder="例如:\n18-09 07:11 2.05\n2.05\n[10.5] 1.68\n1.68")
+        raw_cr = st.text_area("⚽ 角球大小 貼上區", height=130, key=f"{prefix}_paste_cr", placeholder="例如:\n30-09 01:36 4.15\n4.15\n[11.5] 1.17\n1.17")
         
     parsed_hd = parse_single_type_text(raw_hd, "讓球")
     parsed_ou = parse_single_type_text(raw_ou, "入球大小")
@@ -1053,14 +986,17 @@ def render_odds_section(odds_history_state, prefix="pre"):
         if col not in df.columns:
             df[col] = default
             
-    df_display = df[['record_time', 'type', 'line', 'upper', 'lower']].copy()
-    df_display.columns = ['📅日期及時間', '盤口類型', '盤口線', '主隊/大盤賠率', '客隊/小盤賠率']
+    df['刪除'] = False
+            
+    df_display = df[['刪除', 'record_time', 'type', 'line', 'upper', 'lower']].copy()
+    df_display.columns = ['🗑️刪除', '📅日期及時間', '盤口類型', '盤口線', '主隊/大盤賠率', '客隊/小盤賠率']
     
-    st.markdown("##### 📝 盤口與賠率走勢表 (可直接點擊表格左側勾選方塊，並按 Delete 鍵刪除，或修改資料)")
+    st.markdown("##### 📝 盤口與賠率走勢表 (可勾選刪除、修改日期時間、盤口或賠率)")
     edited_df = st.data_editor(
         df_display,
         num_rows="dynamic",
         column_config={
+            "🗑️刪除": st.column_config.CheckboxColumn("刪除", default=False),
             "📅日期及時間": st.column_config.TextColumn("📅日期及時間", required=False),
             "盤口類型": st.column_config.SelectboxColumn("盤口類型", options=["讓球", "入球大小", "角球大小"], required=True),
             "盤口線": st.column_config.NumberColumn("盤口線", format="%.2f", required=True),
@@ -1074,6 +1010,9 @@ def render_odds_section(odds_history_state, prefix="pre"):
     new_history = []
     new_idx = 0
     for i, row in edited_df.iterrows():
+        if row.get("🗑️刪除", False):
+            continue
+            
         try:
             up = float(row["主隊/大盤賠率"]) if pd.notna(row["主隊/大盤賠率"]) else 1.90
             lw = float(row["客隊/小盤賠率"]) if pd.notna(row["客隊/小盤賠率"]) else 1.90
@@ -1095,30 +1034,6 @@ def render_odds_section(odds_history_state, prefix="pre"):
         
     odds_history_state.clear()
     odds_history_state.extend(new_history)
-
-# ==========================================
-# 5.5 智能下注輔助計算
-# ==========================================
-def calc_suggested_stake(cand, sys_bankroll, sys_max_stake):
-    suggested_stake = 0.0
-    raw_stake = 0.0
-    if cand.get('ev', 0) > 0 and sys_bankroll > 0:
-        b = cand.get('odds', 1.90) - 1
-        prob = cand.get('prob', cand.get('base_prob', 0.5))
-        if b > 0:
-            kelly = max(0.0, min((prob * b - (1 - prob)) / b, 0.10))
-            raw_stake = (sys_bankroll * (kelly * 0.5))
-            suggested_stake = min(float(sys_max_stake), float(round(raw_stake / 10) * 10))
-            
-            if "讓球" in cand.get('bet_type', ''):
-                if 0 < suggested_stake < 200:
-                    if cand.get('ev', 0) >= 0.03 and prob >= 0.50:
-                        suggested_stake = 200.0
-                    else:
-                        suggested_stake = 0.0
-            else:
-                suggested_stake = max(10.0, suggested_stake)
-    return suggested_stake, raw_stake
 
 # ==========================================
 # 6. 主程式 UI 
@@ -1209,7 +1124,7 @@ def main():
             if not last_match.empty and last_match.iloc[0]['Status'] == 'Open':
                 c_msg, c_btn = st.columns([3, 1])
                 c_msg.info(f"💡 剛提交注單 ID: **{st.session_state.last_bet_id}** ({last_match.iloc[0]['Match']})。如發現資料有錯漏，可隨時載入修改。")
-                if c_btn.button("✏ 載入該注單修改", key="load_last_pre"):
+                if c_btn.button("✏️ 載入該注單修改", key="load_last_pre"):
                     load_bet_to_edit(st.session_state.last_bet_id)
                     st.rerun()
 
@@ -1302,25 +1217,20 @@ def main():
             ar_val = rating_map.get(away_rating, 3)
             
             candidates_base = []
-            for idx, r in enumerate(st.session_state.odds_history):
+            for r in st.session_state.odds_history:
                 b_type, line_val = r['type'], float(r['line'])
-                rec_time = r.get('record_time', '')
                 if b_type == "讓球":
                     p_up = max(0.1, min(0.9, 0.5 + ((hr_val - ar_val) * 0.03)))
-                    line_str = f"{line_val:g}"
-                    label_h, label_a = (f"{line_str}主隊(上盤)", f"{line_str}客隊(下盤)") if line_val <= 0 else (f"{line_str}主隊(下盤)", f"{line_str}客隊(上盤)")
+                    label_h, label_a = ("主隊(上盤)", "客隊(下盤)") if line_val <= 0 else ("主隊(下盤)", "客隊(上盤)")
                     candidates_base.extend([
-                        {'bet_type': b_type, 'selection': 'Home', 'base_prob': p_up, 'odds': float(r['upper']), 'line': line_val, 'label': label_h, 'history_idx': idx, 'record_time': rec_time},
-                        {'bet_type': b_type, 'selection': 'Away', 'base_prob': 1-p_up, 'odds': float(r['lower']), 'line': line_val, 'label': label_a, 'history_idx': idx, 'record_time': rec_time}
+                        {'bet_type': b_type, 'selection': 'Home', 'base_prob': p_up, 'odds': float(r['upper']), 'line': line_val, 'label': label_h},
+                        {'bet_type': b_type, 'selection': 'Away', 'base_prob': 1-p_up, 'odds': float(r['lower']), 'line': line_val, 'label': label_a}
                     ])
                 else:
                     p_up = max(0.1, min(0.9, 0.5 + ((hr_val + ar_val - (6 if b_type=="入球大小" else 5)) * (0.02 if b_type=="入球大小" else 0.01))))
-                    line_str = f"{line_val:g}"
-                    label_over = f"{line_str}大盤(Over)"
-                    label_under = f"{line_str}小盤(Under)"
                     candidates_base.extend([
-                        {'bet_type': b_type, 'selection': 'Over', 'base_prob': p_up, 'odds': float(r['upper']), 'line': line_val, 'label': label_over, 'history_idx': idx, 'record_time': rec_time},
-                        {'bet_type': b_type, 'selection': 'Under', 'base_prob': 1-p_up, 'odds': float(r['lower']), 'line': line_val, 'label': label_under, 'history_idx': idx, 'record_time': rec_time}
+                        {'bet_type': b_type, 'selection': 'Over', 'base_prob': p_up, 'odds': float(r['upper']), 'line': line_val, 'label': "大盤(Over)"},
+                        {'bet_type': b_type, 'selection': 'Under', 'base_prob': 1-p_up, 'odds': float(r['lower']), 'line': line_val, 'label': "小盤(Under)"}
                     ])
 
             h_data = {'hr': hr_val, 'ar': ar_val, 'hf': extract_form_points(home_form), 'af': extract_form_points(away_form)}
@@ -1338,26 +1248,36 @@ def main():
             if not valid_res: best_model['msg'] = "所有維度樣本數不足，降級為純基礎期望值運算。"
 
             best_bet = best_model['best'] if 'best' in best_model else candidates_base[0]
+            
+            suggested_stake = 0
+            upgrade_msg = ""
+            if 'ev' in best_bet and best_bet['ev'] > 0 and sys_bankroll > 0:
+                b = best_bet['odds'] - 1
+                kelly = max(0.0, min((best_bet['prob'] * b - (1 - best_bet['prob'])) / b, 0.10))
+                raw_stake = (sys_bankroll * (kelly * 0.5))
+                suggested_stake = min(float(sys_max_stake), float(round(raw_stake / 10) * 10))
+                
+                if "讓球" in best_bet['bet_type']:
+                    if 0 < suggested_stake < 200:
+                        if best_bet.get('ev', 0) >= 0.03 and best_bet.get('prob', 0) >= 0.50:
+                            suggested_stake = 200.0
+                            upgrade_msg = "💡 **智能風控提示**：依據凱利公式，原計算注碼不足 $200。但因該讓球盤 EV (≥0.03) 與勝率 (≥50%) 均達標，系統判定具備高投資價值，建議升級至最低投注額 **$200**。"
+                        else:
+                            suggested_stake = 0.0
+                            upgrade_msg = "⚠️ **智能風控提示**：依據凱利公式，原計算注碼不足 $200，且該讓球盤的期望值/勝率未達強制升級標準。系統建議 **放棄** 此次投注 (注碼歸 0)。"
+                else:
+                    suggested_stake = max(10.0, suggested_stake)
 
             st.session_state.analysis_result = {
                 'micro': res_micro, 'meso': res_meso, 'macro': res_macro, 'best_model': best_model,
-                'best_bet': best_bet, 't_name': tournament_name, 't_cat': tournament_category
+                'best_bet': best_bet, 'stake': suggested_stake, 't_name': tournament_name, 't_cat': tournament_category,
+                'upgrade_msg': upgrade_msg
             }
             
         if st.session_state.get('show_analysis', False):
             res = st.session_state.analysis_result
             st.success("✅ 三維度數據分析與 EV 運算完成！")
             
-            # 建立每個 (盤口類型, 盤口線) 最新記錄的歷史 index 對照表
-            latest_history_map = {}
-            for idx, r in enumerate(st.session_state.odds_history):
-                b_type = str(r.get('type', '讓球'))
-                try:
-                    line_val = float(r.get('line', 0.0))
-                except:
-                    line_val = 0.0
-                latest_history_map[(b_type, line_val)] = idx
-
             c1, c2, c3 = st.columns(3)
             for col, r, title in zip([c1, c2, c3], [res['micro'], res['meso'], res['macro']], ["A. 微觀 (賽事名稱)", "B. 中觀 (賽事分類)", "C. 宏觀 (全局數據)"]):
                 with col.container(border=True):
@@ -1378,9 +1298,6 @@ def main():
             
             st.markdown("#### 📊 所有盤口評估明細 (系統決策依據)")
             cand_list = bm.get('candidates', [])
-            
-            all_options = []
-            option_map = {}
             if cand_list:
                 df_show = pd.DataFrame(cand_list)
                 df_show['推薦排序'] = range(1, len(df_show) + 1)
@@ -1395,35 +1312,6 @@ def main():
                     return [''] * len(row)
                     
                 st.dataframe(df_show.style.apply(highlight_first, axis=1), use_container_width=True)
-                
-                # 構建下拉選項：每個 (盤口類型, 盤口線) 只提供最新時間點的一個
-                for c in cand_list:
-                    b_type = c.get('bet_type')
-                    try:
-                        line_val = float(c.get('line', 0.0))
-                    except:
-                        line_val = 0.0
-                    c_idx = c.get('history_idx')
-                    
-                    if c_idx is None or c_idx == latest_history_map.get((b_type, line_val)):
-                        opt_str = f"{c['bet_type']} | {c['label']} @ {c['odds']}"
-                        if opt_str not in option_map:
-                            all_options.append(opt_str)
-                            option_map[opt_str] = c
-
-                # 修正：編輯模式下確保原本舊注單的選項包含在內，避免 Streamlit 報錯
-                if is_editing:
-                    eb = st.session_state.get('edit_bet_type')
-                    el = st.session_state.get('edit_line')
-                    es = st.session_state.get('edit_selection')
-                    if eb and el is not None and es:
-                        for c in cand_list:
-                            if c['bet_type'] == eb and float(c['line']) == float(el) and c['selection'] == es:
-                                opt_str = f"{c['bet_type']} | {c['label']} @ {c['odds']}"
-                                if opt_str not in option_map:
-                                    all_options.append(opt_str)
-                                    option_map[opt_str] = c
-                                break
             
             st.info(f"系統分析顯示，針對『{res['t_name']}』，採用『{bm['dim']}』級別的模型進行運算，其歷史準確率與 EV 獲利期望值最高，故本次投注策略依據此模型生成。")
             
@@ -1432,106 +1320,65 @@ def main():
             mc2.metric(f"🎯 預期勝率 ({dim_short}修正)", f"{bb.get('prob', bb.get('base_prob',0))*100:.1f}%")
             mc3.metric("📊 修正 EV", f"{bb.get('ev', 0):.3f}")
             
-            st.markdown("---")
-            st.markdown("### 🎯 最終投注決策與注碼配置 (可多選/自訂)")
-            
-            col_sys, col_usr = st.columns(2)
-            
-            with col_sys:
-                st.markdown("#### 🤖 系統投注 (System)")
-                st.caption("供模型學習及系統資金策略驗證使用")
-                default_sys = []
-                if is_editing and st.session_state.get('edit_sys_stake', 0) > 0:
-                    eb = st.session_state.get('edit_bet_type')
-                    el = st.session_state.get('edit_line')
-                    es = st.session_state.get('edit_selection')
-                    for opt in all_options:
-                        c = option_map[opt]
-                        if c['bet_type'] == eb and c['line'] == el and c['selection'] == es:
-                            default_sys.append(opt)
-                            break
-                elif not is_editing and cand_list:
-                    best_c = cand_list[0]
-                    if best_c.get('ev', 0) > 0:
-                        opt_candidate = f"{best_c['bet_type']} | {best_c['label']} @ {best_c['odds']}"
-                        if opt_candidate in all_options:
-                            default_sys.append(opt_candidate)
-                
-                sys_selected = st.multiselect("選擇系統投注項目", all_options, default=default_sys, key="sys_multi")
-                sys_stakes = {}
-                for sel in sys_selected:
-                    cand = option_map[sel]
-                    sug_stk, raw_stk = calc_suggested_stake(cand, sys_bankroll, sys_max_stake)
-                    sys_stakes[sel] = st.number_input(f"系統建議金額: {sel}", value=float(sug_stk), disabled=True, key=f"s_stk_{sel}")
-                    if "讓球" in cand['bet_type'] and 0 < raw_stk < 200:
-                        if cand.get('ev', 0) >= 0.03 and cand.get('prob', 0) >= 0.50:
-                            st.caption(f"💡 `{cand['bet_type']}` EV/勝率達標，系統自動升級最低注碼 $200")
-                        else:
-                            st.caption(f"⚠️️ `{cand['bet_type']}` EV未達標，系統建議放棄 (注碼 $0)")
-            
-            with col_usr:
-                st.markdown("#### 👤 用家投注 (User)")
-                st.caption("真實資金決策，不用於系統學習。可跟單或反買")
-                default_usr = []
-                if is_editing and st.session_state.get('edit_user_stake', 0) > 0:
-                    eb = st.session_state.get('edit_bet_type')
-                    el = st.session_state.get('edit_line')
-                    es = st.session_state.get('edit_selection')
-                    for opt in all_options:
-                        c = option_map[opt]
-                        if c['bet_type'] == eb and c['line'] == el and c['selection'] == es:
-                            default_usr.append(opt)
-                            break
-                
-                usr_selected = st.multiselect("選擇用家投注項目", all_options, default=default_usr, key="usr_multi")
-                usr_stakes = {}
-                for sel in usr_selected:
-                    def_val = 100.0
-                    if is_editing and sel in default_usr:
-                        def_val = float(st.session_state.get('edit_user_stake', 100.0))
-                    usr_stakes[sel] = st.number_input(f"用家自訂金額 ($): {sel}", min_value=0.0, step=10.0, value=def_val, key=f"u_stk_{sel}")
-            
-            st.write("")
-            submit_btn_label = f"🔄 確定修改並覆蓋雲端資料庫 (ID: {st.session_state.editing_bet_id})" if is_editing else "✅ 確定投注並寫入雲端資料庫"
-            
-            if st.button(submit_btn_label, type="primary", use_container_width=True):
-                all_keys = set(sys_selected + usr_selected)
-                if not all_keys:
-                    st.warning("⚠️ 請至少在系統或用家選擇一項投注！")
+            if res.get('upgrade_msg'):
+                if "放棄" in res['upgrade_msg']:
+                    st.warning(res['upgrade_msg'])
                 else:
+                    st.info(res['upgrade_msg'])
+
+            with st.form("bet_form"):
+                bc1, bc2 = st.columns(2)
+                cand_btypes = [c['bet_type'] for c in bm.get('candidates', [bb])]
+                default_btype_idx = 0
+                if is_editing and st.session_state.get('edit_bet_type') in cand_btypes:
+                    default_btype_idx = cand_btypes.index(st.session_state.get('edit_bet_type'))
+                    
+                final_btype = bc1.selectbox("最終投注項目", cand_btypes, index=default_btype_idx)
+                
+                sel_options = ["Home", "Away", "Over", "Under"]
+                default_sel_idx = sel_options.index(bb['selection']) if bb['selection'] in sel_options else 0
+                if is_editing and st.session_state.get('edit_selection') in sel_options:
+                    default_sel_idx = sel_options.index(st.session_state.get('edit_selection'))
+                    
+                final_sel = bc2.selectbox("最終投注方向", sel_options, index=default_sel_idx)
+                
+                bc3, bc4 = st.columns(2)
+                final_sys_stake = float(res['stake'] if res['stake'] > 0 else 0.0)
+                bc3.text_input("🤖 系統建議下注金額 (System Stake) - 供分析學習用", f"${final_sys_stake:,.2f}", disabled=True)
+                
+                default_u_stake = float(st.session_state.get('edit_user_stake', final_sys_stake)) if is_editing else float(final_sys_stake)
+                final_user_stake = bc4.number_input("👤 用家真實下注金額 (User Actual Stake) ($)", min_value=0.0, step=10.0, value=default_u_stake)
+                
+                final_row = next((r for r in st.session_state.odds_history if r['type'] == final_btype), st.session_state.odds_history[-1])
+                line, odds = float(final_row['line']), float(final_row['upper']) if final_sel in ["Home", "Over"] else float(final_row['lower'])
+                
+                submit_btn_label = f"🔄 確定修改並覆蓋雲端資料庫 (ID: {st.session_state.editing_bet_id})" if is_editing else "✅ 確定投注並寫入雲端資料庫"
+                
+                if st.form_submit_button(submit_btn_label):
                     target_id = st.session_state.get('editing_bet_id')
-                    # 修改模式下先移除舊注單
-                    if target_id:
-                        st.session_state.df_db = st.session_state.df_db[st.session_state.df_db['ID'] != target_id]
+                    new_id = target_id if target_id else f"B{datetime.now().strftime('%Y%m%d%H%M%S')}"
                     
-                    new_records = []
-                    for i, sel in enumerate(all_keys):
-                        cand = option_map[sel]
-                        s_stk = sys_stakes.get(sel, 0.0)
-                        u_stk = usr_stakes.get(sel, 0.0)
+                    new_record = {
+                        'ID': new_id, 'Date': datetime.now().strftime('%Y-%m-%d %H:%M'), 'Status': 'Open',
+                        'Tournament_Name': res['t_name'], 'Tournament_Category': res['t_cat'], 
+                        'Match': f"{home_team} vs {away_team}", 'Home_Team': home_team, 'Away_Team': away_team,
+                        'Home_Rating': home_rating, 'Away_Rating': away_rating, 'Home_Form': home_form, 'Away_Form': away_form,
+                        'Bet_Type': final_btype, 'Selection': final_sel, 'Initial_Line': line, 'Initial_Odds': odds, 
+                        'System_Stake': final_sys_stake, 'User_Stake': final_user_stake,
+                        'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False)
+                    }
+                    
+                    if target_id and (st.session_state.df_db['ID'] == target_id).any():
+                        mask = st.session_state.df_db['ID'] == target_id
+                        for col_name, val in new_record.items():
+                            st.session_state.df_db.loc[mask, col_name] = val
+                        st.toast(f"🔄 注單 {target_id} 修改成功並已覆蓋雲端資料庫！", icon="✅")
+                    else:
+                        st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame([new_record])], ignore_index=True)
+                        st.toast("✅ 投注紀錄雲端同步成功！", icon="📝")
                         
-                        # 唯一 ID 生成邏輯
-                        if target_id and len(all_keys) == 1:
-                            new_id = target_id
-                        else:
-                            new_id = f"B{datetime.now().strftime('%Y%m%d%H%M%S')}{i}"
-                            
-                        new_record = {
-                            'ID': new_id, 'Date': datetime.now().strftime('%Y-%m-%d %H:%M'), 'Status': 'Open',
-                            'Tournament_Name': res['t_name'], 'Tournament_Category': res['t_cat'], 
-                            'Match': f"{home_team} vs {away_team}", 'Home_Team': home_team, 'Away_Team': away_team,
-                            'Home_Rating': home_rating, 'Away_Rating': away_rating, 'Home_Form': home_form, 'Away_Form': away_form,
-                            'Bet_Type': cand['bet_type'], 'Selection': cand['selection'], 'Initial_Line': cand['line'], 'Initial_Odds': cand['odds'], 
-                            'System_Stake': s_stk, 'User_Stake': u_stk,
-                            'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False)
-                        }
-                        new_records.append(new_record)
-                        
-                    st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame(new_records)], ignore_index=True)
-                    st.toast("✅ 投注紀錄雲端同步成功！", icon="📝")
-                    st.session_state.last_bet_id = new_records[-1]['ID']
+                    st.session_state.last_bet_id = new_id
                     save_db(st.session_state.df_db, db_file, db_table)
-                    
                     clear_edit_mode()
                     st.session_state.odds_history = [{"id": 0, "type": "讓球", "record_time": "", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}] 
                     st.session_state.show_analysis = False
@@ -1566,132 +1413,406 @@ def main():
                     target_id = sel_open_bet.split(" | ")[0]
                     load_bet_to_edit(target_id)
                     st.rerun()
-                    
         st.divider()
 
-        st.markdown("##### ⚡ 一鍵同步即場賽況 (API)")
-        col_api_id, col_api_btn = st.columns([2, 1])
-        inplay_match_id = col_api_id.text_input("輸入賽事 ID", key="api_match_id")
-        if col_api_btn.button("🔄 自動同步數據", key="btn_sync_inplay"):
-            if inplay_match_id:
-                if parse_and_fill_inplay(inplay_match_id):
-                    st.success("✅ 即場數據與盤口同步成功！")
-                    st.rerun()
-                else:
-                    st.warning("⚠️ 找不到賽事或 API 請求失敗。")
-
         if 'inplay_odds_history' not in st.session_state:
-            st.session_state.inplay_odds_history = [{"id": 0, "type": "讓球", "record_time": "", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}]
+            st.session_state.inplay_odds_history = [
+                {"id": 0, "type": "讓球", "record_time": "", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085},
+                {"id": 1, "type": "入球大小", "record_time": "", "line": 2.5, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085},
+                {"id": 2, "type": "角球大小", "record_time": "", "line": 9.5, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}
+            ]
 
-        st.markdown("##### 1. 實時賽況與進攻數據")
-        col_ip1, col_ip2, col_ip3 = st.columns(3)
-        h_g = col_ip1.number_input("主隊入球", 0, 50, st.session_state.get('edit_h_g', 0), key="ip_hg")
-        a_g = col_ip1.number_input("客隊入球", 0, 50, st.session_state.get('edit_a_g', 0), key="ip_ag")
-        h_c = col_ip2.number_input("主隊角球", 0, 50, st.session_state.get('edit_h_c', 0), key="ip_hc")
-        a_c = col_ip2.number_input("客隊角球", 0, 50, st.session_state.get('edit_a_c', 0), key="ip_ac")
-        h_red = col_ip3.number_input("主隊紅牌", 0, 10, st.session_state.get('edit_h_red', 0), key="ip_hred")
-        a_red = col_ip3.number_input("客隊紅牌", 0, 10, st.session_state.get('edit_a_red', 0), key="ip_ared")
-        
-        c1, c2, c3, c4 = st.columns(4)
-        h_da = c1.number_input("主隊危險進攻", 0, 200, st.session_state.get('edit_h_da', 0), key="ip_hda")
-        a_da = c1.number_input("客隊危險進攻", 0, 200, st.session_state.get('edit_a_da', 0), key="ip_ada")
-        h_sot = c2.number_input("主隊射正", 0, 50, st.session_state.get('edit_h_sot', 0), key="ip_hsot")
-        a_sot = c2.number_input("客隊射正", 0, 50, st.session_state.get('edit_a_sot', 0), key="ip_asot")
-        h_soff = c3.number_input("主隊射偏", 0, 50, st.session_state.get('edit_h_soff', 0), key="ip_hsoff")
-        a_soff = c3.number_input("客隊射偏", 0, 50, st.session_state.get('edit_a_soff', 0), key="ip_asoff")
-        h_poss = c4.number_input("主隊控球率 (%)", 0, 100, st.session_state.get('edit_h_poss', 50), key="ip_hposs")
-        a_poss = 100 - h_poss
-        st.caption(f"客隊控球率自動計算為: {a_poss}%")
-        
-        if st.session_state.get('editing_bet_id'):
-            if st.button("💾 儲存實時賽況至該注單", type="primary"):
-                target_id = st.session_state.editing_bet_id
-                mask = st.session_state.df_db['ID'] == target_id
-                st.session_state.df_db.loc[mask, 'Home_Goal'] = h_g
-                st.session_state.df_db.loc[mask, 'Away_Goal'] = a_g
-                st.session_state.df_db.loc[mask, 'Home_Corner'] = h_c
-                st.session_state.df_db.loc[mask, 'Away_Corner'] = a_c
-                st.session_state.df_db.loc[mask, 'Home_Red'] = h_red
-                st.session_state.df_db.loc[mask, 'Away_Red'] = a_red
-                st.session_state.df_db.loc[mask, 'Home_DA'] = h_da
-                st.session_state.df_db.loc[mask, 'Away_DA'] = a_da
-                st.session_state.df_db.loc[mask, 'Home_SoT'] = h_sot
-                st.session_state.df_db.loc[mask, 'Away_SoT'] = a_sot
-                st.session_state.df_db.loc[mask, 'Home_SoFF'] = h_soff
-                st.session_state.df_db.loc[mask, 'Away_SoFF'] = a_soff
-                st.session_state.df_db.loc[mask, 'Home_Possession'] = h_poss
-                st.session_state.df_db.loc[mask, 'Away_Possession'] = a_poss
+        pending_df = st.session_state.df_db[st.session_state.df_db['Status'] == 'Open']
+        if pending_df.empty:
+            st.info("目前沒有待結算的進行中賽事 (Status='Open')。請先於「📝 賽前建檔」建立賽事。")
+        else:
+            unique_matches = pending_df.drop_duplicates(subset=['Match']).reset_index(drop=True)
+            selected_match_name = st.selectbox("📌 請選擇正在進行中的賽事", unique_matches['Match'])
+            row = pending_df[pending_df['Match'] == selected_match_name].iloc[0]
+
+            def get_val(r, col, default=0, edit_key=None):
+                if is_editing and edit_key and edit_key in st.session_state:
+                    return int(st.session_state[edit_key])
+                val = r.get(col)
+                if pd.isna(val) or val == "": return default
+                return int(float(val))
+
+        # --- 自動抓取即場數據與盤口按鈕 ---
+            with st.container(border=True):
+                st.markdown("##### ⚡ 一鍵同步即場賽況與走地盤口")
+                col_in_id, col_in_btn = st.columns([2, 1])
+                inplay_match_id = col_in_id.text_input("輸入賽事 ID 進行同步 (例如: 112684)", key="api_inplay_id")
+                if col_in_btn.button("🔄 自動同步即時比分與走地盤賠率", use_container_width=True):
+                    if inplay_match_id:
+                        with st.spinner('正在同步最新即場數據與賠率...'):
+                            if parse_and_fill_inplay(inplay_match_id):
+                                st.success("✅ 即場數據與走地盤口同步成功！已更新下方火力分析。")
+                                st.rerun()
+                            else:
+                                st.error("❌ 同步失敗。請確認 ID 或是檢查該賽事是否提供即場盤口。")
+            
+            st.markdown("##### 1. 實時數據輸入與自動效率計算")
+            minute = st.number_input("比賽進行時間 (分鐘)", min_value=0, max_value=120, value=get_val(row, 'InPlay_Minute', 45, 'edit_inplay_minute'))
+            
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("##### 🏠 主隊實時數據")
+                h_g = st.number_input("主隊入球", min_value=0, value=get_val(row, 'Home_Goal', 0, 'edit_h_g'))
+                h_c = st.number_input("主隊角球", min_value=0, value=get_val(row, 'Home_Corner', 0, 'edit_h_c'))
+                h_da = st.number_input("主隊危險進攻 (DA)", min_value=0, value=get_val(row, 'Home_DA', 0, 'edit_h_da'))
+                h_sot = st.number_input("主隊射正 (SoT)", min_value=0, value=get_val(row, 'Home_SoT', 0, 'edit_h_sot'))
+                h_soff = st.number_input("主隊射偏 (SoFF)", min_value=0, value=get_val(row, 'Home_SoFF', 0, 'edit_h_soff'))
+                h_red = st.number_input("主隊紅牌", min_value=0, value=get_val(row, 'Home_Red', 0, 'edit_h_red'))
+                h_sub = st.number_input("主隊換人", min_value=0, value=get_val(row, 'Home_Sub', 0, 'edit_h_sub'))
                 
+                h_poss = st.number_input("主隊控球率 (%)", min_value=0, max_value=100, value=get_val(row, 'Home_Possession', 50, 'edit_h_poss'))
+                a_poss = max(0, 100 - h_poss)
+                
+                h_conv = (h_g / h_sot * 100) if h_sot > 0 else 0.0
+                h_fire = ((h_sot + h_soff) / h_da * 100) if h_da > 0 else 0.0
+                
+                st.markdown(f"> 🎯 **主隊得分率**: `{h_conv:.1f}%` ({h_g}進球 / {h_sot}射正)")
+                st.markdown(f"> ⚡ **主隊進攻火力**: `{h_fire:.1f}%` ({h_sot+h_soff}射門 / {h_da}危險進攻)")
+                
+            with c2:
+                st.markdown("##### ✈️ 客隊實時數據")
+                a_g = st.number_input("客隊入球", min_value=0, value=get_val(row, 'Away_Goal', 0, 'edit_a_g'))
+                a_c = st.number_input("客隊角球", min_value=0, value=get_val(row, 'Away_Corner', 0, 'edit_a_c'))
+                a_da = st.number_input("客隊危險進攻 (DA)", min_value=0, value=get_val(row, 'Away_DA', 0, 'edit_a_da'))
+                a_sot = st.number_input("客隊射正 (SoT)", min_value=0, value=get_val(row, 'Away_SoT', 0, 'edit_a_sot'))
+                a_soff = st.number_input("客隊射偏 (SoFF)", min_value=0, value=get_val(row, 'Away_SoFF', 0, 'edit_a_soff'))
+                a_red = st.number_input("客隊紅牌", min_value=0, value=get_val(row, 'Away_Red', 0, 'edit_a_red'))
+                a_sub = st.number_input("客隊換人", min_value=0, value=get_val(row, 'Away_Sub', 0, 'edit_a_sub'))
+                
+                st.number_input("客隊控球率 (%) [自動計算]", min_value=0, max_value=100, value=a_poss, disabled=True)
+                
+                a_conv = (a_g / a_sot * 100) if a_sot > 0 else 0.0
+                a_fire = ((a_sot + a_soff) / a_da * 100) if a_da > 0 else 0.0
+                
+                st.markdown(f"> 🎯 **客隊得分率**: `{a_conv:.1f}%` ({a_g}進球 / {a_sot}射正)")
+                st.markdown(f"> ⚡ **客隊進攻火力**: `{a_fire:.1f}%` ({a_sot+a_soff}射門 / {a_da}危險進攻)")
+
+            if st.button("🔄 僅保存賽事實時數據與分析指標", use_container_width=True):
+                match_mask = st.session_state.df_db['Match'] == selected_match_name
+                st.session_state.df_db.loc[match_mask, 'InPlay_Minute'] = minute
+                st.session_state.df_db.loc[match_mask, 'Home_Goal'] = h_g
+                st.session_state.df_db.loc[match_mask, 'Away_Goal'] = a_g
+                st.session_state.df_db.loc[match_mask, 'Home_Corner'] = h_c
+                st.session_state.df_db.loc[match_mask, 'Away_Corner'] = a_c
+                st.session_state.df_db.loc[match_mask, 'Home_DA'] = h_da
+                st.session_state.df_db.loc[match_mask, 'Away_DA'] = a_da
+                st.session_state.df_db.loc[match_mask, 'Home_SoT'] = h_sot
+                st.session_state.df_db.loc[match_mask, 'Away_SoT'] = a_sot
+                st.session_state.df_db.loc[match_mask, 'Home_SoFF'] = h_soff
+                st.session_state.df_db.loc[match_mask, 'Away_SoFF'] = a_soff
+                st.session_state.df_db.loc[match_mask, 'Home_Red'] = h_red
+                st.session_state.df_db.loc[match_mask, 'Away_Red'] = a_red
+                st.session_state.df_db.loc[match_mask, 'Home_Sub'] = h_sub
+                st.session_state.df_db.loc[match_mask, 'Away_Sub'] = a_sub
+                st.session_state.df_db.loc[match_mask, 'Home_Possession'] = h_poss
+                st.session_state.df_db.loc[match_mask, 'Away_Possession'] = a_poss
+                st.session_state.df_db.loc[match_mask, 'Home_Goal_Conversion'] = h_conv
+                st.session_state.df_db.loc[match_mask, 'Away_Goal_Conversion'] = a_conv
+                st.session_state.df_db.loc[match_mask, 'Home_Firepower'] = h_fire
+                st.session_state.df_db.loc[match_mask, 'Away_Firepower'] = a_fire
                 save_db(st.session_state.df_db, db_file, db_table)
-                st.success("✅ 實時賽況已成功更新至資料庫！")
-                clear_edit_mode()
+                st.success("✅ 實時數據雲端儲存成功！")
                 st.rerun()
 
-    with t_settle:
-        st.subheader("⚖️ 賽果結算與管理")
-        open_bets = st.session_state.df_db[st.session_state.df_db['Status'] == 'Open']
-        
-        if open_bets.empty:
-            st.info("目前沒有待結算的注單。")
-        else:
-            settle_opts = [f"{r['ID']} | {r['Match']} | {r['Bet_Type']} ({r['Selection']}) | 盤口: {r['Initial_Line']}" for _, r in open_bets.iterrows()]
-            sel_settle = st.selectbox("選擇要結算的注單", settle_opts)
-            
-            if sel_settle:
-                target_id = sel_settle.split(" | ")[0]
-                target_row = open_bets[open_bets['ID'] == target_id].iloc[0]
-                
-                st.markdown("##### ⚡ 一鍵同步賽果 (API)")
-                col_s_id, col_s_btn = st.columns([2, 1])
-                settle_match_id = col_s_id.text_input("輸入賽事 ID", key="api_settle_id")
-                
-                if col_s_btn.button("🔄 自動同步賽果", key="btn_sync_settle"):
-                    if settle_match_id and parse_and_fill_inplay(settle_match_id):
-                        st.success("✅ 賽果同步成功！")
-                        st.rerun()
-                        
-                st.markdown("##### 手動或確認最終賽果")
-                
-                def get_safe_val(sess_key, row_key):
-                    val = st.session_state.get(sess_key)
-                    if val is None:
-                        val = target_row.get(row_key)
-                    try:
-                        return int(float(val)) if pd.notna(val) and str(val).strip() != '' else 0
-                    except:
-                        return 0
+            st.divider()
+            st.markdown("##### 2. 即場盤口與賠率走勢紀錄 (JSON結構儲存)")
+            render_odds_section(st.session_state.inplay_odds_history, "inplay")
 
-                h_g_fin = st.number_input("最終主隊入球", min_value=0, value=get_safe_val('edit_h_g', 'Home_Goal'), key="fin_h_g")
-                a_g_fin = st.number_input("最終客隊入球", min_value=0, value=get_safe_val('edit_a_g', 'Away_Goal'), key="fin_a_g")
-                h_c_fin = st.number_input("最終主隊角球", min_value=0, value=get_safe_val('edit_h_c', 'Home_Corner'), key="fin_h_c")
-                a_c_fin = st.number_input("最終客隊角球", min_value=0, value=get_safe_val('edit_a_c', 'Away_Corner'), key="fin_a_c")
+            if st.button("🚀 結合火力與剩餘時間計算 EV 智能推薦", type="primary", use_container_width=True):
+                st.session_state.show_inplay_analysis = True
                 
-                if st.button("⚖️ 確認結算此注單", type="primary"):
-                    sp, up, spo, upo, u_prof, res_lbl, diff = calculate_settlement(
-                        target_row['Bet_Type'], target_row['Selection'], target_row['Initial_Line'], target_row['Initial_Odds'],
-                        target_row['System_Stake'], target_row['User_Stake'], h_g_fin, a_g_fin, h_c_fin, a_c_fin
-                    )
+                safe_min = max(1, minute)
+                rem_time = max(1, 90 - minute)
+                
+                h_atk = (h_da * (max(10.0, h_fire) / 100.0) * 0.7 + h_sot * (max(10.0, h_conv) / 100.0 + 1) * 2.0) / safe_min + (h_poss / 100 * 0.5)
+                a_atk = (a_da * (max(10.0, a_fire) / 100.0) * 0.7 + a_sot * (max(10.0, a_conv) / 100.0 + 1) * 2.0) / safe_min + (a_poss / 100 * 0.5)
+                
+                candidates = []
+                for r in st.session_state.inplay_odds_history:
+                    b_type, line = r['type'], float(r['line'])
+                    u_odds, l_odds = float(r['upper']), float(r['lower'])
                     
-                    mask = st.session_state.df_db['ID'] == target_id
-                    st.session_state.df_db.loc[mask, 'Status'] = 'Settled'
-                    st.session_state.df_db.loc[mask, 'Home_Goal'] = h_g_fin
-                    st.session_state.df_db.loc[mask, 'Away_Goal'] = a_g_fin
-                    st.session_state.df_db.loc[mask, 'Home_Corner'] = h_c_fin
-                    st.session_state.df_db.loc[mask, 'Away_Corner'] = a_c_fin
-                    st.session_state.df_db.loc[mask, 'System_Profit'] = sp
-                    st.session_state.df_db.loc[mask, 'User_Profit'] = up
-                    st.session_state.df_db.loc[mask, 'System_Payout'] = spo
-                    st.session_state.df_db.loc[mask, 'User_Payout'] = upo
-                    st.session_state.df_db.loc[mask, 'Unit_Profit'] = u_prof
-                    st.session_state.df_db.loc[mask, 'Result_Label'] = res_lbl
+                    if b_type == "讓球":
+                        base_p = 0.5 + (h_atk - a_atk) * 0.15 - (h_red - a_red) * 0.20
+                        base_p = max(0.1, min(0.9, base_p))
+                        lbl_h, lbl_a = ("主隊(上盤)", "客隊(下盤)") if line <= 0 else ("主隊(下盤)", "客隊(上盤)")
+                        candidates.extend([
+                            {'bet_type': b_type, 'selection': 'Home', 'prob': base_p, 'odds': u_odds, 'line': line, 'label': lbl_h},
+                            {'bet_type': b_type, 'selection': 'Away', 'prob': 1-base_p, 'odds': l_odds, 'line': line, 'label': lbl_a}
+                        ])
+                    elif b_type == "入球大小":
+                        intensity = (h_atk + a_atk) * (rem_time / 90.0 + 0.5)
+                        base_p_over = 0.5 + (intensity - 1.2) * 0.25
+                        base_p_over = max(0.1, min(0.9, base_p_over))
+                        candidates.extend([
+                            {'bet_type': b_type, 'selection': 'Over', 'prob': base_p_over, 'odds': u_odds, 'line': line, 'label': "大盤(Over)"},
+                            {'bet_type': b_type, 'selection': 'Under', 'prob': 1-base_p_over, 'odds': l_odds, 'line': line, 'label': "小盤(Under)"}
+                        ])
+                    elif b_type == "角球大小":
+                        corner_intensity = ((h_da + a_da) / safe_min) * ((h_fire + a_fire) / 200.0 + 0.5)
+                        base_p_over = 0.5 + (corner_intensity - 0.9) * 0.3
+                        base_p_over = max(0.1, min(0.9, base_p_over))
+                        candidates.extend([
+                            {'bet_type': b_type, 'selection': 'Over', 'prob': base_p_over, 'odds': u_odds, 'line': line, 'label': "大盤(Over)"},
+                            {'bet_type': b_type, 'selection': 'Under', 'prob': 1-base_p_over, 'odds': l_odds, 'line': line, 'label': "小盤(Under)"}
+                        ])
+
+                for c in candidates:
+                    c['ev'] = c['prob'] * (c['odds'] - 1) - (1 - c['prob'])
+                
+                candidates = sorted(candidates, key=lambda x: x['ev'], reverse=True)
+                best_bet = candidates[0] if candidates else None
+                
+                suggested_stake = 0
+                upgrade_msg = ""
+                if best_bet and best_bet['ev'] > 0 and sys_bankroll > 0:
+                    b = best_bet['odds'] - 1
+                    kelly = max(0.0, min((best_bet['prob'] * b - (1 - best_bet['prob'])) / b, 0.10))
+                    raw_stake = (sys_bankroll * (kelly * 0.5))
+                    suggested_stake = min(float(sys_max_stake), float(round(raw_stake / 10) * 10))
                     
-                    save_db(st.session_state.df_db, db_file, db_table)
-                    st.success(f"✅ 結算完成！結果: {res_lbl} | 系統盈虧: ${sp} | 用家盈虧: ${up}")
-                    st.rerun()
+                    if "讓球" in best_bet['bet_type']:
+                        if 0 < suggested_stake < 200:
+                            if best_bet.get('ev', 0) >= 0.03 and best_bet.get('prob', 0) >= 0.50:
+                                suggested_stake = 200.0
+                                upgrade_msg = "💡 **智能風控提示**：依據即場火力與凱利公式，原注碼不足 $200。但因該讓球盤即場 EV (≥0.03) 與勝率 (≥50%) 達標，系統判定具備高價值，建議升級至最低投注額 **$200**。"
+                            else:
+                                suggested_stake = 0.0
+                                upgrade_msg = "⚠️ **智能風控提示**：即場計算注碼不足 $200，且讓球盤期望值/勝率未達強制升級標準。系統建議 **放棄** 此次即場投注 (注碼歸 0)。"
+                    else:
+                        suggested_stake = max(10.0, suggested_stake)
+                
+                st.session_state.inplay_analysis_result = {
+                    'candidates': candidates, 'best_bet': best_bet,
+                    'stake': suggested_stake, 'match_row': row.to_dict(),
+                    'upgrade_msg': upgrade_msg
+                }
+
+            if st.session_state.get('show_inplay_analysis', False):
+                res = st.session_state.inplay_analysis_result
+                best_bet = res['best_bet']
+                match_info = res['match_row']
+                
+                st.success("✅ 結合火力與剩餘時間的即場 EV 精算完成！")
+                
+                if res.get('candidates'):
+                    st.markdown("#### 📊 所有即場盤口評估明細 (系統決策依據)")
+                    df_inplay_show = pd.DataFrame(res['candidates'])
+                    df_inplay_show['推薦排序'] = range(1, len(df_inplay_show) + 1)
+                    df_inplay_show = df_inplay_show[['推薦排序', 'bet_type', 'line', 'label', 'odds', 'prob', 'ev']]
+                    df_inplay_show.columns = ['推薦排序', '盤口類型', '盤口線', '投注方向', '賠率', '動態勝率', '期望值 (EV)']
+                    df_inplay_show['動態勝率'] = df_inplay_show['動態勝率'].apply(lambda x: f"{x*100:.2f}%")
+                    df_inplay_show['期望值 (EV)'] = df_inplay_show['期望值 (EV)'].apply(lambda x: f"{x:.3f}")
+                    
+                    def highlight_first_inplay(row):
+                        if row.name == 0:
+                            return ['background-color: rgba(40, 167, 69, 0.2)'] * len(row)
+                        return [''] * len(row)
+                        
+                    st.dataframe(df_inplay_show.style.apply(highlight_first_inplay, axis=1), use_container_width=True)
+                
+                if best_bet:
+                    st.info("系統已成功納入進攻火力效率與得分率，為您挑選出最佳價值的即場盤口：")
+                    mc1, mc2, mc3 = st.columns(3)
+                    mc1.metric("💡 首選推薦", f"{best_bet['bet_type']} - {best_bet['label']}")
+                    mc2.metric(f"🎯 動態勝率預測", f"{best_bet['prob']*100:.1f}%")
+                    mc3.metric("📊 即場 EV", f"{best_bet['ev']:.3f}")
+                    
+                    if res.get('upgrade_msg'):
+                        if "放棄" in res['upgrade_msg']:
+                            st.warning(res['upgrade_msg'])
+                        else:
+                            st.info(res['upgrade_msg'])
+                    
+                    with st.form("inplay_bet_form"):
+                        bc1, bc2 = st.columns(2)
+                        cand_btypes = [c['bet_type'] for c in res['candidates']]
+                        default_btype_idx = 0
+                        if is_editing and st.session_state.get('edit_bet_type') in cand_btypes:
+                            default_btype_idx = cand_btypes.index(st.session_state.get('edit_bet_type'))
+                        final_btype = bc1.selectbox("最終投注項目", cand_btypes, index=default_btype_idx)
+                        
+                        sel_options = ["Home", "Away", "Over", "Under"]
+                        default_sel_idx = sel_options.index(best_bet['selection']) if best_bet['selection'] in sel_options else 0
+                        if is_editing and st.session_state.get('edit_selection') in sel_options:
+                            default_sel_idx = sel_options.index(st.session_state.get('edit_selection'))
+                        final_sel = bc2.selectbox("最終投注方向", sel_options, index=default_sel_idx)
+                        
+                        bc3, bc4 = st.columns(2)
+                        final_sys_stake = float(res['stake'] if res['stake'] > 0 else 0.0)
+                        bc3.text_input("🤖 系統建議下注金額 (System Stake) - 供分析學習用", f"${final_sys_stake:,.2f}", disabled=True)
+                        
+                        default_u_stake = float(st.session_state.get('edit_user_stake', final_sys_stake)) if is_editing else float(final_sys_stake)
+                        final_user_stake = bc4.number_input("👤 用家真實下注金額 (User Actual Stake) ($)", min_value=0.0, step=10.0, value=default_u_stake)
+                        
+                        submit_btn_label = f"🔄 確定修改並覆蓋即場注單 (ID: {st.session_state.editing_bet_id})" if is_editing else "✅ 確認即場投注並扣除本金"
+                        
+                        if st.form_submit_button(submit_btn_label):
+                            final_row = next((r for r in st.session_state.inplay_odds_history if r['type'] == final_btype), st.session_state.inplay_odds_history[-1])
+                            line = float(final_row['line'])
+                            odds = float(final_row['upper']) if final_sel in ["Home", "Over"] else float(final_row['lower'])
+                            
+                            target_id = st.session_state.get('editing_bet_id')
+                            new_id = target_id if target_id else f"B{datetime.now().strftime('%Y%m%d%H%M%S')}_INPLAY"
+                            
+                            b_type_str = f"{final_btype} (即場)" if "即場" not in final_btype else final_btype
+                            new_record = match_info.copy()
+                            new_record.update({
+                                'ID': new_id, 'Date': datetime.now().strftime('%Y-%m-%d %H:%M'),
+                                'Bet_Type': b_type_str, 'Selection': final_sel,
+                                'Initial_Line': line, 'Initial_Odds': odds, 
+                                'System_Stake': final_sys_stake, 'User_Stake': final_user_stake,
+                                'Status': 'Open', 'Odds_History': json.dumps(st.session_state.inplay_odds_history, ensure_ascii=False),
+                                'InPlay_Minute': minute, 'Home_Goal': h_g, 'Away_Goal': a_g, 'Home_Corner': h_c, 'Away_Corner': a_c,
+                                'Home_DA': h_da, 'Away_DA': a_da, 'Home_SoT': h_sot, 'Away_SoT': a_sot,
+                                'Home_SoFF': h_soff, 'Away_SoFF': a_soff, 'Home_Red': h_red, 'Away_Red': a_red,
+                                'Home_Sub': h_sub, 'Away_Sub': a_sub, 'Home_Possession': h_poss, 'Away_Possession': a_poss,
+                                'Home_Goal_Conversion': h_conv, 'Away_Goal_Conversion': a_conv, 
+                                'Home_Firepower': h_fire, 'Away_Firepower': a_fire,
+                                'Result_Label': '', 'System_Profit': 0, 'User_Profit': 0, 'Unit_Profit': 0, 'System_Payout': 0, 'User_Payout': 0
+                            })
+                            
+                            match_mask = st.session_state.df_db['Match'] == match_info['Match']
+                            st.session_state.df_db.loc[match_mask, 'InPlay_Minute'] = minute
+                            st.session_state.df_db.loc[match_mask, 'Home_Goal'] = h_g
+                            st.session_state.df_db.loc[match_mask, 'Away_Goal'] = a_g
+                            st.session_state.df_db.loc[match_mask, 'Home_Corner'] = h_c
+                            st.session_state.df_db.loc[match_mask, 'Away_Corner'] = a_c
+                            st.session_state.df_db.loc[match_mask, 'Home_DA'] = h_da
+                            st.session_state.df_db.loc[match_mask, 'Away_DA'] = a_da
+                            st.session_state.df_db.loc[match_mask, 'Home_SoT'] = h_sot
+                            st.session_state.df_db.loc[match_mask, 'Away_SoT'] = a_sot
+                            st.session_state.df_db.loc[match_mask, 'Home_SoFF'] = h_soff
+                            st.session_state.df_db.loc[match_mask, 'Away_SoFF'] = a_soff
+                            st.session_state.df_db.loc[match_mask, 'Home_Red'] = h_red
+                            st.session_state.df_db.loc[match_mask, 'Away_Red'] = a_red
+                            st.session_state.df_db.loc[match_mask, 'Home_Sub'] = h_sub
+                            st.session_state.df_db.loc[match_mask, 'Away_Sub'] = a_sub
+                            st.session_state.df_db.loc[match_mask, 'Home_Possession'] = h_poss
+                            st.session_state.df_db.loc[match_mask, 'Away_Possession'] = a_poss
+                            st.session_state.df_db.loc[match_mask, 'Home_Goal_Conversion'] = h_conv
+                            st.session_state.df_db.loc[match_mask, 'Away_Goal_Conversion'] = a_conv
+                            st.session_state.df_db.loc[match_mask, 'Home_Firepower'] = h_fire
+                            st.session_state.df_db.loc[match_mask, 'Away_Firepower'] = a_fire
+
+                            if target_id and (st.session_state.df_db['ID'] == target_id).any():
+                                mask = st.session_state.df_db['ID'] == target_id
+                                for col_name, val in new_record.items():
+                                    st.session_state.df_db.loc[mask, col_name] = val
+                                st.toast(f"🔄 即場注單 {target_id} 修改成功並已覆蓋雲端資料庫！", icon="✅")
+                            else:
+                                st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame([new_record])], ignore_index=True)
+                                st.toast("✅ 即場注單雲端同步成功！", icon="📝")
+
+                            st.session_state.last_bet_id = new_id
+                            save_db(st.session_state.df_db, db_file, db_table)
+                            clear_edit_mode()
+                            st.session_state.show_inplay_analysis = False
+                            st.rerun()
+                else:
+                    st.warning("⚠️ 目前該場賽事並無明顯具備 EV 價值的即場盤口推薦。")
+
+    with t_settle:
+        st.subheader("⚖ 賽果結算與資料庫維護")
+        display_cumulative_metrics(st.session_state.df_db)
+        open_bets = st.session_state.df_db[st.session_state.df_db['Status'] == 'Open']
+        if not open_bets.empty:
+            for idx, row in open_bets.iterrows():
+                with st.expander(f"📌 {row['Match']} - {row['Bet_Type']} ({row['Selection']}) | 盤口: {row['Initial_Line']}"):
+                    col_b1, col_b2 = st.columns([3, 1])
+                    col_b1.caption(f"注單 ID: `{row['ID']}` | 投注金額: 用家 ${row.get('User_Stake',0)} / 系統 ${row.get('System_Stake',0)}")
+                    if col_b2.button("✏️ 載入此注單修改資料", key=f"btn_edit_settle_{row['ID']}"):
+                        load_bet_to_edit(row['ID'])
+                        st.success(f"已成功載入注單 `{row['ID']}`！請切換至「📝 賽前建檔與投注」或「⏱️ 即場賽事」進行修改與覆蓋。")
+                        
+                    with st.form(f"settle_form_{row['ID']}"):
+                        st.markdown("##### ⚽ 全場賽果輸入 (入球與角球)")
+                        col_auto = st.columns(1)[0]
+                        if col_auto.form_submit_button("⚡ 一鍵自動獲取完場比分與角球 (需輸入賽事ID)"):
+                            st.info("請切換至即場賽事分頁使用自動同步，再回來點擊確認結算。")
+                            
+                        col1, col2 = st.columns(2)
+                        h_g = col1.number_input("全場主隊入球數", min_value=0, value=int(row.get('Home_Goal', 0)) if pd.notna(row.get('Home_Goal')) else 0, key=f"hg_{row['ID']}")
+                        a_g = col2.number_input("全場客隊入球數", min_value=0, value=int(row.get('Away_Goal', 0)) if pd.notna(row.get('Away_Goal')) else 0, key=f"ag_{row['ID']}")
+                        
+                        col3, col4 = st.columns(2)
+                        h_c = col3.number_input("全場主隊角球數", min_value=0, value=int(row.get('Home_Corner', 0)) if pd.notna(row.get('Home_Corner')) else 0, key=f"hc_{row['ID']}")
+                        a_c = col4.number_input("全場客隊角球數", min_value=0, value=int(row.get('Away_Corner', 0)) if pd.notna(row.get('Away_Corner')) else 0, key=f"ac_{row['ID']}")
+                        
+                        if st.form_submit_button("確認賽果並雲端結算"):
+                            sys_p, usr_p, sys_pay, usr_pay, u_prof, lbl, diff = calculate_settlement(
+                                row['Bet_Type'], row['Selection'], float(row['Initial_Line']), 
+                                float(row['Initial_Odds']), float(row.get('System_Stake', 0)), float(row.get('User_Stake', 0)), 
+                                h_g, a_g, h_c, a_c
+                            )
+                            st.session_state.df_db['Result_Label'] = st.session_state.df_db['Result_Label'].astype('object')
+                            st.session_state.df_db['Status'] = st.session_state.df_db['Status'].astype('object')
+                            
+                            st.session_state.df_db.loc[idx, 'Home_Goal'] = h_g
+                            st.session_state.df_db.loc[idx, 'Away_Goal'] = a_g
+                            st.session_state.df_db.loc[idx, 'Home_Corner'] = h_c
+                            st.session_state.df_db.loc[idx, 'Away_Corner'] = a_c
+                            st.session_state.df_db.loc[idx, 'Result_Label'] = str(lbl)
+                            st.session_state.df_db.loc[idx, 'System_Profit'] = float(sys_p)
+                            st.session_state.df_db.loc[idx, 'User_Profit'] = float(usr_p)
+                            st.session_state.df_db.loc[idx, 'System_Payout'] = float(sys_pay)
+                            st.session_state.df_db.loc[idx, 'User_Payout'] = float(usr_pay)
+                            st.session_state.df_db.loc[idx, 'Unit_Profit'] = float(u_prof)
+                            st.session_state.df_db.loc[idx, 'Status'] = 'Settled'
+                            
+                            save_db(st.session_state.df_db, db_file, db_table)
+                            st.success(f"結算完成並同步雲端！結果：{lbl} | 單位盈虧：{u_prof:+.2f} U")
+                            st.rerun()
+                            
+        st.markdown("---")
+        st.subheader("⚠️ 撤銷與回滾中心 (Settlement Rollback)")
+        st.info("若發生結算錯誤，您可在此撤銷該筆結算。撤銷後，該賽事將恢復為「Open」未結算狀態，並重新顯示於上方的賽果輸入區，供您修改後重新結算。資金池會自動重構。")
+        
+        settled_bets = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].tail(5)
+        
+        if not settled_bets.empty:
+            rollback_options = []
+            for _, r in settled_bets.iterrows():
+                rollback_options.append(f"{r['ID']} | [{r['Date']}] {r['Match']} | 結算狀態: {r['Result_Label']} | 用家盈虧: ${r.get('User_Profit', 0)}")
+                
+            sel_rollback = st.selectbox("請選擇要撤銷結算的最近紀錄：", rollback_options)
+            
+            if st.button("↩️ 撤銷結算並恢復為未結算狀態", type="primary"):
+                target_id = sel_rollback.split(" | ")[0]
+                mask = st.session_state.df_db['ID'] == target_id
+                st.session_state.df_db.loc[mask, 'Status'] = 'Open'
+                st.session_state.df_db.loc[mask, 'Result_Label'] = ''
+                st.session_state.df_db.loc[mask, 'System_Profit'] = 0.0
+                st.session_state.df_db.loc[mask, 'User_Profit'] = 0.0
+                st.session_state.df_db.loc[mask, 'System_Payout'] = 0.0
+                st.session_state.df_db.loc[mask, 'User_Payout'] = 0.0
+                st.session_state.df_db.loc[mask, 'Unit_Profit'] = 0.0
+                save_db(st.session_state.df_db, db_file, db_table)
+                st.toast(f"✅ 已成功撤銷注單 {target_id} 的結算，恢復為 Open 狀態！", icon="↩️")
+                st.rerun()
 
     with t_ai:
-        st.subheader("🤖 全局模型與統計看板")
-        display_cumulative_metrics(st.session_state.df_db)
+        st.subheader("🤖 全局機器學習模型與策略分析")
+        df_settled = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled']
+        
+        if len(df_settled) < 15:
+            st.info(f"📊 目前已結算樣本數為 {len(df_settled)} 場。當前已結算數據未達 15 場門檻，模型將以基礎機率與期望值運算為主。")
+        else:
+            st.success(f"🎉 目前共有 {len(df_settled)} 筆已結算賽事紀錄，全局機器學習模型運算中。")
+            
+        st.markdown("##### 📈 系統勝率與盈虧走勢看板")
+        if not df_settled.empty:
+            df_chart = df_settled.copy()
+            df_chart['Cum_Sys_Profit'] = pd.to_numeric(df_chart['System_Profit'], errors='coerce').cumsum()
+            df_chart['Cum_User_Profit'] = pd.to_numeric(df_chart['User_Profit'], errors='coerce').cumsum()
+            st.line_chart(df_chart[['Cum_Sys_Profit', 'Cum_User_Profit']])
+        else:
+            st.caption("尚無已結算數據可供展示走勢圖。")
 
 if __name__ == "__main__":
     main()
