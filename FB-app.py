@@ -51,32 +51,42 @@ DB_COLUMNS = [
 CAPITAL_COLUMNS = ['ID', 'Date', 'Type', 'Account', 'Amount', 'Note']
 CATEGORY_OPTIONS = ["國內聯賽 (Domestic League)", "國際聯賽 (International League)", "國際盃賽 (Cup)", "國內盃賽 (Domestic Cup)", "友誼賽 (Friendly)"]
 
-# GitHub API 讀取與寫入輔助函式
+# GitHub API 讀取與寫入輔助函式 (加入時間戳記防快取)
 def load_db_github(repo, path, token):
-    url = f"https://api.github.com/repos/{repo}/contents/{path}"
-    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3.raw"}
+    timestamp = int(get_hkt_now().timestamp())
+    url = f"https://api.github.com/repos/{repo}/contents/{path}?t={timestamp}"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3.raw",
+        "Cache-Control": "no-cache"
+    }
     res = requests.get(url, headers=headers)
     if res.status_code == 200:
         return pd.read_csv(io.StringIO(res.text))
     return None
 
 def save_db_github(df, repo, path, token):
+    timestamp = int(get_hkt_now().timestamp())
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
-    headers = {"Authorization": f"token {token}"}
-    res_get = requests.get(url, headers=headers)
+    headers = {
+        "Authorization": f"token {token}",
+        "Cache-Control": "no-cache"
+    }
+    res_get = requests.get(f"{url}?t={timestamp}", headers=headers)
     sha = res_get.json().get("sha") if res_get.status_code == 200 else None
     
     csv_content = df.to_csv(index=False)
     content_b64 = base64.b64encode(csv_content.encode("utf-8")).decode("utf-8")
     
     payload = {
-        "message": f"Auto-update {path} via Streamlit App",
+        "message": f"Auto-update {path} via Streamlit App [{get_hkt_now().strftime('%Y-%m-%d %H:%M:%S')}]",
         "content": content_b64
     }
     if sha:
         payload["sha"] = sha
         
-    requests.put(url, json=payload, headers=headers)
+    res = requests.put(url, json=payload, headers=headers)
+    return res.status_code in [200, 201]
 
 def process_legacy_columns(df):
     """處理舊資料庫欄位轉移防呆"""
@@ -99,7 +109,7 @@ def enforce_columns(df, columns):
             df[col] = pd.Series(dtype='object')
     return df[columns]
 
-def load_db(filename, columns, table_name):
+def load_db(filename, columns, table_name, force_cloud=False):
     string_cols = [
         'ID', 'Date', 'Status', 'Tournament_Name', 'Tournament_Category', 
         'Match', 'Home_Team', 'Away_Team', 'Home_Rating', 'Away_Rating', 
@@ -108,6 +118,7 @@ def load_db(filename, columns, table_name):
     ]
     
     df = pd.DataFrame()
+    # 優先從雲端 SQL 資料庫讀取
     if HAS_SQLALCHEMY and "DB_URL" in st.secrets and st.secrets["DB_URL"]:
         try:
             engine = create_engine(st.secrets["DB_URL"])
@@ -116,14 +127,16 @@ def load_db(filename, columns, table_name):
         except Exception:
             pass
 
+    # 其次從 GitHub 雲端倉庫讀取
     if df.empty and "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
         try:
             gh_df = load_db_github(st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
-            if gh_df is not None:
+            if gh_df is not None and not gh_df.empty:
                 df = process_legacy_columns(gh_df)
         except Exception:
             pass
 
+    # 最後退回本地 CSV (僅作為備用)
     if df.empty and os.path.exists(filename):
         try:
             df = pd.read_csv(filename)
@@ -144,6 +157,7 @@ def load_db(filename, columns, table_name):
     return df
 
 def save_db(df, filename, table_name):
+    # 1. 寫入 SQL 雲端資料庫
     if HAS_SQLALCHEMY and "DB_URL" in st.secrets and st.secrets["DB_URL"]:
         try:
             engine = create_engine(st.secrets["DB_URL"])
@@ -152,15 +166,17 @@ def save_db(df, filename, table_name):
                 if df_to_db[col].dtype == 'object':
                     df_to_db[col] = df_to_db[col].apply(lambda x: str(x) if pd.notna(x) else None)
             df_to_db.to_sql(table_name, engine, if_exists='replace', index=False)
-        except Exception:
-            pass
+        except Exception as e:
+            st.error(f"SQL 資料庫儲存失敗: {e}")
 
+    # 2. 寫入 GitHub 雲端倉庫
     if "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
         try:
             save_db_github(df, st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
-        except Exception:
-            pass
+        except Exception as e:
+            st.error(f"GitHub 雲端同步失敗: {e}")
 
+    # 3. 寫入本地 CSV
     try:
         df.to_csv(filename, index=False)
     except Exception:
@@ -982,9 +998,29 @@ def main():
     capital_file = "football_capital_db.csv"
     db_table = "football_bets"
     cap_table = "football_cap"
+
+    # --- 數據雲端同步狀態提示與手動刷新 ---
+    has_sql = HAS_SQLALCHEMY and "DB_URL" in st.secrets and st.secrets["DB_URL"]
+    has_gh = "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets
     
-    st.session_state.df_db = load_db(db_file, DB_COLUMNS, db_table)
-    st.session_state.df_cap = load_db(capital_file, CAPITAL_COLUMNS, cap_table)
+    st.sidebar.subheader("☁️ 數據同步狀態看板")
+    if has_sql:
+        st.sidebar.success("✅ 已連接 PostgreSQL/SQL 雲端資料庫")
+    elif has_gh:
+        st.sidebar.success(f"✅ 已連接 GitHub 倉庫同步 (`{st.secrets['GITHUB_REPO']}`)")
+    else:
+        st.sidebar.warning("⚠️ 未偵測到 Secrets！資料僅存於臨時容器。如需永久儲存，請至 Streamlit 設定 GITHUB_TOKEN 與 GITHUB_REPO。")
+
+    if st.sidebar.button("🔄 即時從雲端同步最新數據", use_container_width=True):
+        st.session_state.df_db = load_db(db_file, DB_COLUMNS, db_table, force_cloud=True)
+        st.session_state.df_cap = load_db(capital_file, CAPITAL_COLUMNS, cap_table, force_cloud=True)
+        st.toast("✅ 數據已與雲端同步！", icon="🔄")
+        st.rerun()
+
+    if 'df_db' not in st.session_state:
+        st.session_state.df_db = load_db(db_file, DB_COLUMNS, db_table)
+    if 'df_cap' not in st.session_state:
+        st.session_state.df_cap = load_db(capital_file, CAPITAL_COLUMNS, cap_table)
 
     (sys_dep, sys_wit, sys_net, sys_pnl, sys_bankroll, sys_max_stake, 
      usr_dep, usr_wit, usr_net, usr_pnl, usr_bankroll, usr_max_stake) = recalculate_bankroll_from_scratch(st.session_state.df_cap, st.session_state.df_db)
@@ -1071,7 +1107,7 @@ def main():
         if sys_bankroll <= 0: st.warning("⚠️ 目前系統可用資金不足！無法精確計算建議注碼。請先至側邊欄存入本金。")
         
         is_editing = bool(st.session_state.editing_bet_id)
-        opts_tournaments = ["➕ 新增手動輸入..."] if False else ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Tournament_Name'].dropna().unique())))
+        opts_tournaments = ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Tournament_Name'].dropna().unique())))
         opts_teams = ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Home_Team'].dropna().tolist() + st.session_state.df_db['Away_Team'].dropna().tolist())))
         
         st.markdown("##### 1. 賽事與球隊資料")
@@ -1412,7 +1448,6 @@ def main():
 
         st.markdown("##### 1. 實時賽況與進攻數據")
         
-        # 新增 1. 比賽時間 欄目
         col_time, col_ip1, col_ip2, col_ip3 = st.columns([2, 3, 3, 3])
         ip_minute = col_time.number_input("比賽時間 (分鐘)", 0, 120, int(st.session_state.get('edit_inplay_minute', 45)), key="ip_minute")
         
@@ -1434,19 +1469,19 @@ def main():
         a_poss = 100 - h_poss
         st.caption(f"客隊控球率自動計算為: {a_poss}%")
 
-        # 自動計算指標 2, 3, 4
+        # 自動計算指標
         h_total_shots = h_sot + h_soff
         a_total_shots = a_sot + a_soff
 
-        # 2. 射球命中率 = 入球數量 / (射正次數 + 射偏次數) * 100%
+        # 射球命中率 = 入球數量 / (射正次數 + 射偏次數) * 100%
         h_conversion = (h_g / h_total_shots * 100.0) if h_total_shots > 0 else 0.0
         a_conversion = (a_g / a_total_shots * 100.0) if a_total_shots > 0 else 0.0
 
-        # 3. 進攻火力 = (射正次數 + 射偏次數) / 危險進攻次數 * 100%
+        # 進攻火力 = (射正次數 + 射偏次數) / 危險進攻次數 * 100%
         h_firepower = (h_total_shots / h_da * 100.0) if h_da > 0 else 0.0
         a_firepower = (a_total_shots / a_da * 100.0) if a_da > 0 else 0.0
 
-        # 4. 實際進攻效率 = 進攻火力 / 控球率 * 100%
+        # 實際進攻效率 = 進攻火力 / 控球率 * 100%
         h_efficiency = (h_firepower / h_poss * 100.0) if h_poss > 0 else 0.0
         a_efficiency = (a_firepower / a_poss * 100.0) if a_poss > 0 else 0.0
 
@@ -1522,7 +1557,7 @@ def main():
                 st.write(f"**待結算注單列表 ({len(target_bets)} 張):**")
                 st.dataframe(target_bets[['ID', 'Date', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 'System_Stake', 'User_Stake']], use_container_width=True)
                 
-                # 取得預設分數 (取該場比賽注單中最大/最新的紀錄，以包含 InPlay 狀態更新)
+                # 取得預設分數
                 s_hg_val = pd.to_numeric(target_bets['Home_Goal'], errors='coerce').max()
                 s_ag_val = pd.to_numeric(target_bets['Away_Goal'], errors='coerce').max()
                 s_hc_val = pd.to_numeric(target_bets['Home_Corner'], errors='coerce').max()
