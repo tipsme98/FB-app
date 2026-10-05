@@ -6,11 +6,16 @@ import base64
 import re
 import io
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 # ==========================================
-# 0. 嘗試載入依賴套件 (AI與雲端資料庫)
+# 0. 嘗試載入依賴套件 (AI與雲端資料庫) & 全局時區設定
 # ==========================================
+HKT = timezone(timedelta(hours=8))
+
+def get_hkt_now():
+    return datetime.now(HKT)
+
 try:
     from sklearn.ensemble import RandomForestClassifier
     import numpy as np
@@ -612,10 +617,10 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
                     df_to_delete = df_target[df_target['ID'].isin(ids_to_delete)]
                     
                     st.session_state.undo_stack.append({
-                        'id': f"U{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
+                        'id': f"U{get_hkt_now().strftime('%Y%m%d%H%M%S%f')}",
                         'target': target_name,
                         'data': df_to_delete.copy(),
-                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        'timestamp': get_hkt_now().strftime('%Y-%m-%d %H:%M:%S')
                     })
                     st.session_state.undo_stack = st.session_state.undo_stack[-10:]
                     
@@ -637,10 +642,10 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
                 if st.button("⚠️ 確認清空全部", type="primary", use_container_width=True):
                     if not df_target.empty:
                         st.session_state.undo_stack.append({
-                            'id': f"U{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
+                            'id': f"U{get_hkt_now().strftime('%Y%m%d%H%M%S%f')}",
                             'target': target_name,
                             'data': df_target.copy(),
-                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            'timestamp': get_hkt_now().strftime('%Y-%m-%d %H:%M:%S')
                         })
                         st.session_state.undo_stack = st.session_state.undo_stack[-10:]
                         
@@ -653,7 +658,7 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
                         st.rerun()
                         
         st.divider()
-        st.subheader("2. ↩️️ 狀態重置 (Undo 復原中心)")
+        st.subheader("2. ↩ 狀態重置 (Undo 復原中心)")
         if not st.session_state.undo_stack:
             st.info("目前沒有可還原的刪除紀錄。")
         else:
@@ -1015,8 +1020,8 @@ def main():
             elif "User" in cap_account: acc_val = 'User'
             
             new_cap_record = {
-                'ID': f"C{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                'Date': datetime.now().strftime('%Y-%m-%d %H:%M'),
+                'ID': f"C{get_hkt_now().strftime('%Y%m%d%H%M%S')}",
+                'Date': get_hkt_now().strftime('%Y-%m-%d %H:%M'),
                 'Type': 'Deposit' if 'Deposit' in cap_action else 'Withdraw',
                 'Account': acc_val,
                 'Amount': float(cap_amount),
@@ -1356,10 +1361,10 @@ def main():
                         if target_id and len(all_keys) == 1:
                             new_id = target_id
                         else:
-                            new_id = f"B{datetime.now().strftime('%Y%m%d%H%M%S')}{i}"
+                            new_id = f"B{get_hkt_now().strftime('%Y%m%d%H%M%S')}{i}"
                             
                         new_record = {
-                            'ID': new_id, 'Date': datetime.now().strftime('%Y-%m-%d %H:%M'), 'Status': 'Open',
+                            'ID': new_id, 'Date': get_hkt_now().strftime('%Y-%m-%d %H:%M'), 'Status': 'Open',
                             'Tournament_Name': res['t_name'], 'Tournament_Category': res['t_cat'], 
                             'Match': f"{home_team} vs {away_team}", 'Home_Team': home_team, 'Away_Team': away_team,
                             'Home_Rating': home_rating, 'Away_Rating': away_rating, 'Home_Form': home_form, 'Away_Form': away_form,
@@ -1496,47 +1501,70 @@ def main():
         if open_df.empty:
             st.info("目前沒有待結算的注單。")
         else:
-            st.write("請選擇要結算的注單並輸入最終入球及角球數：")
-            settle_opts = [f"{r['ID']} | {r['Date']} | {r['Match']} | {r['Bet_Type']} ({r['Selection']})" for _, r in open_df.iterrows()]
-            sel_to_settle = st.selectbox("選擇結算注單", settle_opts, key="sel_settle_item")
+            st.write("請選擇要結算的比賽並輸入最終賽果 (系統將自動結算該場比賽的所有注單)：")
+            
+            # 依據賽事名稱與對戰組合進行分組
+            match_groups = open_df.groupby(['Tournament_Name', 'Match']).size().reset_index(name='Bet_Count')
+            settle_opts = []
+            for _, r in match_groups.iterrows():
+                settle_opts.append(f"{r['Tournament_Name']} | {r['Match']} (共 {r['Bet_Count']} 張注單)")
+                
+            sel_to_settle = st.selectbox("選擇結算比賽", settle_opts, key="sel_settle_match")
             
             if sel_to_settle:
-                target_id = sel_to_settle.split(" | ")[0]
-                target_row = open_df[open_df['ID'] == target_id].iloc[0]
+                # 解析選擇的賽事
+                sel_tourn = sel_to_settle.split(" | ")[0]
+                sel_match = sel_to_settle.split(" | ")[1].split(" (共")[0]
                 
-                s_hg_val = target_row.get('Home_Goal', 0)
-                s_ag_val = target_row.get('Away_Goal', 0)
-                s_hc_val = target_row.get('Home_Corner', 0)
-                s_ac_val = target_row.get('Away_Corner', 0)
+                # 篩選出該場比賽的所有未結算注單
+                target_bets = open_df[(open_df['Tournament_Name'] == sel_tourn) & (open_df['Match'] == sel_match)]
                 
-                s_hg = st.number_input("主隊最終入球 (Full Time Home Goals)", 0, 50, int(float(s_hg_val)) if pd.notna(s_hg_val) else 0, key="settle_hg")
-                s_ag = st.number_input("客隊最終入球 (Full Time Away Goals)", 0, 50, int(float(s_ag_val)) if pd.notna(s_ag_val) else 0, key="settle_ag")
-                s_hc = st.number_input("主隊最終角球 (Full Time Home Corners)", 0, 50, int(float(s_hc_val)) if pd.notna(s_hc_val) else 0, key="settle_hc")
-                s_ac = st.number_input("客隊最終角球 (Full Time Away Corners)", 0, 50, int(float(s_ac_val)) if pd.notna(s_ac_val) else 0, key="settle_ac")
+                st.write(f"**待結算注單列表 ({len(target_bets)} 張):**")
+                st.dataframe(target_bets[['ID', 'Date', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 'System_Stake', 'User_Stake']], use_container_width=True)
                 
-                if st.button("⚖️ 確認計算並結算此注單", type="primary"):
-                    sys_prof, usr_prof, sys_pay, usr_pay, unit_p, res_lbl, diff_val = calculate_settlement(
-                        target_row['Bet_Type'], target_row['Selection'], 
-                        float(target_row['Initial_Line']), float(target_row['Initial_Odds']),
-                        float(target_row['System_Stake']), float(target_row['User_Stake']),
-                        s_hg, s_ag, s_hc, s_ac
-                    )
+                # 取得預設分數 (取該場比賽注單中最大/最新的紀錄，以包含 InPlay 狀態更新)
+                s_hg_val = pd.to_numeric(target_bets['Home_Goal'], errors='coerce').max()
+                s_ag_val = pd.to_numeric(target_bets['Away_Goal'], errors='coerce').max()
+                s_hc_val = pd.to_numeric(target_bets['Home_Corner'], errors='coerce').max()
+                s_ac_val = pd.to_numeric(target_bets['Away_Corner'], errors='coerce').max()
+                
+                c1, c2, c3, c4 = st.columns(4)
+                s_hg = c1.number_input("主隊最終入球 (Home Goals)", 0, 50, int(s_hg_val) if pd.notna(s_hg_val) else 0, key="settle_hg")
+                s_ag = c2.number_input("客隊最終入球 (Away Goals)", 0, 50, int(s_ag_val) if pd.notna(s_ag_val) else 0, key="settle_ag")
+                s_hc = c3.number_input("主隊最終角球 (Home Corners)", 0, 50, int(s_hc_val) if pd.notna(s_hc_val) else 0, key="settle_hc")
+                s_ac = c4.number_input("客隊最終角球 (Away Corners)", 0, 50, int(s_ac_val) if pd.notna(s_ac_val) else 0, key="settle_ac")
+                
+                if st.button("⚖️ 確認計算並結算此賽事所有注單", type="primary"):
+                    total_usr_prof = 0.0
+                    total_sys_prof = 0.0
                     
-                    mask = st.session_state.df_db['ID'] == target_id
-                    st.session_state.df_db.loc[mask, 'Status'] = 'Settled'
-                    st.session_state.df_db.loc[mask, 'Result_Label'] = res_lbl
-                    st.session_state.df_db.loc[mask, 'System_Profit'] = sys_prof
-                    st.session_state.df_db.loc[mask, 'User_Profit'] = usr_prof
-                    st.session_state.df_db.loc[mask, 'System_Payout'] = sys_pay
-                    st.session_state.df_db.loc[mask, 'User_Payout'] = usr_pay
-                    st.session_state.df_db.loc[mask, 'Unit_Profit'] = unit_p
-                    st.session_state.df_db.loc[mask, 'Home_Goal'] = s_hg
-                    st.session_state.df_db.loc[mask, 'Away_Goal'] = s_ag
-                    st.session_state.df_db.loc[mask, 'Home_Corner'] = s_hc
-                    st.session_state.df_db.loc[mask, 'Away_Corner'] = s_ac
-                    
+                    for _, target_row in target_bets.iterrows():
+                        target_id = target_row['ID']
+                        sys_prof, usr_prof, sys_pay, usr_pay, unit_p, res_lbl, diff_val = calculate_settlement(
+                            target_row['Bet_Type'], target_row['Selection'], 
+                            float(target_row['Initial_Line']), float(target_row['Initial_Odds']),
+                            float(target_row['System_Stake']), float(target_row['User_Stake']),
+                            s_hg, s_ag, s_hc, s_ac
+                        )
+                        
+                        mask = st.session_state.df_db['ID'] == target_id
+                        st.session_state.df_db.loc[mask, 'Status'] = 'Settled'
+                        st.session_state.df_db.loc[mask, 'Result_Label'] = res_lbl
+                        st.session_state.df_db.loc[mask, 'System_Profit'] = sys_prof
+                        st.session_state.df_db.loc[mask, 'User_Profit'] = usr_prof
+                        st.session_state.df_db.loc[mask, 'System_Payout'] = sys_pay
+                        st.session_state.df_db.loc[mask, 'User_Payout'] = usr_pay
+                        st.session_state.df_db.loc[mask, 'Unit_Profit'] = unit_p
+                        st.session_state.df_db.loc[mask, 'Home_Goal'] = s_hg
+                        st.session_state.df_db.loc[mask, 'Away_Goal'] = s_ag
+                        st.session_state.df_db.loc[mask, 'Home_Corner'] = s_hc
+                        st.session_state.df_db.loc[mask, 'Away_Corner'] = s_ac
+                        
+                        total_usr_prof += usr_prof
+                        total_sys_prof += sys_prof
+                        
                     save_db(st.session_state.df_db, db_file, db_table)
-                    st.success(f"✅ 注單 {target_id} 結算完成！結果：{res_lbl} (盈虧: ${usr_prof:,.2f})")
+                    st.success(f"✅ 賽事 {sel_tourn} | {sel_match} 共 {len(target_bets)} 張注單結算完成！(總用家真實盈虧: ${total_usr_prof:,.2f})")
                     st.rerun()
 
     with t_ai:
@@ -1566,5 +1594,5 @@ def main():
             ).reset_index()
             st.dataframe(cat_group, use_container_width=True)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
