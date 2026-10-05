@@ -103,7 +103,6 @@ def load_db(filename, columns, table_name):
     ]
     
     df = pd.DataFrame()
-    # 策略 A: 嘗試 PostgreSQL 雲端資料庫
     if HAS_SQLALCHEMY and "DB_URL" in st.secrets and st.secrets["DB_URL"]:
         try:
             engine = create_engine(st.secrets["DB_URL"])
@@ -112,7 +111,6 @@ def load_db(filename, columns, table_name):
         except Exception:
             pass
 
-    # 策略 B: 嘗試 GitHub API 自動同步
     if df.empty and "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
         try:
             gh_df = load_db_github(st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
@@ -121,7 +119,6 @@ def load_db(filename, columns, table_name):
         except Exception:
             pass
 
-    # 策略 C: 本地 CSV 讀取防呆
     if df.empty and os.path.exists(filename):
         try:
             df = pd.read_csv(filename)
@@ -168,7 +165,6 @@ def save_db(df, filename, table_name):
 # 1.5 自動化抓取 API 模組 (Auto-Scraper)
 # ==========================================
 def fetch_api_data(url):
-    """通用的 API 請求函數"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json"
@@ -178,21 +174,18 @@ def fetch_api_data(url):
         if response.status_code == 200:
             return response.json()
         return None
-    except Exception as e:
+    except Exception:
         return None
 
 def get_match_odds(match_id):
-    """抓取馬會賠率變化"""
     url = f"https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/{match_id}"
     return fetch_api_data(url)
 
 def get_match_fixtures(match_id):
-    """抓取即場賽況及統計數據 (同時適用於賽果)"""
     url = f"https://tipsme-web.azurewebsites.net/api/Score/fixtures/{match_id}"
     return fetch_api_data(url)
 
 def extract_odds_history(odds_data):
-    """強大的盤口/賠率走勢萃取器，負責解構深層次 JSON 並轉換成系統需要的格式"""
     new_history = []
     row_id = 0
     
@@ -280,12 +273,10 @@ def extract_odds_history(odds_data):
     return new_history
 
 def parse_and_fill_inplay(match_id):
-    """將抓取到的 API 數據填入 Session State (即場與賽果)"""
     data = get_match_fixtures(match_id)
     odds_data = get_match_odds(match_id)
     
     success = False
-    
     if data and "teamStats" in data:
         team_stats_ft = data["teamStats"].get("ft", {})
         if team_stats_ft:
@@ -441,7 +432,6 @@ def extract_form_points(form_str):
         return 0
 
 def parse_form_str(f_str):
-    """解析近況字串，例如 '3W1D1L'"""
     try:
         w = int(re.search(r'(\d+)W', str(f_str)).group(1))
     except:
@@ -527,7 +517,6 @@ def evaluate_dimension(df_subset, dim_name, candidates_base, rating_map, h_data)
 # 4. 注單載入與修改輔助邏輯 (新增/覆蓋)
 # ==========================================
 def load_bet_to_edit(bet_id):
-    """將雲端數據庫中的注單載入至 session_state 供使用者重新修改"""
     match_df = st.session_state.df_db[st.session_state.df_db['ID'] == bet_id]
     if match_df.empty:
         return
@@ -578,7 +567,6 @@ def load_bet_to_edit(bet_id):
     st.session_state.edit_line = float(row.get('Initial_Line', 0.0)) if pd.notna(row.get('Initial_Line')) else 0.0
 
 def clear_edit_mode():
-    """清除修改模式狀態"""
     st.session_state.editing_bet_id = None
     for k in list(st.session_state.keys()):
         if k.startswith('edit_'):
@@ -864,7 +852,6 @@ def get_last_odds_state(history, target_type, default_line):
     }
 
 def parse_single_type_text(text, bet_type):
-    """基於時間區塊、上下盤精準分隔與重複去重的解析器"""
     if not text or not text.strip():
         return []
     
@@ -892,7 +879,6 @@ def parse_single_type_text(text, bet_type):
         except:
             return None
 
-    # 1. 以時間戳記作為區塊分界點
     dt_pattern = re.compile(r'(\d{1,4}[-/.]\d{1,2}(?:[-/.]\d{1,4})?\s*\d{1,2}:\d{2})')
     
     blocks = []
@@ -919,7 +905,6 @@ def parse_single_type_text(text, bet_type):
         dt = block["datetime"]
         block_lines = block["lines_content"]
         
-        # 尋找包含盤口線的行索引 (例如 [10.5] 或 10.5球)
         line_idx = -1
         found_line_val = None
         
@@ -939,7 +924,6 @@ def parse_single_type_text(text, bet_type):
         if found_line_val is not None:
             active_line = found_line_val
         
-        # 嚴格區分上下盤：盤口線之前歸上盤，盤口線所在行及之後歸下盤
         if line_idx == -1:
             upper_lines = block_lines
             lower_lines = []
@@ -947,7 +931,6 @@ def parse_single_type_text(text, bet_type):
             upper_lines = block_lines[:line_idx]
             lower_lines = block_lines[line_idx:]
             
-        # 提取上盤賠率 (主隊/大盤) 並去重
         upper_odds_list = []
         for l_item in upper_lines:
             for n_str in re.findall(r'\b\d+(?:\.\d+)?\b', l_item):
@@ -955,7 +938,6 @@ def parse_single_type_text(text, bet_type):
                 if val is not None and abs(val - active_line) > 1e-4:
                     upper_odds_list.append(val)
                     
-        # 提取下盤賠率 (客隊/小盤) 並去重 (過濾掉中括號盤口數值)
         lower_odds_list = []
         for l_item in lower_lines:
             cleaned_l_item = re.sub(r'\[.*?\]', '', l_item)
@@ -964,7 +946,6 @@ def parse_single_type_text(text, bet_type):
                 if val is not None and abs(val - active_line) > 1e-4:
                     lower_odds_list.append(val)
                     
-        # 去除數值重複的項目
         unique_upper = []
         for u in upper_odds_list:
             if not any(abs(u - existing) < 1e-4 for existing in unique_upper):
@@ -975,7 +956,6 @@ def parse_single_type_text(text, bet_type):
             if not any(abs(l_val - existing) < 1e-4 for existing in unique_lower):
                 unique_lower.append(l_val)
                 
-        # 決定最終上、下盤賠率
         if len(unique_upper) > 0:
             up = unique_upper[-1]
         elif len(upper_odds_list) > 0:
@@ -990,7 +970,6 @@ def parse_single_type_text(text, bet_type):
         else:
             lw = 1.90
             
-        # 若其中一邊抓不到，從區塊所有數字中按順序互補
         if up == 1.90 or lw == 1.90:
             all_nums = []
             for l_item in block_lines:
@@ -1178,7 +1157,6 @@ def main():
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
         
-        # --- 頂部修改與覆蓋控制區塊 ---
         if st.session_state.editing_bet_id:
             st.info(f"🛠️ **【修改/覆蓋模式】** 目前正在編輯未結算注單：`{st.session_state.editing_bet_id}`。修改後提交將**直接覆蓋**資料庫中的原有數據。")
             if st.button("❌ 取消修改 (恢復為新建注單)", key="cancel_edit_pre"):
@@ -1413,7 +1391,6 @@ def main():
                 for sel in sys_selections:
                     cand = cand_mapping[sel]
                     
-                    # 計算該選擇的智能建議注碼
                     suggested_stake = 0
                     if 'ev' in cand and cand['ev'] > 0 and sys_bankroll > 0:
                         b = cand['odds'] - 1
@@ -1499,7 +1476,6 @@ def main():
     with t_inplay:
         st.subheader("⏱️ 即場賽事實時更新與智慧火力分析")
         
-        # --- 頂部修改與覆蓋控制區塊 ---
         if st.session_state.editing_bet_id:
             st.info(f"🛠️ **【修改/覆蓋模式】** 目前正在編輯未結算注單：`{st.session_state.editing_bet_id}`。修改後提交將**直接覆蓋**資料庫中的原有數據。")
             if st.button("❌ 取消修改 (恢復為新增注單)", key="cancel_edit_inplay"):
@@ -1514,7 +1490,7 @@ def main():
                     load_bet_to_edit(st.session_state.last_bet_id)
                     st.rerun()
 
-        with st.expander("✏️️ 載入 / 修改既有未結算即場注單 (Edit Open In-Play Bet)"):
+        with st.expander("✏ 載入 / 修改既有未結算即場注單 (Edit Open In-Play Bet)"):
             open_bets_list = st.session_state.df_db[st.session_state.df_db['Status'] == 'Open']
             if open_bets_list.empty:
                 st.caption("目前沒有未結算的注單。")
@@ -1549,7 +1525,6 @@ def main():
                 if pd.isna(val) or val == "": return default
                 return int(float(val))
 
-        # --- 自動抓取即場數據與盤口按鈕 ---
             with st.container(border=True):
                 st.markdown("##### ⚡ 一鍵同步即場賽況與走地盤口")
                 col_in_id, col_in_btn = st.columns([2, 1])
@@ -1615,13 +1590,351 @@ def main():
                 st.session_state.df_db.loc[match_mask, 'Away_DA'] = a_da
                 st.session_state.df_db.loc[match_mask, 'Home_SoT'] = h_sot
                 st.session_state.df_db.loc[match_mask, 'Away_SoT'] = a_sot
-                st.session_state.df_db.loc[match_mask, 'Home_SoFF'] = h_soff
-                st.session_state.df_db.loc[match_mask, 'Away_SoFF'] = a_soff
-                st.session_state.df_db.loc[match_mask, 'Home_Red'] = h_red
-                st.session_state.df_db.loc[match_mask, 'Away_Red'] = a_red
-                st.session_state.df_db.loc[match_mask, 'Home_Sub'] = h_sub
-                st.session_state.df_db.loc[match_mask, 'Away_Sub'] = a_sub
-                st.session_state.df_db.loc[match_mask, 'Home_Possession'] = h_poss
-                st.session_state.df_db.loc[match_mask, 'Away_Possession'] = a_poss
-                st.session_state.df_db.loc[match_mask, 'Home_Goal_Conversion'] = h_conv
-                st.session_state.df_db
+                st.session_state.df_db.loc[match_mask, 'Home_SoFF'] = h_soff以下是完整修正並包含所有要求功能的 `FB-app.py` 編程碼。
+
+*   **修正盤口刪除**：已完全移除自訂的勾選框，利用 `st.data_editor` 內建功能（選取該列並按 Delete）實現更直覺的刪除。
+*   **雙欄下注區域**：賽前分析與即場投注區皆已改為左右雙欄設計，區分「🤖 系統投注」與「👤 用家投注」。
+*   **系統注碼運算**：左側系統區會依照您選定的盤口，自動帶入凱利公式計算出的建議注碼並鎖定輸入框。
+*   **用家自訂注碼**：右側用家區可自由跟投或反買，並支援手動輸入金額。
+*   **學習資料過濾**：在 `evaluate_dimension` 模型訓練及 EV 計算中，已加入 `System_Stake > 0` 條件，確保純用家注單不會干擾大數據分析。
+
+```python
+import streamlit as st
+import pandas as pd
+import os
+import json
+import base64
+import re
+import io
+import requests
+from datetime import datetime
+
+# ==========================================
+# 0. 嘗試載入依賴套件 (AI與雲端資料庫)
+# ==========================================
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    import numpy as np
+    HAS_AI_MODULES = True
+except ImportError:
+    HAS_AI_MODULES = False
+    np = None
+
+try:
+    from sqlalchemy import create_engine
+    import sqlalchemy
+    HAS_SQLALCHEMY = True
+except ImportError:
+    HAS_SQLALCHEMY = False
+
+# ==========================================
+# 1. 初始化設定與資料庫 Schema
+# ==========================================
+st.set_page_config(page_title="Actuarial and fund management system by Dr. EdwinPro", page_icon="⚽", layout="wide")
+
+DB_COLUMNS = [
+    'ID', 'Date', 'Status', 
+    'Tournament_Name', 'Tournament_Category', 'Match', 'Home_Team', 'Away_Team', 
+    'Home_Rating', 'Away_Rating', 'Home_Form', 'Away_Form',
+    'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 
+    'System_Stake', 'User_Stake', 'Odds_History',
+    'InPlay_Minute', 'Home_DA', 'Away_DA', 'Home_SoT', 'Away_SoT', 'Home_SoFF', 'Away_SoFF',
+    'Home_Red', 'Away_Red', 'Home_Sub', 'Away_Sub', 'Home_Possession', 'Away_Possession',
+    'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner', 
+    'Home_Goal_Conversion', 'Away_Goal_Conversion', 'Home_Firepower', 'Away_Firepower',
+    'Result_Label', 'System_Profit', 'User_Profit', 'Unit_Profit', 'System_Payout', 'User_Payout'
+]
+CAPITAL_COLUMNS = ['ID', 'Date', 'Type', 'Account', 'Amount', 'Note']
+CATEGORY_OPTIONS = ["國內聯賽 (Domestic League)", "國際聯賽 (International League)", "國際盃賽 (Cup)", "國內盃賽 (Domestic Cup)", "友誼賽 (Friendly)"]
+
+# GitHub API 讀取與寫入輔助函式
+def load_db_github(repo, path, token):
+    url = f"[https://api.github.com/repos/](https://api.github.com/repos/){repo}/contents/{path}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3.raw"}
+    res = requests.get(url, headers=headers)
+    if res.status_code == 200:
+        return pd.read_csv(io.StringIO(res.text))
+    return None
+
+def save_db_github(df, repo, path, token):
+    url = f"[https://api.github.com/repos/](https://api.github.com/repos/){repo}/contents/{path}"
+    headers = {"Authorization": f"token {token}"}
+    res_get = requests.get(url, headers=headers)
+    sha = res_get.json().get("sha") if res_get.status_code == 200 else None
+    
+    csv_content = df.to_csv(index=False)
+    content_b64 = base64.b64encode(csv_content.encode("utf-8")).decode("utf-8")
+    
+    payload = {
+        "message": f"Auto-update {path} via Streamlit App",
+        "content": content_b64
+    }
+    if sha:
+        payload["sha"] = sha
+        
+    requests.put(url, json=payload, headers=headers)
+
+def process_legacy_columns(df):
+    """處理舊資料庫欄位轉移防呆"""
+    if 'Stake' in df.columns and 'System_Stake' not in df.columns:
+        df['System_Stake'] = df['Stake']
+        df['User_Stake'] = df['Stake']
+    if 'Profit' in df.columns and 'System_Profit' not in df.columns:
+        df['System_Profit'] = df['Profit']
+        df['User_Profit'] = df['Profit']
+    if 'Payout' in df.columns and 'System_Payout' not in df.columns:
+        df['System_Payout'] = df['Payout']
+        df['User_Payout'] = df['Payout']
+    return df
+
+def enforce_columns(df, columns):
+    if 'Account' in columns and 'Account' not in df.columns:
+        df['Account'] = 'Both'
+    for col in columns:
+        if col not in df.columns: 
+            df[col] = pd.Series(dtype='object')
+    return df[columns]
+
+def load_db(filename, columns, table_name):
+    string_cols = [
+        'ID', 'Date', 'Status', 'Tournament_Name', 'Tournament_Category', 
+        'Match', 'Home_Team', 'Away_Team', 'Home_Rating', 'Away_Rating', 
+        'Home_Form', 'Away_Form', 'Bet_Type', 'Selection', 'Odds_History', 'Result_Label',
+        'Type', 'Account', 'Note'
+    ]
+    
+    df = pd.DataFrame()
+    # 策略 A: 嘗試 PostgreSQL 雲端資料庫
+    if HAS_SQLALCHEMY and "DB_URL" in st.secrets and st.secrets["DB_URL"]:
+        try:
+            engine = create_engine(st.secrets["DB_URL"])
+            df = pd.read_sql_table(table_name, engine)
+            df = process_legacy_columns(df)
+        except Exception:
+            pass
+
+    # 策略 B: 嘗試 GitHub API 自動同步
+    if df.empty and "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
+        try:
+            gh_df = load_db_github(st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
+            if gh_df is not None:
+                df = process_legacy_columns(gh_df)
+        except Exception:
+            pass
+
+    # 策略 C: 本地 CSV 讀取防呆
+    if df.empty and os.path.exists(filename):
+        try:
+            df = pd.read_csv(filename)
+            if 'League' in df.columns and 'Tournament_Name' not in df.columns:
+                df['Tournament_Name'] = df['League']
+                df['Tournament_Category'] = CATEGORY_OPTIONS[0]
+            df = process_legacy_columns(df)
+        except Exception:
+            pass
+            
+    if df.empty:
+        df = pd.DataFrame(columns=columns)
+        
+    df = enforce_columns(df, columns)
+    for col in string_cols:
+        if col in df.columns: df[col] = df[col].astype('object')
+        
+    return df
+
+def save_db(df, filename, table_name):
+    if HAS_SQLALCHEMY and "DB_URL" in st.secrets and st.secrets["DB_URL"]:
+        try:
+            engine = create_engine(st.secrets["DB_URL"])
+            df_to_db = df.copy()
+            for col in df_to_db.columns:
+                if df_to_db[col].dtype == 'object':
+                    df_to_db[col] = df_to_db[col].apply(lambda x: str(x) if pd.notna(x) else None)
+            df_to_db.to_sql(table_name, engine, if_exists='replace', index=False)
+        except Exception:
+            pass
+
+    if "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
+        try:
+            save_db_github(df, st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
+        except Exception:
+            pass
+
+    try:
+        df.to_csv(filename, index=False)
+    except Exception:
+        pass
+
+# ==========================================
+# 1.5 自動化抓取 API 模組 (Auto-Scraper)
+# ==========================================
+def fetch_api_data(url):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            return response.json()
+        return None
+    except Exception:
+        return None
+
+def get_match_odds(match_id):
+    url = f"[https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/](https://tipsme-web.azurewebsites.net/api/Score/odds/hkjc/){match_id}"
+    return fetch_api_data(url)
+
+def get_match_fixtures(match_id):
+    url = f"[https://tipsme-web.azurewebsites.net/api/Score/fixtures/](https://tipsme-web.azurewebsites.net/api/Score/fixtures/){match_id}"
+    return fetch_api_data(url)
+
+def extract_odds_history(odds_data):
+    new_history = []
+    row_id = 0
+    
+    def parse_line(line_str):
+        try:
+            line_str = str(line_str).replace('[', '').replace(']', '').replace('球', '')
+            if '/' in line_str:
+                parts = line_str.split('/')
+                return (float(parts[0]) + float(parts[1])) / 2
+            return float(line_str)
+        except:
+            return 0.0
+            
+    def parse_odds_val(val):
+        try:
+            clean_val = re.sub(r'[^\d\.]', '', str(val))
+            return float(clean_val)
+        except:
+            return 1.90
+            
+    def get_odds(item, keys, default=1.90):
+        for k in keys:
+            if k in item and item[k] is not None:
+                return parse_odds_val(item[k])
+        return default
+
+    mapping = {
+        "讓球": ["letting", "hdc", "ah", "handicap", "讓球"],
+        "入球大小": ["ou", "hil", "overunder", "入球大細", "入球大小"],
+        "角球大小": ["corner", "chl", "corners", "角球大細", "角球大小"]
+    }
+    
+    upper_keys = ['h', 'home', 'homeOdds', 'up', 'upper', 'over', 'overOdds', 'high', '大', '主']
+    lower_keys = ['a', 'away', 'awayOdds', 'low', 'lower', 'under', 'underOdds', '小', '客', 'l']
+    line_keys = ['line', 'goal', 'p', '盤', 'handicap']
+
+    for bet_type_cn, possible_keys in mapping.items():
+        target_data = []
+        if isinstance(odds_data, dict):
+            for k in possible_keys:
+                if k in odds_data:
+                    target_data = odds_data[k]
+                    break
+        elif isinstance(odds_data, list):
+            for item in odds_data:
+                if isinstance(item, dict):
+                    t = item.get('type', '').lower()
+                    if any(pk.lower() in t for pk in possible_keys):
+                        target_data = item.get('history', [item])
+                        break
+                        
+        if isinstance(target_data, dict):
+            if 'history' in target_data:
+                target_data = target_data['history']
+            elif 'odds' in target_data:
+                target_data = target_data['odds']
+            else:
+                target_data = [target_data]
+                
+        if isinstance(target_data, list):
+            if len(target_data) > 12:
+                step = len(target_data) // 10
+                target_data = [target_data[0]] + target_data[1:-1:step] + [target_data[-1]]
+                
+            for item in target_data:
+                if not isinstance(item, dict): continue
+                
+                line_val = 0.0
+                for lk in line_keys:
+                    if lk in item:
+                        line_val = item[lk]
+                        break
+                line = parse_line(line_val)
+                
+                upper = get_odds(item, upper_keys, 1.90)
+                lower = get_odds(item, lower_keys, 1.90)
+                
+                if upper != 1.90 or lower != 1.90 or line != 0.0: 
+                    new_history.append({
+                        "id": row_id, "type": bet_type_cn, "record_time": "", "line": line,
+                        "upper": upper, "lower": lower, "unlock": True, "margin": 1.085
+                    })
+                    row_id += 1
+                    
+    return new_history
+
+def parse_and_fill_inplay(match_id):
+    data = get_match_fixtures(match_id)
+    odds_data = get_match_odds(match_id)
+    
+    success = False
+    
+    if data and "teamStats" in data:
+        team_stats_ft = data["teamStats"].get("ft", {})
+        if team_stats_ft:
+            goals = team_stats_ft.get("1", [0, 0])
+            st.session_state.edit_h_g = int(goals[0])
+            st.session_state.edit_a_g = int(goals[1])
+            
+            corners = team_stats_ft.get("2", [0, 0])
+            st.session_state.edit_h_c = int(corners[0])
+            st.session_state.edit_a_c = int(corners[1])
+            
+            red_cards = team_stats_ft.get("4", [0, 0])
+            st.session_state.edit_h_red = int(red_cards[0])
+            st.session_state.edit_a_red = int(red_cards[1])
+            
+            sot = team_stats_ft.get("21", [0, 0])
+            st.session_state.edit_h_sot = int(sot[0])
+            st.session_state.edit_a_sot = int(sot[1])
+            
+            poss = team_stats_ft.get("25", [50, 50])
+            st.session_state.edit_h_poss = int(poss[0])
+            success = True
+            
+    if odds_data:
+        new_history = extract_odds_history(odds_data)
+        if new_history:
+            st.session_state.inplay_odds_history = new_history
+            success = True
+            
+    return success
+
+# ==========================================
+# 2. 資金、風控與累計算式
+# ==========================================
+def recalculate_bankroll_from_scratch(df_cap, df_db):
+    if df_cap.empty:
+        sys_dep = sys_wit = usr_dep = usr_wit = 0.0
+    else:
+        sys_cap = df_cap[df_cap['Account'].isin(['System', 'Both'])]
+        usr_cap = df_cap[df_cap['Account'].isin(['User', 'Both'])]
+
+        sys_dep = pd.to_numeric(sys_cap[sys_cap['Type'] == 'Deposit']['Amount'], errors='coerce').sum()
+        sys_wit = pd.to_numeric(sys_cap[sys_cap['Type'] == 'Withdraw']['Amount'], errors='coerce').sum()
+        
+        usr_dep = pd.to_numeric(usr_cap[usr_cap['Type'] == 'Deposit']['Amount'], errors='coerce').sum()
+        usr_wit = pd.to_numeric(usr_cap[usr_cap['Type'] == 'Withdraw']['Amount'], errors='coerce').sum()
+    
+    sys_net = max(0.0, sys_dep - sys_wit)
+    usr_net = max(0.0, usr_dep - usr_wit)
+    
+    if df_db.empty:
+        sys_profit = user_profit = 0.0
+        sys_open = user_open = 0.0
+    else:
+        settled_df = df_db[df_db['Status'] == 'Settled']
+        open_df = df_db[df_db['Status'] == 'Open']
