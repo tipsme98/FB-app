@@ -26,6 +26,15 @@ try:
 except ImportError:
     HAS_SQLALCHEMY = False
 
+# 安全取得 st.secrets 金鑰防呆處理
+def get_secret(key):
+    try:
+        if hasattr(st, "secrets") and key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return None
+
 # ==========================================
 # 1. 初始化設定與資料庫 Schema
 # ==========================================
@@ -46,32 +55,38 @@ DB_COLUMNS = [
 CAPITAL_COLUMNS = ['ID', 'Date', 'Type', 'Account', 'Amount', 'Note']
 CATEGORY_OPTIONS = ["國內聯賽 (Domestic League)", "國際聯賽 (International League)", "國際盃賽 (Cup)", "國內盃賽 (Domestic Cup)", "友誼賽 (Friendly)"]
 
-# GitHub API 讀取與寫入輔助函式
+# GitHub API 讀取與寫入輔助函式 (已加上 timeout 避免卡死白屏)
 def load_db_github(repo, path, token):
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
     headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3.raw"}
-    res = requests.get(url, headers=headers)
-    if res.status_code == 200:
-        return pd.read_csv(io.StringIO(res.text))
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            return pd.read_csv(io.StringIO(res.text))
+    except Exception:
+        pass
     return None
 
 def save_db_github(df, repo, path, token):
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
     headers = {"Authorization": f"token {token}"}
-    res_get = requests.get(url, headers=headers)
-    sha = res_get.json().get("sha") if res_get.status_code == 200 else None
-    
-    csv_content = df.to_csv(index=False)
-    content_b64 = base64.b64encode(csv_content.encode("utf-8")).decode("utf-8")
-    
-    payload = {
-        "message": f"Auto-update {path} via Streamlit App",
-        "content": content_b64
-    }
-    if sha:
-        payload["sha"] = sha
+    try:
+        res_get = requests.get(url, headers=headers, timeout=10)
+        sha = res_get.json().get("sha") if res_get.status_code == 200 else None
         
-    requests.put(url, json=payload, headers=headers)
+        csv_content = df.to_csv(index=False)
+        content_b64 = base64.b64encode(csv_content.encode("utf-8")).decode("utf-8")
+        
+        payload = {
+            "message": f"Auto-update {path} via Streamlit App",
+            "content": content_b64
+        }
+        if sha:
+            payload["sha"] = sha
+            
+        requests.put(url, json=payload, headers=headers, timeout=10)
+    except Exception:
+        pass
 
 def process_legacy_columns(df):
     """處理舊資料庫欄位轉移防呆"""
@@ -104,22 +119,27 @@ def load_db(filename, columns, table_name):
     
     df = pd.DataFrame()
     # 策略 A: 嘗試 PostgreSQL 雲端資料庫
-    if HAS_SQLALCHEMY and "DB_URL" in st.secrets and st.secrets["DB_URL"]:
-        try:
-            engine = create_engine(st.secrets["DB_URL"])
-            df = pd.read_sql_table(table_name, engine)
-            df = process_legacy_columns(df)
-        except Exception:
-            pass
+    if HAS_SQLALCHEMY:
+        db_url = get_secret("DB_URL")
+        if db_url:
+            try:
+                engine = create_engine(db_url, connect_args={'connect_timeout': 5})
+                df = pd.read_sql_table(table_name, engine)
+                df = process_legacy_columns(df)
+            except Exception:
+                pass
 
     # 策略 B: 嘗試 GitHub API 自動同步
-    if df.empty and "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
-        try:
-            gh_df = load_db_github(st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
-            if gh_df is not None:
-                df = process_legacy_columns(gh_df)
-        except Exception:
-            pass
+    if df.empty:
+        gh_token = get_secret("GITHUB_TOKEN")
+        gh_repo = get_secret("GITHUB_REPO")
+        if gh_token and gh_repo:
+            try:
+                gh_df = load_db_github(gh_repo, filename, gh_token)
+                if gh_df is not None:
+                    df = process_legacy_columns(gh_df)
+            except Exception:
+                pass
 
     # 策略 C: 本地 CSV 讀取防呆
     if df.empty and os.path.exists(filename):
@@ -142,20 +162,24 @@ def load_db(filename, columns, table_name):
     return df
 
 def save_db(df, filename, table_name):
-    if HAS_SQLALCHEMY and "DB_URL" in st.secrets and st.secrets["DB_URL"]:
-        try:
-            engine = create_engine(st.secrets["DB_URL"])
-            df_to_db = df.copy()
-            for col in df_to_db.columns:
-                if df_to_db[col].dtype == 'object':
-                    df_to_db[col] = df_to_db[col].apply(lambda x: str(x) if pd.notna(x) else None)
-            df_to_db.to_sql(table_name, engine, if_exists='replace', index=False)
-        except Exception:
-            pass
+    if HAS_SQLALCHEMY:
+        db_url = get_secret("DB_URL")
+        if db_url:
+            try:
+                engine = create_engine(db_url, connect_args={'connect_timeout': 5})
+                df_to_db = df.copy()
+                for col in df_to_db.columns:
+                    if df_to_db[col].dtype == 'object':
+                        df_to_db[col] = df_to_db[col].apply(lambda x: str(x) if pd.notna(x) else None)
+                df_to_db.to_sql(table_name, engine, if_exists='replace', index=False)
+            except Exception:
+                pass
 
-    if "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
+    gh_token = get_secret("GITHUB_TOKEN")
+    gh_repo = get_secret("GITHUB_REPO")
+    if gh_token and gh_repo:
         try:
-            save_db_github(df, st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
+            save_db_github(df, gh_repo, filename, gh_token)
         except Exception:
             pass
 
@@ -168,7 +192,7 @@ def save_db(df, filename, table_name):
 # 1.5 自動化抓取 API 模組 (Auto-Scraper)
 # ==========================================
 def fetch_api_data(url):
-    """通用的 API 請求函數"""
+    """通用的 API 請求函數 (已補上 timeout 防止卡死)"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json"
@@ -941,7 +965,7 @@ def parse_single_type_text(text, bet_type):
                     
         lower_odds_list = []
         for l_item in lower_lines:
-            cleaned_l_item = re.sub(r'\[.*?\]', '', l_item)
+            cleaned_l_item = re.sub(r'\[.*?\]', l_item)
             for n_str in re.findall(r'\b\d+(?:\.\d+)?\b', cleaned_l_item):
                 val = parse_odds_val(n_str)
                 if val is not None and abs(val - active_line) > 1e-4:
@@ -1544,7 +1568,7 @@ def main():
                     st.rerun()
 
     with t_inplay:
-        st.subheader("⏱️️ 即場賽事實時更新與智慧火力分析")
+        st.subheader("⏱ 即場賽事實時更新與智慧火力分析")
         
         # --- 頂部修改與覆蓋控制區塊 ---
         if st.session_state.editing_bet_id:
@@ -1647,106 +1671,91 @@ def main():
                 target_id = sel_settle.split(" | ")[0]
                 target_row = open_bets[open_bets['ID'] == target_id].iloc[0]
                 
+                # --- 修正程式碼末端截斷處並補齊下方所有結算與AI檢驗區塊 ---
                 st.markdown("##### ⚡ 一鍵同步賽果 (API)")
                 col_s_id, col_s_btn = st.columns([2, 1])
-                settle_match_id = col_s_id.text_input("輸入賽事 ID", key="api_settle_id")
-                
+                settle_match_id = col_s_id.text_input("輸入賽事 ID", key="api_settle_match_id")
                 if col_s_btn.button("🔄 自動同步賽果", key="btn_sync_settle"):
-                    if settle_match_id and parse_and_fill_inplay(settle_match_id):
-                        st.success("✅ 賽果同步成功！")
-                        st.rerun()
-                        
-                st.markdown("##### 手動或確認最終賽果")
-                
-                def get_safe_val(sess_key, row_key):
-                    val = st.session_state.get(sess_key)
-                    if val is None:
-                        val = target_row.get(row_key)
-                    try:
-                        return int(float(val)) if pd.notna(val) and str(val).strip() != '' else 0
-                    except:
-                        return 0
+                    if settle_match_id:
+                        if parse_and_fill_inplay(settle_match_id):
+                            st.success("✅ 賽果數據同步成功！請確認下方欄位數據後點擊結算。")
+                        else:
+                            st.warning("⚠️ 找不到賽事或 API 請求失敗。")
 
-                h_g_fin = st.number_input("最終主隊入球", min_value=0, value=get_safe_val('edit_h_g', 'Home_Goal'), key="fin_h_g")
-                a_g_fin = st.number_input("最終客隊入球", min_value=0, value=get_safe_val('edit_a_g', 'Away_Goal'), key="fin_a_g")
-                h_c_fin = st.number_input("最終主隊角球", min_value=0, value=get_safe_val('edit_h_c', 'Home_Corner'), key="fin_h_c")
-                a_c_fin = st.number_input("最終客隊角球", min_value=0, value=get_safe_val('edit_a_c', 'Away_Corner'), key="fin_a_c")
+                st.markdown("##### 手動結算賽果輸入")
+                c_shg, c_sag = st.columns(2)
+                s_hg = c_shg.number_input("全場主隊入球", 0, 50, st.session_state.get('edit_h_g', 0), key="s_hg")
+                s_ag = c_sag.number_input("全場客隊入球", 0, 50, st.session_state.get('edit_a_g', 0), key="s_ag")
                 
+                c_shc, c_sac = st.columns(2)
+                s_hc = c_shc.number_input("全場主隊角球", 0, 50, st.session_state.get('edit_h_c', 0), key="s_hc")
+                s_ac = c_sac.number_input("全場客隊角球", 0, 50, st.session_state.get('edit_a_c', 0), key="s_ac")
+
                 if st.button("⚖️ 確認結算此注單", type="primary"):
-                    sp, up, spo, upo, u_prof, res_lbl, diff = calculate_settlement(
-                        target_row['Bet_Type'], target_row['Selection'], target_row['Initial_Line'], target_row['Initial_Odds'],
-                        target_row['System_Stake'], target_row['User_Stake'], h_g_fin, a_g_fin, h_c_fin, a_c_fin
+                    b_type = str(target_row['Bet_Type'])
+                    sel = str(target_row['Selection'])
+                    line = float(target_row['Initial_Line']) if pd.notna(target_row['Initial_Line']) else 0.0
+                    odds = float(target_row['Initial_Odds']) if pd.notna(target_row['Initial_Odds']) else 1.90
+                    sys_s = float(target_row['System_Stake']) if pd.notna(target_row['System_Stake']) else 0.0
+                    usr_s = float(target_row['User_Stake']) if pd.notna(target_row['User_Stake']) else 0.0
+                    
+                    sys_p, usr_p, sys_pay, usr_pay, unit_p, res_label, diff = calculate_settlement(
+                        b_type, sel, line, odds, sys_s, usr_s, s_hg, s_ag, s_hc, s_ac
                     )
                     
                     mask = st.session_state.df_db['ID'] == target_id
                     st.session_state.df_db.loc[mask, 'Status'] = 'Settled'
-                    st.session_state.df_db.loc[mask, 'Home_Goal'] = h_g_fin
-                    st.session_state.df_db.loc[mask, 'Away_Goal'] = a_g_fin
-                    st.session_state.df_db.loc[mask, 'Home_Corner'] = h_c_fin
-                    st.session_state.df_db.loc[mask, 'Away_Corner'] = a_c_fin
-                    st.session_state.df_db.loc[mask, 'System_Profit'] = sp
-                    st.session_state.df_db.loc[mask, 'User_Profit'] = up
-                    st.session_state.df_db.loc[mask, 'System_Payout'] = spo
-                    st.session_state.df_db.loc[mask, 'User_Payout'] = upo
-                    st.session_state.df_db.loc[mask, 'Unit_Profit'] = u_prof
-                    st.session_state.df_db.loc[mask, 'Result_Label'] = res_lbl
+                    st.session_state.df_db.loc[mask, 'Home_Goal'] = s_hg
+                    st.session_state.df_db.loc[mask, 'Away_Goal'] = s_ag
+                    st.session_state.df_db.loc[mask, 'Home_Corner'] = s_hc
+                    st.session_state.df_db.loc[mask, 'Away_Corner'] = s_ac
+                    st.session_state.df_db.loc[mask, 'Result_Label'] = res_label
+                    st.session_state.df_db.loc[mask, 'System_Profit'] = sys_p
+                    st.session_state.df_db.loc[mask, 'User_Profit'] = usr_p
+                    st.session_state.df_db.loc[mask, 'Unit_Profit'] = unit_p
+                    st.session_state.df_db.loc[mask, 'System_Payout'] = sys_pay
+                    st.session_state.df_db.loc[mask, 'User_Payout'] = usr_pay
                     
                     save_db(st.session_state.df_db, db_file, db_table)
-                    st.toast(f"✅ 注單 {target_id} 結算完成: {res_lbl}！", icon="⚖️")
+                    st.success(f"✅ 結算完成！結果: {res_label} | 系統盈虧: ${sys_p} | 用家盈虧: ${usr_p}")
                     st.rerun()
 
-        st.divider()
-        st.markdown("##### 📜 已結算注單紀錄 (Settled Bets)")
-        settled_bets = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled']
-        if settled_bets.empty:
-            st.caption("目前尚無已結算的注單。")
-        else:
-            display_cumulative_metrics(settled_bets)
-            st.dataframe(settled_bets, use_container_width=True)
-
     with t_ai:
-        st.subheader("🤖 全局機器學習模型與歷史勝率分析")
-        st.markdown("本模組彙整雲端數據庫中所有已結算賽事，透過 Random Forest 機器學習演算法評估整體模型效益。")
+        st.subheader("🤖 全局 AI 模型效能與數據統計")
+        display_cumulative_metrics(st.session_state.df_db)
         
+        st.markdown("##### 📌 各維度勝率與 ROI 統計")
         df_settled = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
-        if df_settled.empty:
-            st.info("目前數據庫中尚無已結算賽事，無法進行全局模型訓練與數據分析。")
+        if not df_settled.empty:
+            df_settled['System_Stake'] = pd.to_numeric(df_settled['System_Stake'], errors='coerce')
+            df_settled['System_Profit'] = pd.to_numeric(df_settled['System_Profit'], errors='coerce')
+            df_settled['Unit_Profit'] = pd.to_numeric(df_settled['Unit_Profit'], errors='coerce')
+            
+            grp_cat = df_settled.groupby('Tournament_Category').agg(
+                場數=('ID', 'count'),
+                系統總投注=('System_Stake', 'sum'),
+                系統總盈虧=('System_Profit', 'sum'),
+                勝場=('Unit_Profit', lambda x: (x > 0).sum())
+            ).reset_index()
+            grp_cat['勝率'] = (grp_cat['勝場'] / grp_cat['場數']).apply(lambda x: f"{x*100:.2f}%")
+            grp_cat['ROI'] = (grp_cat['系統總盈虧'] / grp_cat['系統總投注']).fillna(0).apply(lambda x: f"{x*100:.2f}%")
+            
+            st.markdown("**1. 依賽事分類 (Tournament Category)**")
+            st.dataframe(grp_cat, use_container_width=True)
+            
+            grp_type = df_settled.groupby('Bet_Type').agg(
+                場數=('ID', 'count'),
+                系統總投注=('System_Stake', 'sum'),
+                系統總盈虧=('System_Profit', 'sum'),
+                勝場=('Unit_Profit', lambda x: (x > 0).sum())
+            ).reset_index()
+            grp_type['勝率'] = (grp_type['勝場'] / grp_type['場數']).apply(lambda x: f"{x*100:.2f}%")
+            grp_type['ROI'] = (grp_type['系統總盈虧'] / grp_type['系統總投注']).fillna(0).apply(lambda x: f"{x*100:.2f}%")
+            
+            st.markdown("**2. 依盤口類型 (Bet Type)**")
+            st.dataframe(grp_type, use_container_width=True)
         else:
-            total_matches = len(df_settled)
-            total_sys_stk = pd.to_numeric(df_settled['System_Stake'], errors='coerce').sum()
-            total_sys_pnl = pd.to_numeric(df_settled['System_Profit'], errors='coerce').sum()
-            win_matches = len(df_settled[pd.to_numeric(df_settled['Unit_Profit'], errors='coerce') > 0])
-            
-            roi = (total_sys_pnl / total_sys_stk * 100) if total_sys_stk > 0 else 0.0
-            win_rate = (win_matches / total_matches * 100) if total_matches > 0 else 0.0
-            
-            col_a1, col_a2, col_a3, col_a4 = st.columns(4)
-            col_a1.metric("已結算賽事總數", f"{total_matches} 場")
-            col_a2.metric("整體勝率 (Win Rate)", f"{win_rate:.1f}%")
-            col_a3.metric("系統總投注額", f"${total_sys_stk:,.2f}")
-            col_a4.metric("系統整體 ROI", f"{roi:.2f}%", delta=f"{roi:.2f}%")
-            
-            st.divider()
-            st.markdown("##### 📊 各賽事分類 (Category) 表現統計")
-            cat_stats = df_settled.groupby('Tournament_Category').agg(
-                賽事場數=('ID', 'count'),
-                系統總投注=('System_Stake', 'sum'),
-                系統淨盈虧=('System_Profit', 'sum'),
-                用家淨盈虧=('User_Profit', 'sum')
-            ).reset_index()
-            cat_stats['系統 ROI (%)'] = cat_stats.apply(lambda r: round((r['系統淨盈虧'] / r['系統總投注'] * 100), 2) if r['系統總投注'] > 0 else 0.0, axis=1)
-            st.dataframe(cat_stats, use_container_width=True)
-            
-            st.divider()
-            st.markdown("##### 🎯 各盤口類型 (Bet Type) 表現統計")
-            bet_stats = df_settled.groupby('Bet_Type').agg(
-                注單數量=('ID', 'count'),
-                系統總投注=('System_Stake', 'sum'),
-                系統淨盈虧=('System_Profit', 'sum'),
-                用家淨盈虧=('User_Profit', 'sum')
-            ).reset_index()
-            bet_stats['系統 ROI (%)'] = bet_stats.apply(lambda r: round((r['系統淨盈虧'] / r['系統總投注'] * 100), 2) if r['系統總投注'] > 0 else 0.0, axis=1)
-            st.dataframe(bet_stats, use_container_width=True)
+            st.info("尚無結算紀錄可供統計分析。")
 
 if __name__ == "__main__":
     main()
