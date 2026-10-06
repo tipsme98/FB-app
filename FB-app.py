@@ -1587,7 +1587,7 @@ def main():
             for _, row in open_bets_settle.iterrows():
                 with st.container():
                     st.markdown(f"**ID**: `{row['ID']}` | **賽事**: `{row['Match']}` | **盤口**: `{row['Bet_Type']} ({row['Selection']})` @ `{row['Initial_Odds']}` (線: {row['Initial_Line']})")
-                    st.caption(f"系統注碼: ${row['System_Stake']:,.2f} \vert{} 用家注碼: ${row['User_Stake']:,.2f}")
+                    st.caption(f"系統注碼: ${row['System_Stake']:,.2f} \{vert} 用家注碼: ${row['User_Stake']:,.2f}")
                     
                     c_hg, c_ag, c_hc, c_ac = st.columns(4)
                     res_hg = c_hg.number_input("主隊全場入球", 0, 20, int(row.get('Home_Goal', 0)), key=f"s_hg_{row['ID']}")
