@@ -46,6 +46,7 @@ DB_COLUMNS = [
     'Home_Red', 'Away_Red', 'Home_Sub', 'Away_Sub', 'Home_Possession', 'Away_Possession',
     'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner', 
     'Home_Goal_Conversion', 'Away_Goal_Conversion', 'Home_Firepower', 'Away_Firepower',
+    'Home_Corner_Eff', 'Away_Corner_Eff',
     'Result_Label', 'System_Profit', 'User_Profit', 'Unit_Profit', 'System_Payout', 'User_Payout'
 ]
 CAPITAL_COLUMNS = ['ID', 'Date', 'Type', 'Account', 'Amount', 'Note']
@@ -980,6 +981,105 @@ def calc_suggested_stake(cand, sys_bankroll, sys_max_stake):
     return suggested_stake, raw_stake
 
 # ==========================================
+# 5.5 即場投注輔助函式 (賠率連動與機率計算)
+# ==========================================
+MARGIN_CONST = 1.085
+
+def _calc_lower_from_upper(upper, margin=MARGIN_CONST):
+    """根據馬會抽水公式由大賠率算小賠率: 1 / (margin - 1/大賠率)"""
+    if upper and upper > 1.0:
+        denom = margin - 1.0 / upper
+        if denom > 0:
+            return round(1.0 / denom, 2)
+    return 1.90
+
+def auto_calc_lower(prefix):
+    """當大/上賠率變動時，自動計算小/下賠率並重設手動旗標"""
+    upper = st.session_state.get(f"{prefix}_upper", 1.90)
+    st.session_state[f"{prefix}_lower"] = _calc_lower_from_upper(upper)
+    st.session_state[f"{prefix}_manual"] = False
+
+def mark_manual_lower(prefix):
+    """當小/下賠率被手動修改時，標記為手動模式"""
+    st.session_state[f"{prefix}_manual"] = True
+
+def calc_live_margin_str(upper, lower):
+    """計算抽水百分比字串"""
+    try:
+        if upper > 0 and lower > 0:
+            margin = (1.0 / upper) + (1.0 / lower)
+            pct = (margin - 1.0) * 100.0
+            return f"{pct:.2f}% (margin: {margin:.3f})"
+        return "8.50% (margin: 1.085)"
+    except:
+        return "8.50% (margin: 1.085)"
+
+def calc_inplay_base_prob(bet_type, selection, line, h_g, a_g, h_c, a_c, ip_minute, h_firepower, a_firepower, h_corner_eff, a_corner_eff):
+    """結合剩餘時間與攻勢危險度計算即場調整後的基礎機率"""
+    remaining_min = max(0, 90 - ip_minute)
+    time_factor = remaining_min / 90.0
+
+    if bet_type == "讓球":
+        if selection == "Home":
+            current_diff = h_g + line - a_g
+            if current_diff > 0:
+                base = 0.7 + min(0.2, current_diff * 0.05)
+            elif current_diff == 0:
+                base = 0.5
+            else:
+                base = 0.3 - min(0.2, abs(current_diff) * 0.05)
+            base += (h_firepower - a_firepower) * 0.0003 * time_factor
+        else:
+            current_diff = a_g - line - h_g
+            if current_diff > 0:
+                base = 0.7 + min(0.2, current_diff * 0.05)
+            elif current_diff == 0:
+                base = 0.5
+            else:
+                base = 0.3 - min(0.2, abs(current_diff) * 0.05)
+            base += (a_firepower - h_firepower) * 0.0003 * time_factor
+    elif bet_type == "入球大小":
+        total_goals = h_g + a_g
+        total_firepower = h_firepower + a_firepower
+        if selection == "Over":
+            if total_goals > line:
+                base = 0.95
+            else:
+                gap = line - total_goals
+                scoring_rate = min(1.0, total_firepower / 100.0)
+                base = min(0.85, 0.3 + scoring_rate * time_factor * 0.5 - gap * 0.1)
+        else:
+            if total_goals > line:
+                base = 0.05
+            else:
+                gap = line - total_goals
+                scoring_rate = min(1.0, total_firepower / 100.0)
+                over_prob = min(0.85, 0.3 + scoring_rate * time_factor * 0.5 - gap * 0.1)
+                base = 1 - over_prob
+    elif bet_type == "角球大小":
+        total_corners = h_c + a_c
+        total_corner_eff = h_corner_eff + a_corner_eff
+        if selection == "Over":
+            if total_corners > line:
+                base = 0.95
+            else:
+                gap = line - total_corners
+                corner_rate = min(1.0, total_corner_eff / 100.0)
+                base = min(0.85, 0.3 + corner_rate * time_factor * 0.5 - gap * 0.08)
+        else:
+            if total_corners > line:
+                base = 0.05
+            else:
+                gap = line - total_corners
+                corner_rate = min(1.0, total_corner_eff / 100.0)
+                over_prob = min(0.85, 0.3 + corner_rate * time_factor * 0.5 - gap * 0.08)
+                base = 1 - over_prob
+    else:
+        base = 0.5
+
+    return max(0.05, min(0.95, base))
+
+# ==========================================
 # 6. 主程式 UI 
 # ==========================================
 def main():
@@ -1498,6 +1598,9 @@ def main():
                 h_firepower = (h_total_shots / h_da * 100.0) if h_da > 0 else 0.0
                 a_firepower = (a_total_shots / a_da * 100.0) if a_da > 0 else 0.0
 
+                h_corner_eff = (h_c / h_da * 100.0) if h_da > 0 else 0.0
+                a_corner_eff = (a_c / a_da * 100.0) if a_da > 0 else 0.0
+
                 h_efficiency = (h_firepower / h_poss * 100.0) if h_poss > 0 else 0.0
                 a_efficiency = (a_firepower / a_poss * 100.0) if a_poss > 0 else 0.0
 
@@ -1507,11 +1610,13 @@ def main():
                     st.markdown("**🏠 主隊 (Home Team)**")
                     st.metric("射球命中率", f"{h_conversion:.2f}%", help="入球數量 / (射正次數 + 射偏次數) * 100%")
                     st.metric("進攻火力", f"{h_firepower:.2f}%", help="(射正次數 + 射偏次數) / 危險進攻次數 * 100%")
+                    st.metric("進攻產生角球效率", f"{h_corner_eff:.2f}%", help="角球數量 / 危險進攻數量 * 100%")
                     st.metric("實際進攻效率", f"{h_efficiency:.2f}%", help="進攻火力 / 控球率 * 100%")
                 with m_col2:
                     st.markdown("**✈️ 客隊 (Away Team)**")
                     st.metric("射球命中率", f"{a_conversion:.2f}%", help="入球數量 / (射正次數 + 射偏次數) * 100%")
                     st.metric("進攻火力", f"{a_firepower:.2f}%", help="(射正次數 + 射偏次數) / 危險進攻次數 * 100%")
+                    st.metric("進攻產生角球效率", f"{a_corner_eff:.2f}%", help="角球數量 / 危險進攻數量 * 100%")
                     st.metric("實際進攻效率", f"{a_efficiency:.2f}%", help="進攻火力 / 控球率 * 100%")
 
                 if st.button("💾 儲存實時賽況至此比賽的所有注單", type="primary", use_container_width=True):
@@ -1535,10 +1640,283 @@ def main():
                     st.session_state.df_db.loc[mask, 'Away_Goal_Conversion'] = round(a_conversion, 2)
                     st.session_state.df_db.loc[mask, 'Home_Firepower'] = round(h_firepower, 2)
                     st.session_state.df_db.loc[mask, 'Away_Firepower'] = round(a_firepower, 2)
+                    st.session_state.df_db.loc[mask, 'Home_Corner_Eff'] = round(h_corner_eff, 2)
+                    st.session_state.df_db.loc[mask, 'Away_Corner_Eff'] = round(a_corner_eff, 2)
                     
                     save_db(st.session_state.df_db, db_file, db_table)
                     st.toast(f"✅ 已成功更新『{selected_match}』共 {mask.sum()} 筆注單的即場數據！", icon="💾")
                     st.rerun()
+
+                # ==========================================
+                # 3. 即場投注 (Live Betting) — 賠率連動與手動/自動切換
+                # ==========================================
+                st.markdown("---")
+                st.markdown("##### 3. 即場投注 (Live Betting)")
+                st.caption("💡 當您輸入或修改「大/上賠率」後，系統自動依馬會抽水公式 (Margin=1.085) 計算「小/下賠率」。如需覆蓋，直接修改「小/下賠率」即可，系統將以手動值為準並更新抽水。")
+
+                # --- 初始化即場投注 session_state ---
+                _ip_prefixes = ["ip_hd", "ip_ou", "ip_cr"]
+                _ip_defaults = {
+                    "ip_hd": {"line": 0.0, "upper": 1.90},
+                    "ip_ou": {"line": 2.5, "upper": 1.90},
+                    "ip_cr": {"line": 9.5, "upper": 1.90},
+                }
+                for _pf in _ip_prefixes:
+                    if f"{_pf}_line" not in st.session_state:
+                        st.session_state[f"{_pf}_line"] = _ip_defaults[_pf]["line"]
+                    if f"{_pf}_upper" not in st.session_state:
+                        st.session_state[f"{_pf}_upper"] = _ip_defaults[_pf]["upper"]
+                    if f"{_pf}_lower" not in st.session_state:
+                        st.session_state[f"{_pf}_lower"] = _calc_lower_from_upper(_ip_defaults[_pf]["upper"])
+                    if f"{_pf}_manual" not in st.session_state:
+                        st.session_state[f"{_pf}_manual"] = False
+
+                bet_col1, bet_col2, bet_col3 = st.columns(3)
+
+                with bet_col1:
+                    st.markdown("**⚽ 讓球 (Handicap)**")
+                    ip_hd_line = st.number_input("讓球盤口線", min_value=-10.0, max_value=10.0, step=0.25, format="%.2f", key="ip_hd_line")
+                    ip_hd_upper = st.number_input("大/上賠率 (主隊)", min_value=1.01, max_value=100.0, step=0.01, format="%.2f", key="ip_hd_upper", on_change=auto_calc_lower, args=("ip_hd",))
+                    ip_hd_lower = st.number_input("小/下賠率 (客隊)", min_value=1.01, max_value=100.0, step=0.01, format="%.2f", key="ip_hd_lower", on_change=mark_manual_lower, args=("ip_hd",))
+                    _hd_mode = "手動" if st.session_state.ip_hd_manual else "自動"
+                    st.caption(f"抽水: {calc_live_margin_str(ip_hd_upper, ip_hd_lower)} [{_hd_mode}]")
+
+                with bet_col2:
+                    st.markdown("**⚽ 入球大小 (Goals O/U)**")
+                    ip_ou_line = st.number_input("入球大小盤口線", min_value=0.0, max_value=20.0, step=0.25, format="%.2f", key="ip_ou_line")
+                    ip_ou_upper = st.number_input("大賠率 (Over)", min_value=1.01, max_value=100.0, step=0.01, format="%.2f", key="ip_ou_upper", on_change=auto_calc_lower, args=("ip_ou",))
+                    ip_ou_lower = st.number_input("小賠率 (Under)", min_value=1.01, max_value=100.0, step=0.01, format="%.2f", key="ip_ou_lower", on_change=mark_manual_lower, args=("ip_ou",))
+                    _ou_mode = "手動" if st.session_state.ip_ou_manual else "自動"
+                    st.caption(f"抽水: {calc_live_margin_str(ip_ou_upper, ip_ou_lower)} [{_ou_mode}]")
+
+                with bet_col3:
+                    st.markdown("**⚽ 角球大小 (Corners O/U)**")
+                    ip_cr_line = st.number_input("角球盤口線", min_value=0.0, max_value=30.0, step=0.5, format="%.2f", key="ip_cr_line")
+                    ip_cr_upper = st.number_input("大賠率 (Over)", min_value=1.01, max_value=100.0, step=0.01, format="%.2f", key="ip_cr_upper", on_change=auto_calc_lower, args=("ip_cr",))
+                    ip_cr_lower = st.number_input("小賠率 (Under)", min_value=1.01, max_value=100.0, step=0.01, format="%.2f", key="ip_cr_lower", on_change=mark_manual_lower, args=("ip_cr",))
+                    _cr_mode = "手動" if st.session_state.ip_cr_manual else "自動"
+                    st.caption(f"抽水: {calc_live_margin_str(ip_cr_upper, ip_cr_lower)} [{_cr_mode}]")
+
+                # --- 即場數據分析執行 ---
+                if st.button("🚀 即場數據分析執行", type="primary", use_container_width=True, key="btn_inplay_analysis"):
+                    st.session_state.show_inplay_analysis = True
+
+                    # 取得比賽資料
+                    ip_last_row = matching_bets.iloc[-1]
+                    ip_t_name = str(ip_last_row.get('Tournament_Name', '')) if pd.notna(ip_last_row.get('Tournament_Name')) else ''
+                    ip_t_cat = str(ip_last_row.get('Tournament_Category', CATEGORY_OPTIONS[0])) if pd.notna(ip_last_row.get('Tournament_Category')) else CATEGORY_OPTIONS[0]
+                    ip_h_team = str(ip_last_row.get('Home_Team', '')) if pd.notna(ip_last_row.get('Home_Team')) else ''
+                    ip_a_team = str(ip_last_row.get('Away_Team', '')) if pd.notna(ip_last_row.get('Away_Team')) else ''
+                    ip_h_rating = str(ip_last_row.get('Home_Rating', 'C')) if pd.notna(ip_last_row.get('Home_Rating')) else 'C'
+                    ip_a_rating = str(ip_last_row.get('Away_Rating', 'C')) if pd.notna(ip_last_row.get('Away_Rating')) else 'C'
+                    ip_h_form = str(ip_last_row.get('Home_Form', '3W1D1L')) if pd.notna(ip_last_row.get('Home_Form')) else '3W1D1L'
+                    ip_a_form = str(ip_last_row.get('Away_Form', '2W2D1L')) if pd.notna(ip_last_row.get('Away_Form')) else '2W2D1L'
+
+                    _rating_map = {"S": 5, "A": 4, "B": 3, "C": 2, "D": 1}
+                    ip_hr_val = _rating_map.get(ip_h_rating, 3)
+                    ip_ar_val = _rating_map.get(ip_a_rating, 3)
+                    ip_h_data = {'hr': ip_hr_val, 'ar': ip_ar_val, 'hf': extract_form_points(ip_h_form), 'af': extract_form_points(ip_a_form)}
+
+                    # 建立即場候選盤口 (結合剩餘時間與攻勢危險度計算基礎機率)
+                    ip_candidates_base = []
+
+                    # 讓球
+                    _hd_line_str = f"{ip_hd_line:g}"
+                    _hd_p_home = calc_inplay_base_prob("讓球", "Home", ip_hd_line, h_g, a_g, h_c, a_c, ip_minute, h_firepower, a_firepower, h_corner_eff, a_corner_eff)
+                    _hd_p_away = calc_inplay_base_prob("讓球", "Away", ip_hd_line, h_g, a_g, h_c, a_c, ip_minute, h_firepower, a_firepower, h_corner_eff, a_corner_eff)
+                    if ip_hd_line <= 0:
+                        _hd_label_h, _hd_label_a = f"{_hd_line_str}主隊(上盤)", f"{_hd_line_str}客隊(下盤)"
+                    else:
+                        _hd_label_h, _hd_label_a = f"{_hd_line_str}主隊(下盤)", f"{_hd_line_str}客隊(上盤)"
+                    ip_candidates_base.extend([
+                        {'bet_type': '讓球', 'selection': 'Home', 'base_prob': _hd_p_home, 'odds': float(ip_hd_upper), 'line': float(ip_hd_line), 'label': _hd_label_h, 'history_idx': 0, 'record_time': get_hkt_now().strftime('%m-%d %H:%M')},
+                        {'bet_type': '讓球', 'selection': 'Away', 'base_prob': _hd_p_away, 'odds': float(ip_hd_lower), 'line': float(ip_hd_line), 'label': _hd_label_a, 'history_idx': 0, 'record_time': get_hkt_now().strftime('%m-%d %H:%M')},
+                    ])
+
+                    # 入球大小
+                    _ou_line_str = f"{ip_ou_line:g}"
+                    _ou_p_over = calc_inplay_base_prob("入球大小", "Over", ip_ou_line, h_g, a_g, h_c, a_c, ip_minute, h_firepower, a_firepower, h_corner_eff, a_corner_eff)
+                    _ou_p_under = calc_inplay_base_prob("入球大小", "Under", ip_ou_line, h_g, a_g, h_c, a_c, ip_minute, h_firepower, a_firepower, h_corner_eff, a_corner_eff)
+                    ip_candidates_base.extend([
+                        {'bet_type': '入球大小', 'selection': 'Over', 'base_prob': _ou_p_over, 'odds': float(ip_ou_upper), 'line': float(ip_ou_line), 'label': f"{_ou_line_str}大盤(Over)", 'history_idx': 1, 'record_time': get_hkt_now().strftime('%m-%d %H:%M')},
+                        {'bet_type': '入球大小', 'selection': 'Under', 'base_prob': _ou_p_under, 'odds': float(ip_ou_lower), 'line': float(ip_ou_line), 'label': f"{_ou_line_str}小盤(Under)", 'history_idx': 1, 'record_time': get_hkt_now().strftime('%m-%d %H:%M')},
+                    ])
+
+                    # 角球大小
+                    _cr_line_str = f"{ip_cr_line:g}"
+                    _cr_p_over = calc_inplay_base_prob("角球大小", "Over", ip_cr_line, h_g, a_g, h_c, a_c, ip_minute, h_firepower, a_firepower, h_corner_eff, a_corner_eff)
+                    _cr_p_under = calc_inplay_base_prob("角球大小", "Under", ip_cr_line, h_g, a_g, h_c, a_c, ip_minute, h_firepower, a_firepower, h_corner_eff, a_corner_eff)
+                    ip_candidates_base.extend([
+                        {'bet_type': '角球大小', 'selection': 'Over', 'base_prob': _cr_p_over, 'odds': float(ip_cr_upper), 'line': float(ip_cr_line), 'label': f"{_cr_line_str}大盤(Over)", 'history_idx': 2, 'record_time': get_hkt_now().strftime('%m-%d %H:%M')},
+                        {'bet_type': '角球大小', 'selection': 'Under', 'base_prob': _cr_p_under, 'odds': float(ip_cr_lower), 'line': float(ip_cr_line), 'label': f"{_cr_line_str}小盤(Under)", 'history_idx': 2, 'record_time': get_hkt_now().strftime('%m-%d %H:%M')},
+                    ])
+
+                    # 三維度分析
+                    df_settled_ip = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
+                    df_ip_micro = df_settled_ip[df_settled_ip['Tournament_Name'] == ip_t_name]
+                    df_ip_meso = df_settled_ip[df_settled_ip['Tournament_Category'] == ip_t_cat]
+                    df_ip_macro = df_settled_ip
+
+                    ip_res_micro = evaluate_dimension(df_ip_micro, "微觀 - 賽事名稱", ip_candidates_base, _rating_map, ip_h_data)
+                    ip_res_meso = evaluate_dimension(df_ip_meso, "中觀 - 賽事分類", ip_candidates_base, _rating_map, ip_h_data)
+                    ip_res_macro = evaluate_dimension(df_ip_macro, "宏觀 - 總數據", ip_candidates_base, _rating_map, ip_h_data)
+
+                    ip_valid_res = [r for r in [ip_res_micro, ip_res_meso, ip_res_macro] if r['valid']]
+                    ip_best_model = max(ip_valid_res, key=lambda x: x['score']) if ip_valid_res else ip_res_macro
+                    if not ip_valid_res:
+                        ip_best_model['msg'] = "所有維度樣本數不足，降級為純基礎期望值運算。"
+
+                    ip_best_bet = ip_best_model['best'] if 'best' in ip_best_model else ip_candidates_base[0]
+
+                    # 建立即場賠率歷史 JSON
+                    ip_odds_history = [
+                        {"id": 0, "type": "讓球", "record_time": get_hkt_now().strftime('%m-%d %H:%M'), "line": float(ip_hd_line), "upper": float(ip_hd_upper), "lower": float(ip_hd_lower), "unlock": True, "margin": round(1.0/ip_hd_upper + 1.0/ip_hd_lower, 3) if ip_hd_upper > 0 and ip_hd_lower > 0 else 1.085},
+                        {"id": 1, "type": "入球大小", "record_time": get_hkt_now().strftime('%m-%d %H:%M'), "line": float(ip_ou_line), "upper": float(ip_ou_upper), "lower": float(ip_ou_lower), "unlock": True, "margin": round(1.0/ip_ou_upper + 1.0/ip_ou_lower, 3) if ip_ou_upper > 0 and ip_ou_lower > 0 else 1.085},
+                        {"id": 2, "type": "角球大小", "record_time": get_hkt_now().strftime('%m-%d %H:%M'), "line": float(ip_cr_line), "upper": float(ip_cr_upper), "lower": float(ip_cr_lower), "unlock": True, "margin": round(1.0/ip_cr_upper + 1.0/ip_cr_lower, 3) if ip_cr_upper > 0 and ip_cr_lower > 0 else 1.085},
+                    ]
+
+                    st.session_state.inplay_analysis_result = {
+                        'micro': ip_res_micro, 'meso': ip_res_meso, 'macro': ip_res_macro,
+                        'best_model': ip_best_model, 'best_bet': ip_best_bet,
+                        't_name': ip_t_name, 't_cat': ip_t_cat,
+                        'h_team': ip_h_team, 'a_team': ip_a_team,
+                        'h_rating': ip_h_rating, 'a_rating': ip_a_rating,
+                        'h_form': ip_h_form, 'a_form': ip_a_form,
+                        'odds_history': ip_odds_history,
+                        'remaining_min': max(0, 90 - ip_minute),
+                    }
+
+                # --- 顯示即場分析結果 ---
+                if st.session_state.get('show_inplay_analysis', False):
+                    ip_res = st.session_state.inplay_analysis_result
+                    st.success("✅ 三維度即場數據分析與 EV 運算完成！")
+                    st.info(f"⏱ 剩餘比賽時間: {ip_res['remaining_min']} 分鐘 | 系統結合剩餘時間、進攻火力與角球效率計算即場期望值。")
+
+                    ip_c1, ip_c2, ip_c3 = st.columns(3)
+                    for col, r, title in zip([ip_c1, ip_c2, ip_c3], [ip_res['micro'], ip_res['meso'], ip_res['macro']], ["A. 微觀 (賽事名稱)", "B. 中觀 (賽事分類)", "C. 宏觀 (全局數據)"]):
+                        with col.container(border=True):
+                            st.markdown(f"**{title}**")
+                            if r['valid']:
+                                st.write(f"樣本數: `{r['n']}` 場")
+                                st.write(f"系統策略 ROI: `{r['roi']*100:.1f}%`")
+                                st.write(f"歷史勝率: `{r['acc']*100:.1f}%`")
+                            else:
+                                st.warning(r['msg'])
+
+                    ip_bm = ip_res['best_model']
+                    ip_bb = ip_res['best_bet']
+                    ip_dim_label_map = {"微觀 - 賽事名稱": "微觀", "中觀 - 賽事分類": "中觀", "宏觀 - 總數據": "宏觀"}
+                    ip_dim_short = ip_dim_label_map.get(ip_bm['dim'], "宏觀")
+
+                    st.markdown(f"### 🧠 AI 預測模型推薦 (即場)")
+                    st.info(f"系統分析顯示，針對『{ip_res['t_name']}』，採用『{ip_bm['dim']}』級別的模型進行運算，其歷史準確率與 EV 獲利期望值最高，故本次即場投注策略依據此模型生成。")
+
+                    st.markdown("#### 📊 所有盤口評估明細 (即場 EV 運算)")
+                    ip_cand_list = ip_bm.get('candidates', [])
+
+                    ip_all_options = []
+                    ip_option_map = {}
+
+                    if ip_cand_list:
+                        ip_df_show = pd.DataFrame(ip_cand_list)
+                        ip_df_show['推薦排序'] = range(1, len(ip_df_show) + 1)
+                        ip_df_show = ip_df_show[['推薦排序', 'bet_type', 'line', 'label', 'odds', 'prob', 'ev']]
+                        ip_df_show.columns = ['推薦排序', '盤口類型', '盤口線', '投注方向', '賠率', '預期勝率', '期望值 (EV)']
+                        ip_df_show['預期勝率'] = ip_df_show['預期勝率'].apply(lambda x: f"{x*100:.2f}%")
+                        ip_df_show['期望值 (EV)'] = ip_df_show['期望值 (EV)'].apply(lambda x: f"{x:.3f}")
+
+                        def _highlight_first_ip(row):
+                            if row.name == 0:
+                                return ['background-color: rgba(40, 167, 69, 0.2)'] * len(row)
+                            return [''] * len(row)
+
+                        st.dataframe(ip_df_show.style.apply(_highlight_first_ip, axis=1), use_container_width=True)
+
+                        for c in ip_cand_list:
+                            opt_str = f"【{c['bet_type']}】{c['label']} @ {c['odds']}"
+                            if opt_str not in ip_option_map:
+                                ip_all_options.append(opt_str)
+                                ip_option_map[opt_str] = c
+
+                    ip_mc1, ip_mc2, ip_mc3 = st.columns(3)
+                    ip_mc1.metric("💡 首選推薦", f"{ip_bb['bet_type']} - {ip_bb['label']}")
+                    ip_mc2.metric(f"🎯 預期勝率 ({ip_dim_short}修正)", f"{ip_bb.get('prob', ip_bb.get('base_prob',0))*100:.1f}%")
+                    ip_mc3.metric("📊 修正 EV", f"{ip_bb.get('ev', 0):.3f}")
+
+                    st.markdown("---")
+                    st.markdown("### 🎯 最終即場投注決策與注碼配置")
+
+                    ip_col_sys, ip_col_usr = st.columns(2)
+
+                    with ip_col_sys:
+                        st.markdown("#### 🤖 系統投注 (System)")
+                        st.caption("供模型學習及系統資金策略驗證使用。下注金額將自動從系統可用資金中扣除。")
+                        ip_default_sys = []
+                        if ip_cand_list:
+                            ip_best_c = ip_cand_list[0]
+                            if ip_best_c.get('ev', 0) > 0:
+                                for opt, c in ip_option_map.items():
+                                    if c['bet_type'] == ip_best_c['bet_type'] and abs(float(c['line']) - float(ip_best_c['line'])) < 1e-4 and c['selection'] == ip_best_c['selection']:
+                                        ip_default_sys.append(opt)
+                                        break
+
+                        ip_sys_selected = st.multiselect("選擇系統即場投注項目", ip_all_options, default=ip_default_sys, key="ip_sys_multi")
+                        ip_sys_stakes = {}
+                        for sel in ip_sys_selected:
+                            cand = ip_option_map[sel]
+                            sug_stk, raw_stk = calc_suggested_stake(cand, sys_bankroll, sys_max_stake)
+                            ip_sys_stakes[sel] = st.number_input(f"系統建議金額: {sel}", value=float(sug_stk), disabled=True, key=f"ip_s_stk_{sel}")
+                            if "讓球" in cand['bet_type'] and 0 < raw_stk < 200:
+                                if cand.get('ev', 0) >= 0.03 and cand.get('prob', 0) >= 0.50:
+                                    st.caption(f"💡 `{cand['bet_type']}` EV/勝率達標，系統自動升級最低注碼 $200")
+                                else:
+                                    st.caption(f"⚠ `{cand['bet_type']}` EV未達標，系統建議放棄 (注碼 $0)")
+
+                    with ip_col_usr:
+                        st.markdown("#### 👤 用家投注 (User)")
+                        st.caption("真實資金決策，不用於系統學習。下注金額將自動從用家可用資金中扣除。")
+                        ip_usr_selected = st.multiselect("選擇用家即場投注項目", ip_all_options, default=[], key="ip_usr_multi")
+                        ip_usr_stakes = {}
+                        for sel in ip_usr_selected:
+                            ip_usr_stakes[sel] = st.number_input(f"用家自訂金額 ($): {sel}", min_value=0.0, step=10.0, value=100.0, key=f"ip_u_stk_{sel}")
+
+                    st.write("")
+                    if st.button("✅ 確定即場投注並寫入雲端資料庫", type="primary", use_container_width=True, key="btn_submit_inplay"):
+                        ip_all_keys = set(ip_sys_selected + ip_usr_selected)
+                        if not ip_all_keys:
+                            st.warning("⚠️ 請至少在系統或用家選擇一項即場投注！")
+                        else:
+                            ip_new_records = []
+                            for i, sel in enumerate(ip_all_keys):
+                                cand = ip_option_map[sel]
+                                s_stk = ip_sys_stakes.get(sel, 0.0)
+                                u_stk = ip_usr_stakes.get(sel, 0.0)
+                                new_id = f"IP{get_hkt_now().strftime('%Y%m%d%H%M%S')}{i}"
+
+                                new_record = {
+                                    'ID': new_id, 'Date': get_hkt_now().strftime('%Y-%m-%d %H:%M'), 'Status': 'Open',
+                                    'Tournament_Name': ip_res['t_name'], 'Tournament_Category': ip_res['t_cat'],
+                                    'Match': f"{ip_res['h_team']} vs {ip_res['a_team']}", 'Home_Team': ip_res['h_team'], 'Away_Team': ip_res['a_team'],
+                                    'Home_Rating': ip_res['h_rating'], 'Away_Rating': ip_res['a_rating'], 'Home_Form': ip_res['h_form'], 'Away_Form': ip_res['a_form'],
+                                    'Bet_Type': f"{cand['bet_type']} (即場)", 'Selection': cand['selection'], 'Initial_Line': cand['line'], 'Initial_Odds': cand['odds'],
+                                    'System_Stake': s_stk, 'User_Stake': u_stk,
+                                    'Odds_History': json.dumps(ip_res['odds_history'], ensure_ascii=False),
+                                    'InPlay_Minute': ip_minute,
+                                    'Home_DA': h_da, 'Away_DA': a_da, 'Home_SoT': h_sot, 'Away_SoT': a_sot,
+                                    'Home_SoFF': h_soff, 'Away_SoFF': a_soff,
+                                    'Home_Red': h_red, 'Away_Red': a_red, 'Home_Possession': h_poss, 'Away_Possession': a_poss,
+                                    'Home_Goal': h_g, 'Away_Goal': a_g, 'Home_Corner': h_c, 'Away_Corner': a_c,
+                                    'Home_Goal_Conversion': round(h_conversion, 2), 'Away_Goal_Conversion': round(a_conversion, 2),
+                                    'Home_Firepower': round(h_firepower, 2), 'Away_Firepower': round(a_firepower, 2),
+                                    'Home_Corner_Eff': round(h_corner_eff, 2), 'Away_Corner_Eff': round(a_corner_eff, 2),
+                                }
+                                ip_new_records.append(new_record)
+
+                            st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame(ip_new_records)], ignore_index=True)
+                            save_db(st.session_state.df_db, db_file, db_table)
+                            st.toast("✅ 即場投注紀錄雲端同步成功！本金已從可用資金中扣除。", icon="⏱️")
+                            st.session_state.show_inplay_analysis = False
+                            st.rerun()
 
     with t_settle:
         st.subheader("⚖️ 賽果結算與派彩管理")
