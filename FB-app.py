@@ -709,7 +709,7 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
                 
                 if action['target'] == 'bets':
                     st.session_state.df_db = pd.concat([st.session_state.df_db, action['data']], ignore_index=True)
-                    save_db(st.session這是在保留所有現有功能的前提下, 為 `36dc0a0.py`[cite: 1] 補全並加入「系統單位利潤」與「用家單位利潤」的完整 `FB-app.py` 程式碼。
+                    save_db(st.session這是在保留所有現有功能的前提下，為 `36dc0a0.py`[cite: 1] 補全並加入「系統單位利潤」與「用家單位利潤」的完整 `FB-app.py` 程式碼。
 
 本次更新主要包含以下重點[cite: 1]：
 * **獨立單位利潤計算**：系統會自動根據 `System_Stake` 與 `User_Stake` 是否大於 0 來判定該注單的單位利潤歸屬，完美區分系統與用家。
