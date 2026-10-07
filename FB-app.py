@@ -38,7 +38,7 @@ st.set_page_config(page_title="Actuarial and fund management system by Dr. Edwin
 
 DB_COLUMNS = [
     'ID', 'Date', 'Status', 
-    'Tournament_Name', 'Tournament_Category', 'Match', 'Home_Team', 'Away_Team', 
+    'Tournament_Name', 'Tournament_Category', 'Match', 'Match_Date', 'Home_Team', 'Away_Team', 
     'Home_Rating', 'Away_Rating', 'Home_Form', 'Away_Form',
     'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 
     'System_Stake', 'User_Stake', 'Odds_History',
@@ -113,7 +113,7 @@ def enforce_columns(df, columns):
 def load_db(filename, columns, table_name, force_cloud=False):
     string_cols = [
         'ID', 'Date', 'Status', 'Tournament_Name', 'Tournament_Category', 
-        'Match', 'Home_Team', 'Away_Team', 'Home_Rating', 'Away_Rating', 
+        'Match', 'Match_Date', 'Home_Team', 'Away_Team', 'Home_Rating', 'Away_Rating', 
         'Home_Form', 'Away_Form', 'Bet_Type', 'Selection', 'Odds_History', 'Result_Label',
         'Type', 'Account', 'Note'
     ]
@@ -399,6 +399,12 @@ def load_bet_to_edit(bet_id):
     
     st.session_state.edit_t_name = str(row.get('Tournament_Name', '')) if pd.notna(row.get('Tournament_Name')) else ''
     st.session_state.edit_t_cat = str(row.get('Tournament_Category', CATEGORY_OPTIONS[0])) if pd.notna(row.get('Tournament_Category')) else CATEGORY_OPTIONS[0]
+    _match_date_str = get_row_match_date(row)
+    st.session_state.edit_match_date = _match_date_str
+    try:
+        st.session_state.match_date_input = datetime.strptime(_match_date_str, "%Y-%m-%d").date()
+    except:
+        st.session_state.match_date_input = get_hkt_now().date()
     st.session_state.edit_h_team = str(row.get('Home_Team', '')) if pd.notna(row.get('Home_Team')) else ''
     st.session_state.edit_a_team = str(row.get('Away_Team', '')) if pd.notna(row.get('Away_Team')) else ''
     st.session_state.edit_h_rating = str(row.get('Home_Rating', 'C')) if pd.notna(row.get('Home_Rating')) else 'C'
@@ -1080,6 +1086,230 @@ def calc_inplay_base_prob(bet_type, selection, line, h_g, a_g, h_c, a_c, ip_minu
     return max(0.05, min(0.95, base))
 
 # ==========================================
+# 5.6 時間維度盈虧分析輔助函式
+# ==========================================
+PERIOD_LABELS = {
+    'D': '每日',
+    'W': '每周',
+    'Q': '每季',
+    'Y': '每年',
+}
+PERIOD_FREQ = {
+    'D': 'D',
+    'W': 'W',
+    'Q': 'Q',
+    'Y': 'Y',
+}
+
+def get_row_match_date(row):
+    """安全取得比賽日期：Match_Date -> Date -> 今天"""
+    md = row.get('Match_Date', '')
+    if pd.notna(md) and str(md).strip():
+        return str(md)[:10]
+    dv = row.get('Date', '')
+    parsed = pd.to_datetime(dv, errors='coerce')
+    if pd.notna(parsed):
+        return parsed.strftime('%Y-%m-%d')
+    return get_hkt_now().strftime('%Y-%m-%d')
+
+def compute_period_pnl(df, profit_col, date_col='Match_Date', period='D'):
+    """按指定時間維度分組計算各期淨盈虧，回傳 DataFrame (period_label, total)
+    優先使用 Match_Date，舊資料無此欄位時退回 Date。"""
+    if df.empty:
+        return pd.DataFrame(columns=['period', profit_col])
+    tmp = df.copy()
+    # 優先使用 Match_Date，若不存在或為空則退回 Date
+    if date_col in tmp.columns:
+        tmp['_dt'] = pd.to_datetime(tmp[date_col], errors='coerce')
+        # 對於 Match_Date 為空的記錄，退回 Date
+        if 'Date' in tmp.columns:
+            date_fallback = pd.to_datetime(tmp['Date'], errors='coerce')
+            tmp['_dt'] = tmp['_dt'].fillna(date_fallback)
+    elif 'Date' in tmp.columns:
+        tmp['_dt'] = pd.to_datetime(tmp['Date'], errors='coerce')
+    else:
+        return pd.DataFrame(columns=['period', profit_col])
+    tmp = tmp.dropna(subset=['_dt'])
+    tmp[profit_col] = pd.to_numeric(tmp[profit_col], errors='coerce').fillna(0.0)
+    if tmp.empty:
+        return pd.DataFrame(columns=['period', profit_col])
+    freq = PERIOD_FREQ.get(period, 'D')
+    tmp['_period'] = tmp['_dt'].dt.to_period(freq).astype(str)
+    grouped = tmp.groupby('_period')[profit_col].sum().reset_index()
+    grouped.columns = ['period', profit_col]
+    grouped = grouped.sort_values('period').reset_index(drop=True)
+    return grouped
+
+def compute_period_pnl_table(df, sys_col='System_Profit', usr_col='User_Profit', date_col='Match_Date'):
+    """計算全部四個時間維度的系統與用家淨盈虧，回傳 dict"""
+    result = {}
+    for period in ['D', 'W', 'Q', 'Y']:
+        sys_df = compute_period_pnl(df, sys_col, date_col, period)
+        usr_df = compute_period_pnl(df, usr_col, date_col, period)
+        if not sys_df.empty:
+            sys_total = sys_df[sys_col].iloc[-1]  # 最新一期
+            sys_all = sys_df[sys_col].sum()
+        else:
+            sys_total = 0.0
+            sys_all = 0.0
+        if not usr_df.empty:
+            usr_total = usr_df[usr_col].iloc[-1]
+            usr_all = usr_df[usr_col].sum()
+        else:
+            usr_total = 0.0
+            usr_all = 0.0
+        result[period] = {
+            'sys_latest': round(float(sys_total), 2),
+            'usr_latest': round(float(usr_total), 2),
+            'sys_all': round(float(sys_all), 2),
+            'usr_all': round(float(usr_all), 2),
+            'sys_df': sys_df,
+            'usr_df': usr_df,
+        }
+    return result
+
+def render_pnl_chart_section(df_settled, key_prefix, title_prefix=""):
+    """渲染可選擇系列的盈虧折線圖區塊"""
+    if df_settled.empty:
+        return
+    
+    # 預先計算所有時間序列
+    series_data = {}
+    for period in ['D', 'W', 'Q', 'Y']:
+        sys_df = compute_period_pnl(df_settled, 'System_Profit', 'Match_Date', period)
+        usr_df = compute_period_pnl(df_settled, 'User_Profit', 'Match_Date', period)
+        if not sys_df.empty:
+            series_data[f"系統{PERIOD_LABELS[period]}盈虧"] = sys_df.set_index('period')['System_Profit']
+        if not usr_df.empty:
+            series_data[f"用家{PERIOD_LABELS[period]}盈虧"] = usr_df.set_index('period')['User_Profit']
+    
+    if not series_data:
+        st.caption("暫無可用於繪製折線圖的數據。")
+        return
+    
+    st.markdown(f"#### 📈 {title_prefix}盈虧折線圖" if title_prefix else "#### 📈 盈虧折線圖")
+    
+    all_series = list(series_data.keys())
+    
+    # 預設選擇系統每日及用家每日
+    default_series = [s for s in all_series if '每日' in s]
+    if not default_series:
+        default_series = all_series[:2] if len(all_series) >= 2 else all_series[:1]
+    
+    selected_series = st.multiselect(
+        f"選擇要顯示的盈虧線條",
+        all_series,
+        default=default_series,
+        key=f"{key_prefix}_series_select"
+    )
+    
+    if not selected_series:
+        st.caption("請至少選擇一條線條以顯示折線圖。")
+        return
+    
+    # 依時間頻率分組渲染
+    freq_groups = {}
+    for s in selected_series:
+        for period_key, period_label in PERIOD_LABELS.items():
+            if period_label in s:
+                freq = PERIOD_FREQ[period_key]
+                if freq not in freq_groups:
+                    freq_groups[freq] = []
+                freq_groups[freq].append(s)
+                break
+    
+    for freq, series_list in freq_groups.items():
+        period_label = next((v for k, v in PERIOD_LABELS.items() if PERIOD_FREQ[k] == freq), freq)
+        # 合併同頻率的系列
+        merged = None
+        for s in series_list:
+            if s in series_data:
+                if merged is None:
+                    merged = series_data[s].to_frame(name=s)
+                else:
+                    merged = merged.join(series_data[s].to_frame(name=s), how='outer')
+        
+        if merged is not None and not merged.empty:
+            merged = merged.fillna(0.0)
+            st.caption(f"**{period_label}盈虧折線圖** ({', '.join(series_list)})")
+            st.line_chart(merged, use_container_width=True)
+            
+            # 也提供累計盈虧圖
+            cumulative = merged.cumsum()
+            st.caption(f"**{period_label}累計盈虧折線圖** ({', '.join(series_list)})")
+            st.line_chart(cumulative, use_container_width=True)
+
+def render_bet_type_comparison_chart(df_settled, bet_types, key_prefix):
+    """渲染盤口類型對比盈虧折線圖：可選擇 盤口類型 x 系統/用家 x 每日/每周/每季/每年"""
+    if df_settled.empty:
+        return
+    
+    series_data = {}
+    for bt in bet_types:
+        sub_df = df_settled[df_settled['Bet_Type'].astype(str).str.contains(bt, na=False, regex=False)]
+        if sub_df.empty:
+            continue
+        for period in ['D', 'W', 'Q', 'Y']:
+            sys_df = compute_period_pnl(sub_df, 'System_Profit', 'Match_Date', period)
+            usr_df = compute_period_pnl(sub_df, 'User_Profit', 'Match_Date', period)
+            if not sys_df.empty:
+                series_data[f"系統-{bt}-{PERIOD_LABELS[period]}"] = sys_df.set_index('period')['System_Profit']
+            if not usr_df.empty:
+                series_data[f"用家-{bt}-{PERIOD_LABELS[period]}"] = usr_df.set_index('period')['User_Profit']
+    
+    if not series_data:
+        st.caption("暫無可用於繪製盤口對比折線圖的數據。")
+        return
+    
+    st.markdown("#### 📈 盤口類型對比盈虧折線圖")
+    
+    all_series = list(series_data.keys())
+    default_series = [s for s in all_series if '每日' in s]
+    if not default_series:
+        default_series = all_series[:2] if len(all_series) >= 2 else all_series[:1]
+    
+    selected_series = st.multiselect(
+        "選擇要顯示的盈虧線條 (可跨盤口類型、帳戶、頻率任意組合)",
+        all_series,
+        default=default_series,
+        key=f"{key_prefix}_bt_series_select"
+    )
+    
+    if not selected_series:
+        st.caption("請至少選擇一條線條以顯示折線圖。")
+        return
+    
+    # 依時間頻率分組渲染
+    freq_groups = {}
+    for s in selected_series:
+        for period_key, period_label in PERIOD_LABELS.items():
+            if period_label in s:
+                freq = PERIOD_FREQ[period_key]
+                if freq not in freq_groups:
+                    freq_groups[freq] = []
+                freq_groups[freq].append(s)
+                break
+    
+    for freq, series_list in freq_groups.items():
+        period_label = next((v for k, v in PERIOD_LABELS.items() if PERIOD_FREQ[k] == freq), freq)
+        merged = None
+        for s in series_list:
+            if s in series_data:
+                if merged is None:
+                    merged = series_data[s].to_frame(name=s)
+                else:
+                    merged = merged.join(series_data[s].to_frame(name=s), how='outer')
+        
+        if merged is not None and not merged.empty:
+            merged = merged.fillna(0.0)
+            st.caption(f"**{period_label}盈虧折線圖** ({', '.join(series_list)})")
+            st.line_chart(merged, use_container_width=True)
+            
+            cumulative = merged.cumsum()
+            st.caption(f"**{period_label}累計盈虧折線圖** ({', '.join(series_list)})")
+            st.line_chart(cumulative, use_container_width=True)
+
+# ==========================================
 # 6. 主程式 UI 
 # ==========================================
 def main():
@@ -1119,6 +1349,8 @@ def main():
 
     if 'df_db' not in st.session_state:
         st.session_state.df_db = load_db(db_file, DB_COLUMNS, db_table)
+    else:
+        st.session_state.df_db = enforce_columns(st.session_state.df_db, DB_COLUMNS)
     if 'df_cap' not in st.session_state:
         st.session_state.df_cap = load_db(capital_file, CAPITAL_COLUMNS, cap_table)
 
@@ -1230,6 +1462,15 @@ def main():
                     default_cat_idx = CATEGORY_OPTIONS.index(last_cat)
                     
         tournament_category = col_c.selectbox("賽事分類 (Tournament Category)", CATEGORY_OPTIONS, index=default_cat_idx, key="sel_cat")
+
+        # 比賽日期輸入 (用於時間維度盈虧分組)
+        _default_md = st.session_state.get('edit_match_date', get_hkt_now().strftime('%Y-%m-%d')) if is_editing else get_hkt_now().strftime('%Y-%m-%d')
+        try:
+            _default_md_dt = datetime.strptime(_default_md, '%Y-%m-%d').date()
+        except:
+            _default_md_dt = get_hkt_now().date()
+        match_date_input = st.date_input("比賽日期 / 下注日期 (Match Date)", value=_default_md_dt, key="match_date_input")
+        match_date = match_date_input.strftime('%Y-%m-%d')
 
         col_h, col_a = st.columns(2)
         default_h_team = st.session_state.get('edit_h_team', '') if is_editing else ''
@@ -1502,7 +1743,7 @@ def main():
                         new_record = {
                             'ID': new_id, 'Date': get_hkt_now().strftime('%Y-%m-%d %H:%M'), 'Status': 'Open',
                             'Tournament_Name': res['t_name'], 'Tournament_Category': res['t_cat'], 
-                            'Match': f"{home_team} vs {away_team}", 'Home_Team': home_team, 'Away_Team': away_team,
+                            'Match': f"{home_team} vs {away_team}", 'Match_Date': match_date, 'Home_Team': home_team, 'Away_Team': away_team,
                             'Home_Rating': home_rating, 'Away_Rating': away_rating, 'Home_Form': home_form, 'Away_Form': away_form,
                             'Bet_Type': cand['bet_type'], 'Selection': cand['selection'], 'Initial_Line': cand['line'], 'Initial_Odds': cand['odds'], 
                             'System_Stake': s_stk, 'User_Stake': u_stk,
@@ -1546,7 +1787,7 @@ def main():
                 ]
 
                 st.write(f"**該比賽包含的注單列表 ({len(matching_bets)} 張):**")
-                st.dataframe(matching_bets[['ID', 'Date', 'Status', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 'System_Stake', 'User_Stake']], use_container_width=True)
+                st.dataframe(matching_bets[['ID', 'Date', 'Match_Date', 'Status', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 'System_Stake', 'User_Stake']], use_container_width=True)
 
                 last_row = matching_bets.iloc[-1]
                 def_minute = int(float(last_row.get('InPlay_Minute', 45))) if pd.notna(last_row.get('InPlay_Minute')) else 45
@@ -1784,6 +2025,7 @@ def main():
                         'h_form': ip_h_form, 'a_form': ip_a_form,
                         'odds_history': ip_odds_history,
                         'remaining_min': max(0, 90 - ip_minute),
+                        'match_date': get_row_match_date(ip_last_row),
                     }
 
                 # --- 顯示即場分析結果 ---
@@ -1896,7 +2138,7 @@ def main():
                                 new_record = {
                                     'ID': new_id, 'Date': get_hkt_now().strftime('%Y-%m-%d %H:%M'), 'Status': 'Open',
                                     'Tournament_Name': ip_res['t_name'], 'Tournament_Category': ip_res['t_cat'],
-                                    'Match': f"{ip_res['h_team']} vs {ip_res['a_team']}", 'Home_Team': ip_res['h_team'], 'Away_Team': ip_res['a_team'],
+                                    'Match': f"{ip_res['h_team']} vs {ip_res['a_team']}", 'Match_Date': ip_res.get('match_date', get_hkt_now().strftime('%Y-%m-%d')), 'Home_Team': ip_res['h_team'], 'Away_Team': ip_res['a_team'],
                                     'Home_Rating': ip_res['h_rating'], 'Away_Rating': ip_res['a_rating'], 'Home_Form': ip_res['h_form'], 'Away_Form': ip_res['a_form'],
                                     'Bet_Type': f"{cand['bet_type']} (即場)", 'Selection': cand['selection'], 'Initial_Line': cand['line'], 'Initial_Odds': cand['odds'],
                                     'System_Stake': s_stk, 'User_Stake': u_stk,
@@ -1940,7 +2182,7 @@ def main():
                 target_bets = open_df[(open_df['Tournament_Name'] == sel_tourn) & (open_df['Match'] == sel_match)]
                 
                 st.write(f"**待結算注單列表 ({len(target_bets)} 張):**")
-                st.dataframe(target_bets[['ID', 'Date', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 'System_Stake', 'User_Stake']], use_container_width=True)
+                st.dataframe(target_bets[['ID', 'Date', 'Match_Date', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 'System_Stake', 'User_Stake']], use_container_width=True)
                 
                 s_hg_val = pd.to_numeric(target_bets['Home_Goal'], errors='coerce').max()
                 s_ag_val = pd.to_numeric(target_bets['Away_Goal'], errors='coerce').max()
@@ -2002,6 +2244,7 @@ def main():
             )
 
             st.markdown("### 📊 全局整體績效概覽")
+            st.caption("📅 時間維度盈虧按賽前輸入的比賽日期 (Match_Date) 分組；舊資料無比賽日期時會退回記錄日期 (Date)。")
             total_bets = len(df_settled)
             sys_pnl_total = pd.to_numeric(df_settled['System_Profit'], errors='coerce').sum()
             usr_pnl_total = pd.to_numeric(df_settled['User_Profit'], errors='coerce').sum()
@@ -2015,6 +2258,29 @@ def main():
             c3.metric("用家總淨盈虧", f"${usr_pnl_total:,.2f}")
             c4.metric("系統單位利潤", f"{sys_unit_profit_total:.2f} U")
             c5.metric("用家單位利潤", f"{usr_unit_profit_total:.2f} U")
+
+            # --- 全局時間維度盈虧 ---
+            global_pnl = compute_period_pnl_table(df_settled)
+            st.markdown("#### 📅 全局時間維度盈虧 (按比賽日期分組)")
+            gp1, gp2, gp3, gp4 = st.columns(4)
+            with gp1:
+                st.markdown("**每日淨盈虧**")
+                st.metric("系統 (最新一期)", f"${global_pnl['D']['sys_latest']:,.2f}")
+                st.metric("用家 (最新一期)", f"${global_pnl['D']['usr_latest']:,.2f}")
+            with gp2:
+                st.markdown("**每周淨盈虧**")
+                st.metric("系統 (最新一期)", f"${global_pnl['W']['sys_latest']:,.2f}")
+                st.metric("用家 (最新一期)", f"${global_pnl['W']['usr_latest']:,.2f}")
+            with gp3:
+                st.markdown("**每季淨盈虧**")
+                st.metric("系統 (最新一期)", f"${global_pnl['Q']['sys_latest']:,.2f}")
+                st.metric("用家 (最新一期)", f"${global_pnl['Q']['usr_latest']:,.2f}")
+            with gp4:
+                st.markdown("**每年淨盈虧**")
+                st.metric("系統 (最新一期)", f"${global_pnl['Y']['sys_latest']:,.2f}")
+                st.metric("用家 (最新一期)", f"${global_pnl['Y']['usr_latest']:,.2f}")
+
+            render_pnl_chart_section(df_settled, "global", "全局")
 
             st.divider()
             st.markdown("### 📈 各盤口類型績效分析")
@@ -2031,7 +2297,11 @@ def main():
                         performance_data.append({
                             "盤口類型": b_type, "注單數": 0, "勝率 (%)": "0.0%", 
                             "系統淨盈虧": 0.0, "用家淨盈虧": 0.0,
-                            "系統單位利潤": 0.0, "用家單位利潤": 0.0
+                            "系統單位利潤": 0.0, "用家單位利潤": 0.0,
+                            "系統每日淨盈虧": 0.0, "用家每日淨盈虧": 0.0,
+                            "系統每周淨盈虧": 0.0, "用家每周淨盈虧": 0.0,
+                            "系統每季淨盈虧": 0.0, "用家每季淨盈虧": 0.0,
+                            "系統每年淨盈虧": 0.0, "用家每年淨盈虧": 0.0,
                         })
                         continue
                         
@@ -2053,6 +2323,28 @@ def main():
                     
                     st.write(f"**勝率 (贏半或以上):** `{win_rate:.1f}%` ({win_bets}/{t_bets})")
                     
+                    # --- 盤口時間維度盈虧 ---
+                    bt_pnl = compute_period_pnl_table(sub_df)
+                    btc1, btc2, btc3, btc4 = st.columns(4)
+                    with btc1:
+                        st.markdown("**每日淨盈虧**")
+                        st.metric("系統", f"${bt_pnl['D']['sys_latest']:,.2f}")
+                        st.metric("用家", f"${bt_pnl['D']['usr_latest']:,.2f}")
+                    with btc2:
+                        st.markdown("**每周淨盈虧**")
+                        st.metric("系統", f"${bt_pnl['W']['sys_latest']:,.2f}")
+                        st.metric("用家", f"${bt_pnl['W']['usr_latest']:,.2f}")
+                    with btc3:
+                        st.markdown("**每季淨盈虧**")
+                        st.metric("系統", f"${bt_pnl['Q']['sys_latest']:,.2f}")
+                        st.metric("用家", f"${bt_pnl['Q']['usr_latest']:,.2f}")
+                    with btc4:
+                        st.markdown("**每年淨盈虧**")
+                        st.metric("系統", f"${bt_pnl['Y']['sys_latest']:,.2f}")
+                        st.metric("用家", f"${bt_pnl['Y']['usr_latest']:,.2f}")
+                    
+                    render_pnl_chart_section(sub_df, f"bt_{i}", b_type)
+                    
                     performance_data.append({
                         "盤口類型": b_type,
                         "注單數": t_bets,
@@ -2060,7 +2352,15 @@ def main():
                         "系統淨盈虧": sys_p,
                         "用家淨盈虧": usr_p,
                         "系統單位利潤": sys_u,
-                        "用家單位利潤": usr_u
+                        "用家單位利潤": usr_u,
+                        "系統每日淨盈虧": bt_pnl['D']['sys_latest'],
+                        "用家每日淨盈虧": bt_pnl['D']['usr_latest'],
+                        "系統每周淨盈虧": bt_pnl['W']['sys_latest'],
+                        "用家每周淨盈虧": bt_pnl['W']['usr_latest'],
+                        "系統每季淨盈虧": bt_pnl['Q']['sys_latest'],
+                        "用家每季淨盈虧": bt_pnl['Q']['usr_latest'],
+                        "系統每年淨盈虧": bt_pnl['Y']['sys_latest'],
+                        "用家每年淨盈虧": bt_pnl['Y']['usr_latest'],
                     })
 
             st.divider()
@@ -2074,9 +2374,20 @@ def main():
                         "用家淨盈虧": st.column_config.NumberColumn("用家淨盈虧", format="$%.2f"),
                         "系統單位利潤": st.column_config.NumberColumn("系統單位利潤", format="%.2f U"),
                         "用家單位利潤": st.column_config.NumberColumn("用家單位利潤", format="%.2f U"),
+                        "系統每日淨盈虧": st.column_config.NumberColumn("系統每日淨盈虧", format="$%.2f"),
+                        "用家每日淨盈虧": st.column_config.NumberColumn("用家每日淨盈虧", format="$%.2f"),
+                        "系統每周淨盈虧": st.column_config.NumberColumn("系統每周淨盈虧", format="$%.2f"),
+                        "用家每周淨盈虧": st.column_config.NumberColumn("用家每周淨盈虧", format="$%.2f"),
+                        "系統每季淨盈虧": st.column_config.NumberColumn("系統每季淨盈虧", format="$%.2f"),
+                        "用家每季淨盈虧": st.column_config.NumberColumn("用家每季淨盈虧", format="$%.2f"),
+                        "系統每年淨盈虧": st.column_config.NumberColumn("系統每年淨盈虧", format="$%.2f"),
+                        "用家每年淨盈虧": st.column_config.NumberColumn("用家每年淨盈虧", format="$%.2f"),
                     },
                     use_container_width=True
                 )
+                
+                # 盤口類型對比盈虧折線圖
+                render_bet_type_comparison_chart(df_settled, bet_types, "compare")
 
 if __name__ == "__main__":
     main()
