@@ -35,18 +35,27 @@ try:
 except ImportError:
     HAS_SQLALCHEMY = False
 
-# 選配套件：XGBoost / LightGBM (未安裝時自動跳過，不影響其他模型)
-try:
-    from xgboost import XGBClassifier
-    HAS_XGBOOST = True
-except ImportError:
-    HAS_XGBOOST = False
+# 選配套件：XGBoost / LightGBM (延遲載入：僅在真正訓練時才 import，加快啟動速度並降低記憶體)
+def get_xgb_classifier():
+    try:
+        from xgboost import XGBClassifier
+        return XGBClassifier
+    except ImportError:
+        return None
 
+def get_lgbm_classifier():
+    try:
+        from lightgbm import LGBMClassifier
+        return LGBMClassifier
+    except ImportError:
+        return None
+
+# 限制數值函式庫執行緒 (避免在 CPU 受限的雲端容器上執行緒超訂，降低 CPU 峰值)
 try:
-    from lightgbm import LGBMClassifier
-    HAS_LIGHTGBM = True
+    from threadpoolctl import threadpool_limits as _threadpool_limits
+    HAS_THREADPOOLCTL = True
 except ImportError:
-    HAS_LIGHTGBM = False
+    HAS_THREADPOOLCTL = False
 
 # 深度學習/ML 分析最低樣本門檻 (讓球等小樣本盤口亦可訓練；EV 引擎仍維持 15 場)
 ML_MIN_SAMPLES = 8
@@ -456,7 +465,14 @@ def prepare_enhanced_ml_dataset(df, rating_map):
     return np.array(X) if len(X) > 0 else None, np.array(y) if len(y) > 0 else None
 
 def train_ensemble_models(X, y):
-    """訓練多個 ML/DL 模型，回傳 (best_model, model_results_dict)"""
+    """訓練多個 ML/DL 模型，回傳 (best_model, model_results_dict)
+    以單執行緒執行，避免在 CPU 受限的雲端容器上執行緒超訂。"""
+    if HAS_THREADPOOLCTL:
+        with _threadpool_limits(limits=1):
+            return _train_ensemble_models_impl(X, y)
+    return _train_ensemble_models_impl(X, y)
+
+def _train_ensemble_models_impl(X, y):
     if X is None or y is None or len(np.unique(y)) < 2:
         return None, {}
     
@@ -487,20 +503,22 @@ def train_ensemble_models(X, y):
     except Exception:
         pass
     
-    # 2b. XGBoost (選配：已安裝時自動加入集成)
-    if HAS_XGBOOST:
+    # 2b. XGBoost (選配：已安裝時自動加入集成，延遲載入)
+    XGB_CLS = get_xgb_classifier()
+    if XGB_CLS is not None:
         try:
-            xgb = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, random_state=42, eval_metric='logloss', verbosity=0)
+            xgb = XGB_CLS(n_estimators=50, max_depth=3, learning_rate=0.1, random_state=42, eval_metric='logloss', verbosity=0, n_jobs=1)
             scores = cross_val_score(xgb, X, y, cv=cv_folds, scoring='accuracy', error_score=0)
             results['XGBoost'] = {'cv_mean': float(scores.mean()), 'cv_std': float(scores.std())}
             models['XGBoost'] = xgb
         except Exception:
             pass
     
-    # 2c. LightGBM (選配：已安裝時自動加入集成)
-    if HAS_LIGHTGBM:
+    # 2c. LightGBM (選配：已安裝時自動加入集成，延遲載入)
+    LGBM_CLS = get_lgbm_classifier()
+    if LGBM_CLS is not None:
         try:
-            lgbm = LGBMClassifier(n_estimators=50, max_depth=3, random_state=42, verbose=-1)
+            lgbm = LGBM_CLS(n_estimators=50, max_depth=3, random_state=42, verbose=-1, n_jobs=1)
             scores = cross_val_score(lgbm, X, y, cv=cv_folds, scoring='accuracy', error_score=0)
             results['LightGBM'] = {'cv_mean': float(scores.mean()), 'cv_std': float(scores.std())}
             models['LightGBM'] = lgbm
@@ -1502,6 +1520,7 @@ def get_row_match_date(row):
         return parsed.strftime('%Y-%m-%d')
     return get_hkt_now().strftime('%Y-%m-%d')
 
+@st.cache_data(max_entries=64)
 def compute_period_pnl(df, profit_col, date_col='Match_Date', period='D'):
     """按指定時間維度分組計算各期淨盈虧，回傳 DataFrame (period_label, total)
     優先使用 Match_Date，舊資料無此欄位時退回 Date。"""
@@ -1530,6 +1549,7 @@ def compute_period_pnl(df, profit_col, date_col='Match_Date', period='D'):
     grouped = grouped.sort_values('period').reset_index(drop=True)
     return grouped
 
+@st.cache_data(max_entries=32)
 def compute_period_pnl_table(df, sys_col='System_Profit', usr_col='User_Profit', date_col='Match_Date'):
     """計算全部四個時間維度的系統與用家淨盈虧，回傳 dict"""
     result = {}
@@ -1629,6 +1649,7 @@ def render_pnl_chart_section(df_settled, key_prefix, title_prefix=""):
             st.caption(f"**{period_label}累計盈虧折線圖** ({', '.join(series_list)})")
             st.line_chart(cumulative, use_container_width=True)
 
+@st.cache_data(max_entries=16)
 def build_time_dimension_pnl_records(df_settled):
     """構建時間維度盈虧記錄表：按盤口類型 x 時間維度記錄盈虧"""
     if df_settled.empty:
@@ -1890,13 +1911,64 @@ def render_bet_type_comparison_chart(df_settled, bet_types, key_prefix):
 # ==========================================
 # 5.7 深度學習與機器學習盈虧分析 (全局模型板塊)
 # ==========================================
+@st.cache_data(max_entries=16, show_spinner="🧠 正在訓練 ML 模型 (首次訓練較慢，完成後會自動快取)...")
+def run_ml_analysis_cached(df_settled):
+    """執行 ML 分析並回傳可序列化的摘要結果。
+    @st.cache_data 快取：資料庫內容變更時自動重新計算，
+    避免每次畫面刷新 (rerun) 都重複訓練模型，大幅降低 CPU 用量。"""
+    rating_map = {"S": 5, "A": 4, "B": 3, "C": 2, "D": 1}
+    bet_types = ["讓球", "入球大小", "角球大小"]
+    analysis = {}
+    
+    for bt in bet_types:
+        sub_df = df_settled[df_settled['Bet_Type'].astype(str).str.contains(bt, na=False, regex=False)]
+        n = len(sub_df)
+        entry = {'n': n, 'trained': False, 'class_ok': True}
+        
+        if n < ML_MIN_SAMPLES:
+            analysis[bt] = entry
+            continue
+        
+        X, y = prepare_enhanced_ml_dataset(sub_df, rating_map)
+        if X is None or len(np.unique(y)) < 2:
+            entry['class_ok'] = False
+            analysis[bt] = entry
+            continue
+        
+        best_model_info, model_results = train_ensemble_models(X, y)
+        
+        if model_results:
+            entry['trained'] = True
+            entry['model_results'] = {
+                name: {'cv_mean': float(res['cv_mean']), 'cv_std': float(res['cv_std'])}
+                for name, res in model_results.items()
+            }
+            entry['best_model'] = best_model_info[0] if best_model_info else None
+            
+            # 時間趨勢統計 (最近10場)
+            recent = sub_df.tail(min(10, n))
+            recent_win_rate = len(recent[pd.to_numeric(recent['Unit_Profit'], errors='coerce') > 0]) / len(recent) if len(recent) > 0 else 0.0
+            recent_odds = pd.to_numeric(recent['Initial_Odds'], errors='coerce').mean()
+            entry['recent_win_rate'] = float(recent_win_rate)
+            entry['recent_odds'] = float(recent_odds) if pd.notna(recent_odds) else 0.0
+        
+        analysis[bt] = entry
+    
+    return analysis
+
 def render_dl_ml_analysis_section(df_settled):
     """渲染深度學習與機器學習盈虧分析：多模型交叉驗證結果 + 時間趨勢 ML 預測建議
-    (涵蓋讓球、入球大小、角球大小三種盤口)"""
+    (涵蓋讓球、入球大小、角球大小三種盤口；ML 結果經快取，不會重複訓練)"""
     st.markdown("### 🧠 深度學習與機器學習盈虧分析")
     st.caption(f"本板塊涵蓋讓球、入球大小、角球大小三種盤口；ML 分析最低樣本門檻為 {ML_MIN_SAMPLES} 場。小樣本 (8-14 場) 時模型結果波動較大，僅供參考。")
     
-    rating_map = {"S": 5, "A": 4, "B": 3, "C": 2, "D": 1}
+    if not HAS_AI_MODULES:
+        st.warning("未安裝 sklearn 套件，無法執行 ML 模型訓練。")
+        return
+    
+    # 呼叫快取的 ML 分析 (資料變更時自動重算，平時直接讀取快取)
+    analysis = run_ml_analysis_cached(df_settled)
+    
     bet_types = ["讓球", "入球大小", "角球大小"]
     
     ml_col1, ml_col2 = st.columns(2)
@@ -1904,83 +1976,65 @@ def render_dl_ml_analysis_section(df_settled):
     with ml_col1:
         st.markdown("##### 多模型交叉驗證結果")
         
-        if HAS_AI_MODULES:
-            for bt in bet_types:
-                sub_df = df_settled[df_settled['Bet_Type'].astype(str).str.contains(bt, na=False, regex=False)]
-                n = len(sub_df)
-                
+        for bt in bet_types:
+            entry = analysis.get(bt, {})
+            n = entry.get('n', 0)
+            
+            if not entry.get('trained', False):
                 if n < ML_MIN_SAMPLES:
                     st.warning(f"{bt}: 樣本數不足 ({n} < {ML_MIN_SAMPLES})，無法訓練 ML 模型。")
-                    continue
-                
-                X, y = prepare_enhanced_ml_dataset(sub_df, rating_map)
-                if X is None or len(np.unique(y)) < 2:
+                elif not entry.get('class_ok', True):
                     st.warning(f"{bt}: 目標類別不足，無法訓練 ML 模型。")
-                    continue
-                
-                best_model_info, model_results = train_ensemble_models(X, y)
-                
-                if model_results:
-                    st.markdown(f"**{bt}** (樣本數: {n})")
-                    model_data = []
-                    for name, res in model_results.items():
-                        model_data.append({
-                            '模型': name,
-                            '交叉驗證準確率': f"{res['cv_mean']*100:.1f}%",
-                            '標準差': f"{res['cv_std']*100:.1f}%",
-                        })
-                    st.dataframe(pd.DataFrame(model_data), use_container_width=True, hide_index=True)
-                    
-                    if best_model_info:
-                        st.success(f"最佳模型: {best_model_info[0]}")
                 else:
                     st.warning(f"{bt}: 所有模型訓練失敗。")
-        else:
-            st.warning("未安裝 sklearn 套件，無法執行 ML 模型訓練。")
+                continue
+            
+            st.markdown(f"**{bt}** (樣本數: {n})")
+            model_data = []
+            for name, res in entry.get('model_results', {}).items():
+                model_data.append({
+                    '模型': name,
+                    '交叉驗證準確率': f"{res['cv_mean']*100:.1f}%",
+                    '標準差': f"{res['cv_std']*100:.1f}%",
+                })
+            st.dataframe(pd.DataFrame(model_data), use_container_width=True, hide_index=True)
+            
+            if entry.get('best_model'):
+                st.success(f"最佳模型: {entry['best_model']}")
     
     with ml_col2:
         st.markdown("##### 時間趨勢 ML 預測建議")
         
-        if HAS_AI_MODULES and not df_settled.empty:
-            # 基於時間維度的盈虧趨勢分析
-            for bt in bet_types:
-                sub_df = df_settled[df_settled['Bet_Type'].astype(str).str.contains(bt, na=False, regex=False)]
-                n = len(sub_df)
-                
+        any_suggestion = False
+        for bt in bet_types:
+            entry = analysis.get(bt, {})
+            n = entry.get('n', 0)
+            
+            if not entry.get('trained', False):
                 if n < ML_MIN_SAMPLES:
                     st.caption(f"{bt}: 樣本數不足 ({n} < {ML_MIN_SAMPLES})，無法生成 ML 預測建議。")
-                    continue
-                
-                X, y = prepare_enhanced_ml_dataset(sub_df, rating_map)
-                if X is None or len(np.unique(y)) < 2:
-                    continue
-                
-                best_model_info, _ = train_ensemble_models(X, y)
-                
-                if best_model_info:
-                    # 計算最近10場的勝率趨勢
-                    recent = sub_df.tail(min(10, n))
-                    recent_win_rate = len(recent[pd.to_numeric(recent['Unit_Profit'], errors='coerce') > 0]) / len(recent) if len(recent) > 0 else 0
-                    
-                    # 計算最近10場的平均賠率
-                    recent_odds = pd.to_numeric(recent['Initial_Odds'], errors='coerce').mean()
-                    
-                    # 建議
-                    if recent_win_rate >= 0.6:
-                        trend = "上升趨勢 📈"
-                        suggestion = f"{bt} 近期勝率 {recent_win_rate*100:.0f}%，建議繼續關注。"
-                    elif recent_win_rate >= 0.4:
-                        trend = "平穩 ➡️"
-                        suggestion = f"{bt} 近期勝率 {recent_win_rate*100:.0f}%，建議謹慎下注。"
-                    else:
-                        trend = "下降趨勢 📉"
-                        suggestion = f"{bt} 近期勝率 {recent_win_rate*100:.0f}%，建議減少下注或反向操作。"
-                    
-                    st.markdown(f"**{bt}** ({trend})")
-                    st.write(f"最佳模型: {best_model_info[0]}")
-                    st.write(suggestion)
-                    st.caption(f"近期平均賠率: {recent_odds:.2f} | 樣本數: {n}")
-        else:
+                continue
+            
+            any_suggestion = True
+            recent_win_rate = entry.get('recent_win_rate', 0.0)
+            
+            # 建議
+            if recent_win_rate >= 0.6:
+                trend = "上升趨勢 📈"
+                suggestion = f"{bt} 近期勝率 {recent_win_rate*100:.0f}%，建議繼續關注。"
+            elif recent_win_rate >= 0.4:
+                trend = "平穩 ➡️"
+                suggestion = f"{bt} 近期勝率 {recent_win_rate*100:.0f}%，建議謹慎下注。"
+            else:
+                trend = "下降趨勢 📉"
+                suggestion = f"{bt} 近期勝率 {recent_win_rate*100:.0f}%，建議減少下注或反向操作。"
+            
+            st.markdown(f"**{bt}** ({trend})")
+            st.write(f"最佳模型: {entry.get('best_model', 'N/A')}")
+            st.write(suggestion)
+            st.caption(f"近期平均賠率: {entry.get('recent_odds', 0.0):.2f} | 樣本數: {n}")
+        
+        if not any_suggestion:
             st.info(f"需要更多已結算注單 (≥{ML_MIN_SAMPLES}場/盤口類型) 才能生成 ML 預測建議。")
 
 # ==========================================
@@ -2925,6 +2979,13 @@ def main():
                     st.toast(f"✅ {sel_match} 結算完成！", icon="⚖️")
                     st.rerun()
 
+    # 先渲染「時間維度盈虧記錄分析」分頁，再執行「全局模型」的 ML 訓練：
+    # 確保分頁資料與圖表優先送出，ML 首次訓練不會阻塞其他分頁顯示 (解決空白分頁問題)。
+    # (分頁的視覺順序不變，只是渲染順序調整)
+    with t_time_pnl:
+        df_settled_tdp = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
+        render_time_dimension_pnl_tab(df_settled_tdp, sys_bankroll, sys_max_stake)
+
     with t_ai:
         st.subheader("🤖 全局模型與績效分析")
         df_settled = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
@@ -3017,10 +3078,6 @@ def main():
             # --- 深度學習與機器學習盈虧分析 (由『時間維度盈虧記錄分析』板塊移至此處) ---
             st.divider()
             render_dl_ml_analysis_section(df_settled)
-
-    with t_time_pnl:
-        df_settled_tdp = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
-        render_time_dimension_pnl_tab(df_settled_tdp, sys_bankroll, sys_max_stake)
 
 if __name__ == "__main__":
     main()
