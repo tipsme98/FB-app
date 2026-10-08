@@ -35,6 +35,22 @@ try:
 except ImportError:
     HAS_SQLALCHEMY = False
 
+# 選配套件：XGBoost / LightGBM (未安裝時自動跳過，不影響其他模型)
+try:
+    from xgboost import XGBClassifier
+    HAS_XGBOOST = True
+except ImportError:
+    HAS_XGBOOST = False
+
+try:
+    from lightgbm import LGBMClassifier
+    HAS_LIGHTGBM = True
+except ImportError:
+    HAS_LIGHTGBM = False
+
+# 深度學習/ML 分析最低樣本門檻 (讓球等小樣本盤口亦可訓練；EV 引擎仍維持 15 場)
+ML_MIN_SAMPLES = 8
+
 # ==========================================
 # 1. 初始化設定與資料庫 Schema
 # ==========================================
@@ -471,6 +487,26 @@ def train_ensemble_models(X, y):
     except Exception:
         pass
     
+    # 2b. XGBoost (選配：已安裝時自動加入集成)
+    if HAS_XGBOOST:
+        try:
+            xgb = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, random_state=42, eval_metric='logloss', verbosity=0)
+            scores = cross_val_score(xgb, X, y, cv=cv_folds, scoring='accuracy', error_score=0)
+            results['XGBoost'] = {'cv_mean': float(scores.mean()), 'cv_std': float(scores.std())}
+            models['XGBoost'] = xgb
+        except Exception:
+            pass
+    
+    # 2c. LightGBM (選配：已安裝時自動加入集成)
+    if HAS_LIGHTGBM:
+        try:
+            lgbm = LGBMClassifier(n_estimators=50, max_depth=3, random_state=42, verbose=-1)
+            scores = cross_val_score(lgbm, X, y, cv=cv_folds, scoring='accuracy', error_score=0)
+            results['LightGBM'] = {'cv_mean': float(scores.mean()), 'cv_std': float(scores.std())}
+            models['LightGBM'] = lgbm
+        except Exception:
+            pass
+    
     # 3. LogisticRegression (需標準化)
     try:
         scaler = StandardScaler()
@@ -670,6 +706,123 @@ def clear_edit_mode():
     keys_to_del = [k for k in st.session_state.keys() if k.startswith('edit_')]
     for k in keys_to_del:
         del st.session_state[k]
+
+# ==========================================
+# 4b. 已完成注單資料修補工具 (開啟已儲存賽事更新數據)
+# ==========================================
+def is_missing_match_date(v):
+    """判斷 Match_Date 是否缺失 (None/NaN/空字串)"""
+    if pd.isna(v):
+        return True
+    s = str(v).strip()
+    return s == '' or s.lower() in ('none', 'nan', 'nat')
+
+@st.dialog("🗂 已完成注單資料修補與更新", width="large")
+def edit_settled_bets_dialog(db_file, db_table):
+    """開啟資料庫中已儲存的注單 (含已完成 Settled) 進行更新：補填或修正比賽日期 (Match_Date)"""
+    st.caption("此工具可開啟已完成 (Settled) 的注單進行數據更新：補填或修正比賽日期 (Match_Date)，供時間維度盈虧分析使用。修改後會自動同步雲端數據庫。")
+    
+    settled = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
+    if settled.empty:
+        st.info("目前沒有已完成的注單。")
+        return
+    
+    n_missing = int(settled['Match_Date'].apply(is_missing_match_date).sum())
+    
+    tab_match, tab_id = st.tabs(["📋 按比賽場次批量補填", "🔍 按注單 ID 單筆修改"])
+    
+    with tab_match:
+        st.write(f"目前共有 **{len(settled)}** 張已完成注單，其中 **{n_missing}** 張缺少比賽日期。")
+        
+        # 依「賽事 + 對賽 + 記錄日期」分組，避免不同日期的同組合對賽被誤改
+        settled_groups = settled.copy()
+        settled_groups['_Record_Date'] = pd.to_datetime(settled_groups['Date'], errors='coerce').dt.strftime('%Y-%m-%d').fillna('無記錄日期')
+        
+        groups = settled_groups.fillna({'Tournament_Name': '', 'Match': ''}).groupby(['Tournament_Name', 'Match', '_Record_Date'])
+        group_indices = []
+        group_opts = []
+        for (tname, match, record_date), g in groups:
+            group_indices.append(list(g.index))
+            existing_dates = sorted({str(d)[:10] for d in g['Match_Date'] if not is_missing_match_date(d)})
+            miss_cnt = int(g['Match_Date'].apply(is_missing_match_date).sum())
+            date_disp = "、".join(existing_dates) if existing_dates else "未設定"
+            group_opts.append(f"{tname} | {match} | 記錄日期: {record_date} | 比賽日期: {date_disp} | 缺日期: {miss_cnt}/{len(g)} 張")
+        
+        sel_group = st.selectbox("選擇要補填的比賽場次", group_opts, key="sbd_group_sel")
+        g_idx = group_opts.index(sel_group)
+        
+        only_missing = st.checkbox("僅更新目前缺少比賽日期的注單", value=True, key="sbd_only_missing")
+        new_date = st.date_input("比賽日期 (Match Date)", value=get_hkt_now().date(), key="sbd_new_date")
+        
+        if st.button("💾 更新此場次注單的比賽日期", type="primary", use_container_width=True, key="sbd_save_group"):
+            selected_indices = group_indices[g_idx]
+            if only_missing:
+                upd_indices = [idx for idx in selected_indices if is_missing_match_date(st.session_state.df_db.at[idx, 'Match_Date'])]
+            else:
+                upd_indices = selected_indices
+            
+            if not upd_indices:
+                st.warning("此場次沒有符合條件的注單可更新。")
+            else:
+                st.session_state.df_db.loc[upd_indices, 'Match_Date'] = new_date.strftime('%Y-%m-%d')
+                save_db(st.session_state.df_db, db_file, db_table)
+                st.toast(f"✅ 已更新 {len(upd_indices)} 張注單的比賽日期！", icon="🗂")
+                st.rerun()
+        
+        st.divider()
+        with st.expander("⚡ 一鍵智能補填：以記錄日期 (Date) 填補所有缺失的比賽日期"):
+            st.caption("系統會將所有缺少 Match_Date 的注單，自動以該注單的記錄日期 (Date 欄位) 作為比賽日期填入。")
+            if st.button("⚡ 執行一鍵補填", key="sbd_auto_fill"):
+                miss_mask = (st.session_state.df_db['Status'] == 'Settled') & st.session_state.df_db['Match_Date'].apply(is_missing_match_date)
+                miss_idx = st.session_state.df_db.index[miss_mask]
+                if len(miss_idx) == 0:
+                    st.toast("目前沒有缺少比賽日期的注單。", icon="✅")
+                else:
+                    for idx in miss_idx:
+                        dv = st.session_state.df_db.at[idx, 'Date']
+                        parsed = pd.to_datetime(dv, errors='coerce')
+                        fill_val = parsed.strftime('%Y-%m-%d') if pd.notna(parsed) else get_hkt_now().strftime('%Y-%m-%d')
+                        st.session_state.df_db.at[idx, 'Match_Date'] = fill_val
+                    save_db(st.session_state.df_db, db_file, db_table)
+                    st.toast(f"✅ 已智能補填 {len(miss_idx)} 張注單的比賽日期！", icon="⚡")
+                    st.rerun()
+    
+    with tab_id:
+        def _id_opt(r):
+            cur = str(r.get('Match_Date', ''))[:10] if not is_missing_match_date(r.get('Match_Date')) else "❌未設定"
+            return f"{r['ID']} | {r.get('Match', '')} | {r.get('Bet_Type', '')} | 日期: {cur}"
+        
+        id_opts = [_id_opt(r) for _, r in settled.iterrows()]
+        sel_id_str = st.selectbox("選擇要修改的注單 (ID)", id_opts, key="sbd_id_sel")
+        target_id = str(sel_id_str).split(" | ")[0]
+        
+        target_row = settled[settled['ID'] == target_id]
+        if target_row.empty:
+            st.warning("找不到所選注單。")
+            return
+        target_row = target_row.iloc[0]
+        
+        # 預設日期：現有 Match_Date -> Date -> 今天
+        _def_date = None
+        if not is_missing_match_date(target_row.get('Match_Date')):
+            try:
+                _def_date = datetime.strptime(str(target_row['Match_Date'])[:10], '%Y-%m-%d').date()
+            except:
+                _def_date = None
+        if _def_date is None:
+            _parsed = pd.to_datetime(target_row.get('Date'), errors='coerce')
+            if pd.notna(_parsed):
+                _def_date = _parsed.date()
+        if _def_date is None:
+            _def_date = get_hkt_now().date()
+        
+        single_date = st.date_input("比賽日期 (Match Date)", value=_def_date, key="sbd_single_date")
+        
+        if st.button("💾 更新此注單的比賽日期", type="primary", use_container_width=True, key="sbd_save_single"):
+            st.session_state.df_db.loc[st.session_state.df_db['ID'] == target_id, 'Match_Date'] = single_date.strftime('%Y-%m-%d')
+            save_db(st.session_state.df_db, db_file, db_table)
+            st.toast(f"✅ 注單 {target_id} 的比賽日期已更新！", icon="🗂")
+            st.rerun()
 
 # ==========================================
 # 5. 資金流水 HTML 構建
@@ -1540,7 +1693,7 @@ def render_time_dimension_pnl_tab(df_settled, sys_bankroll, sys_max_stake):
     df = add_account_unit_profit_columns(df_settled)
     
     st.markdown("### 📅 時間維度盈虧記錄分析")
-    st.caption("本板塊按盤口類型（讓球/入球大小/角球大小）與時間維度（每日/每周/每季/每年）記錄盈虧，供深度學習與機器學習模型分析。")
+    st.caption("本板塊按盤口類型（讓球/入球大小/角球大小）與時間維度（每日/每周/每季/每年）記錄盈虧；深度學習與機器學習盈虧分析已移至『全局模型』板塊。")
     
     # --- 盈虧總覽指標 ---
     st.markdown("#### 📊 盈虧總覽")
@@ -1560,6 +1713,32 @@ def render_time_dimension_pnl_tab(df_settled, sys_bankroll, sys_max_stake):
     tc5.metric("用家單位利潤", f"{usr_unit:.2f} U")
     
     st.caption("💡 注意：單位利潤僅計算系統/用家有實際下注 (Stake > 0) 的注單，與全局模型一致。零下注注單的盈虧結果不計入。")
+    
+    # --- 全局時間維度盈虧 (由『全局模型』板塊合併至此，避免重複) ---
+    st.divider()
+    st.markdown("#### 📅 全局時間維度盈虧 (按比賽日期分組)")
+    st.caption("按賽前輸入的比賽日期 (Match_Date) 分組；舊資料無比賽日期時會退回記錄日期 (Date)。")
+    
+    global_pnl = compute_period_pnl_table(df_settled)
+    gp1, gp2, gp3, gp4 = st.columns(4)
+    with gp1:
+        st.markdown("**每日淨盈虧**")
+        st.metric("系統 (最新一期)", f"${global_pnl['D']['sys_latest']:,.2f}")
+        st.metric("用家 (最新一期)", f"${global_pnl['D']['usr_latest']:,.2f}")
+    with gp2:
+        st.markdown("**每周淨盈虧**")
+        st.metric("系統 (最新一期)", f"${global_pnl['W']['sys_latest']:,.2f}")
+        st.metric("用家 (最新一期)", f"${global_pnl['W']['usr_latest']:,.2f}")
+    with gp3:
+        st.markdown("**每季淨盈虧**")
+        st.metric("系統 (最新一期)", f"${global_pnl['Q']['sys_latest']:,.2f}")
+        st.metric("用家 (最新一期)", f"${global_pnl['Q']['usr_latest']:,.2f}")
+    with gp4:
+        st.markdown("**每年淨盈虧**")
+        st.metric("系統 (最新一期)", f"${global_pnl['Y']['sys_latest']:,.2f}")
+        st.metric("用家 (最新一期)", f"${global_pnl['Y']['usr_latest']:,.2f}")
+    
+    render_pnl_chart_section(df_settled, "global", "全局")
     
     # --- 各盤口類型時間維度盈虧記錄表 ---
     st.divider()
@@ -1634,95 +1813,6 @@ def render_time_dimension_pnl_tab(df_settled, sys_bankroll, sys_max_stake):
             
             render_pnl_chart_section(sub_df, f"tdp_bt_{i}", bt)
     
-    # --- 深度學習/機器學習分析 ---
-    st.divider()
-    st.markdown("#### 🧠 深度學習與機器學習盈虧分析")
-    
-    rating_map = {"S": 5, "A": 4, "B": 3, "C": 2, "D": 1}
-    
-    ml_col1, ml_col2 = st.columns(2)
-    
-    with ml_col1:
-        st.markdown("##### 多模型交叉驗證結果")
-        
-        if HAS_AI_MODULES:
-            for bt in bet_types:
-                sub_df = df[df['Bet_Type'].astype(str).str.contains(bt, na=False, regex=False)]
-                n = len(sub_df)
-                
-                if n < 15:
-                    st.warning(f"{bt}: 樣本數不足 ({n} < 15)，無法訓練 ML 模型。")
-                    continue
-                
-                X, y = prepare_enhanced_ml_dataset(sub_df, rating_map)
-                if X is None or len(np.unique(y)) < 2:
-                    st.warning(f"{bt}: 目標類別不足，無法訓練 ML 模型。")
-                    continue
-                
-                best_model_info, model_results = train_ensemble_models(X, y)
-                
-                if model_results:
-                    st.markdown(f"**{bt}** (樣本數: {n})")
-                    model_data = []
-                    for name, res in model_results.items():
-                        model_data.append({
-                            '模型': name,
-                            '交叉驗證準確率': f"{res['cv_mean']*100:.1f}%",
-                            '標準差': f"{res['cv_std']*100:.1f}%",
-                        })
-                    st.dataframe(pd.DataFrame(model_data), use_container_width=True, hide_index=True)
-                    
-                    if best_model_info:
-                        st.success(f"最佳模型: {best_model_info[0]}")
-                else:
-                    st.warning(f"{bt}: 所有模型訓練失敗。")
-        else:
-            st.warning("未安裝 sklearn 套件，無法執行 ML 模型訓練。")
-    
-    with ml_col2:
-        st.markdown("##### 時間趨勢 ML 預測建議")
-        
-        if HAS_AI_MODULES and not df.empty:
-            # 基於時間維度的盈虧趨勢分析
-            for bt in bet_types:
-                sub_df = df[df['Bet_Type'].astype(str).str.contains(bt, na=False, regex=False)]
-                n = len(sub_df)
-                
-                if n < 15:
-                    continue
-                
-                X, y = prepare_enhanced_ml_dataset(sub_df, rating_map)
-                if X is None or len(np.unique(y)) < 2:
-                    continue
-                
-                best_model_info, _ = train_ensemble_models(X, y)
-                
-                if best_model_info:
-                    # 計算最近10場的勝率趨勢
-                    recent = sub_df.tail(min(10, n))
-                    recent_win_rate = len(recent[pd.to_numeric(recent['Unit_Profit'], errors='coerce') > 0]) / len(recent) if len(recent) > 0 else 0
-                    
-                    # 計算最近10場的平均賠率
-                    recent_odds = pd.to_numeric(recent['Initial_Odds'], errors='coerce').mean()
-                    
-                    # 建議
-                    if recent_win_rate >= 0.6:
-                        trend = "上升趨勢 📈"
-                        suggestion = f"{bt} 近期勝率 {recent_win_rate*100:.0f}%，建議繼續關注。"
-                    elif recent_win_rate >= 0.4:
-                        trend = "平穩 ➡️"
-                        suggestion = f"{bt} 近期勝率 {recent_win_rate*100:.0f}%，建議謹慎下注。"
-                    else:
-                        trend = "下降趨勢 📉"
-                        suggestion = f"{bt} 近期勝率 {recent_win_rate*100:.0f}%，建議減少下注或反向操作。"
-                    
-                    st.markdown(f"**{bt}** ({trend})")
-                    st.write(f"最佳模型: {best_model_info[0]}")
-                    st.write(suggestion)
-                    st.caption(f"近期平均賠率: {recent_odds:.2f} | 樣本數: {n}")
-        else:
-            st.info("需要更多已結算注單 (≥15場/盤口類型) 才能生成 ML 預測建議。")
-    
     # --- 盤口類型對比盈虧折線圖 ---
     st.divider()
     render_bet_type_comparison_chart(df_settled, bet_types, "tdp_compare")
@@ -1796,6 +1886,102 @@ def render_bet_type_comparison_chart(df_settled, bet_types, key_prefix):
             cumulative = merged.cumsum()
             st.caption(f"**{period_label}累計盈虧折線圖** ({', '.join(series_list)})")
             st.line_chart(cumulative, use_container_width=True)
+
+# ==========================================
+# 5.7 深度學習與機器學習盈虧分析 (全局模型板塊)
+# ==========================================
+def render_dl_ml_analysis_section(df_settled):
+    """渲染深度學習與機器學習盈虧分析：多模型交叉驗證結果 + 時間趨勢 ML 預測建議
+    (涵蓋讓球、入球大小、角球大小三種盤口)"""
+    st.markdown("### 🧠 深度學習與機器學習盈虧分析")
+    st.caption(f"本板塊涵蓋讓球、入球大小、角球大小三種盤口；ML 分析最低樣本門檻為 {ML_MIN_SAMPLES} 場。小樣本 (8-14 場) 時模型結果波動較大，僅供參考。")
+    
+    rating_map = {"S": 5, "A": 4, "B": 3, "C": 2, "D": 1}
+    bet_types = ["讓球", "入球大小", "角球大小"]
+    
+    ml_col1, ml_col2 = st.columns(2)
+    
+    with ml_col1:
+        st.markdown("##### 多模型交叉驗證結果")
+        
+        if HAS_AI_MODULES:
+            for bt in bet_types:
+                sub_df = df_settled[df_settled['Bet_Type'].astype(str).str.contains(bt, na=False, regex=False)]
+                n = len(sub_df)
+                
+                if n < ML_MIN_SAMPLES:
+                    st.warning(f"{bt}: 樣本數不足 ({n} < {ML_MIN_SAMPLES})，無法訓練 ML 模型。")
+                    continue
+                
+                X, y = prepare_enhanced_ml_dataset(sub_df, rating_map)
+                if X is None or len(np.unique(y)) < 2:
+                    st.warning(f"{bt}: 目標類別不足，無法訓練 ML 模型。")
+                    continue
+                
+                best_model_info, model_results = train_ensemble_models(X, y)
+                
+                if model_results:
+                    st.markdown(f"**{bt}** (樣本數: {n})")
+                    model_data = []
+                    for name, res in model_results.items():
+                        model_data.append({
+                            '模型': name,
+                            '交叉驗證準確率': f"{res['cv_mean']*100:.1f}%",
+                            '標準差': f"{res['cv_std']*100:.1f}%",
+                        })
+                    st.dataframe(pd.DataFrame(model_data), use_container_width=True, hide_index=True)
+                    
+                    if best_model_info:
+                        st.success(f"最佳模型: {best_model_info[0]}")
+                else:
+                    st.warning(f"{bt}: 所有模型訓練失敗。")
+        else:
+            st.warning("未安裝 sklearn 套件，無法執行 ML 模型訓練。")
+    
+    with ml_col2:
+        st.markdown("##### 時間趨勢 ML 預測建議")
+        
+        if HAS_AI_MODULES and not df_settled.empty:
+            # 基於時間維度的盈虧趨勢分析
+            for bt in bet_types:
+                sub_df = df_settled[df_settled['Bet_Type'].astype(str).str.contains(bt, na=False, regex=False)]
+                n = len(sub_df)
+                
+                if n < ML_MIN_SAMPLES:
+                    st.caption(f"{bt}: 樣本數不足 ({n} < {ML_MIN_SAMPLES})，無法生成 ML 預測建議。")
+                    continue
+                
+                X, y = prepare_enhanced_ml_dataset(sub_df, rating_map)
+                if X is None or len(np.unique(y)) < 2:
+                    continue
+                
+                best_model_info, _ = train_ensemble_models(X, y)
+                
+                if best_model_info:
+                    # 計算最近10場的勝率趨勢
+                    recent = sub_df.tail(min(10, n))
+                    recent_win_rate = len(recent[pd.to_numeric(recent['Unit_Profit'], errors='coerce') > 0]) / len(recent) if len(recent) > 0 else 0
+                    
+                    # 計算最近10場的平均賠率
+                    recent_odds = pd.to_numeric(recent['Initial_Odds'], errors='coerce').mean()
+                    
+                    # 建議
+                    if recent_win_rate >= 0.6:
+                        trend = "上升趨勢 📈"
+                        suggestion = f"{bt} 近期勝率 {recent_win_rate*100:.0f}%，建議繼續關注。"
+                    elif recent_win_rate >= 0.4:
+                        trend = "平穩 ➡️"
+                        suggestion = f"{bt} 近期勝率 {recent_win_rate*100:.0f}%，建議謹慎下注。"
+                    else:
+                        trend = "下降趨勢 📉"
+                        suggestion = f"{bt} 近期勝率 {recent_win_rate*100:.0f}%，建議減少下注或反向操作。"
+                    
+                    st.markdown(f"**{bt}** ({trend})")
+                    st.write(f"最佳模型: {best_model_info[0]}")
+                    st.write(suggestion)
+                    st.caption(f"近期平均賠率: {recent_odds:.2f} | 樣本數: {n}")
+        else:
+            st.info(f"需要更多已結算注單 (≥{ML_MIN_SAMPLES}場/盤口類型) 才能生成 ML 預測建議。")
 
 # ==========================================
 # 6. 主程式 UI 
@@ -1891,6 +2077,8 @@ def main():
     st.sidebar.divider()
     if st.sidebar.button("🔍 數據庫即時線上預覽與管理", use_container_width=True):
         preview_db_dialog(st.session_state.df_db, st.session_state.df_cap, db_file, capital_file, db_table, cap_table)
+    if st.sidebar.button("🗂 已完成注單資料修補 (補填比賽日期)", use_container_width=True):
+        edit_settled_bets_dialog(db_file, db_table)
 
     t_pre, t_inplay, t_settle, t_ai, t_time_pnl = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖ 賽果結算與管理", "🤖 全局模型", "📅 時間維度盈虧記錄分析"])
 
@@ -2745,15 +2933,10 @@ def main():
             st.info("目前尚無已結算的賽事，無法進行績效分析。")
         else:
             # 依照下注金額是否大於 0 來判斷是否將純賠率單位利潤計入該帳戶
-            df_settled['System_Unit_Profit'] = df_settled.apply(
-                lambda x: pd.to_numeric(x['Unit_Profit'], errors='coerce') if pd.to_numeric(x['System_Stake'], errors='coerce') > 0 else 0.0, axis=1
-            )
-            df_settled['User_Unit_Profit'] = df_settled.apply(
-                lambda x: pd.to_numeric(x['Unit_Profit'], errors='coerce') if pd.to_numeric(x['User_Stake'], errors='coerce') > 0 else 0.0, axis=1
-            )
+            df_settled = add_account_unit_profit_columns(df_settled)
 
             st.markdown("### 📊 全局整體績效概覽")
-            st.caption("📅 時間維度盈虧按賽前輸入的比賽日期 (Match_Date) 分組；舊資料無比賽日期時會退回記錄日期 (Date)。")
+            st.caption("時間維度盈虧及相關圖表已合併至『時間維度盈虧記錄分析』板塊；本板塊保留全局績效、各盤口類型績效與深度學習/機器學習盈虧分析。")
             total_bets = len(df_settled)
             sys_pnl_total = pd.to_numeric(df_settled['System_Profit'], errors='coerce').sum()
             usr_pnl_total = pd.to_numeric(df_settled['User_Profit'], errors='coerce').sum()
@@ -2768,31 +2951,9 @@ def main():
             c4.metric("系統單位利潤", f"{sys_unit_profit_total:.2f} U")
             c5.metric("用家單位利潤", f"{usr_unit_profit_total:.2f} U")
 
-            # --- 全局時間維度盈虧 ---
-            global_pnl = compute_period_pnl_table(df_settled)
-            st.markdown("#### 📅 全局時間維度盈虧 (按比賽日期分組)")
-            gp1, gp2, gp3, gp4 = st.columns(4)
-            with gp1:
-                st.markdown("**每日淨盈虧**")
-                st.metric("系統 (最新一期)", f"${global_pnl['D']['sys_latest']:,.2f}")
-                st.metric("用家 (最新一期)", f"${global_pnl['D']['usr_latest']:,.2f}")
-            with gp2:
-                st.markdown("**每周淨盈虧**")
-                st.metric("系統 (最新一期)", f"${global_pnl['W']['sys_latest']:,.2f}")
-                st.metric("用家 (最新一期)", f"${global_pnl['W']['usr_latest']:,.2f}")
-            with gp3:
-                st.markdown("**每季淨盈虧**")
-                st.metric("系統 (最新一期)", f"${global_pnl['Q']['sys_latest']:,.2f}")
-                st.metric("用家 (最新一期)", f"${global_pnl['Q']['usr_latest']:,.2f}")
-            with gp4:
-                st.markdown("**每年淨盈虧**")
-                st.metric("系統 (最新一期)", f"${global_pnl['Y']['sys_latest']:,.2f}")
-                st.metric("用家 (最新一期)", f"${global_pnl['Y']['usr_latest']:,.2f}")
-
-            render_pnl_chart_section(df_settled, "global", "全局")
-
             st.divider()
             st.markdown("### 📈 各盤口類型績效分析")
+            st.caption("各盤口的時間維度盈虧 (每日/每周/每季/每年) 與相關折線圖已合併至『時間維度盈虧記錄分析』板塊。")
             bet_types = ["讓球", "入球大小", "角球大小"]
             
             tabs = st.tabs(bet_types)
@@ -2807,10 +2968,6 @@ def main():
                             "盤口類型": b_type, "注單數": 0, "勝率 (%)": "0.0%", 
                             "系統淨盈虧": 0.0, "用家淨盈虧": 0.0,
                             "系統單位利潤": 0.0, "用家單位利潤": 0.0,
-                            "系統每日淨盈虧": 0.0, "用家每日淨盈虧": 0.0,
-                            "系統每周淨盈虧": 0.0, "用家每周淨盈虧": 0.0,
-                            "系統每季淨盈虧": 0.0, "用家每季淨盈虧": 0.0,
-                            "系統每年淨盈虧": 0.0, "用家每年淨盈虧": 0.0,
                         })
                         continue
                         
@@ -2832,28 +2989,6 @@ def main():
                     
                     st.write(f"**勝率 (贏半或以上):** `{win_rate:.1f}%` ({win_bets}/{t_bets})")
                     
-                    # --- 盤口時間維度盈虧 ---
-                    bt_pnl = compute_period_pnl_table(sub_df)
-                    btc1, btc2, btc3, btc4 = st.columns(4)
-                    with btc1:
-                        st.markdown("**每日淨盈虧**")
-                        st.metric("系統", f"${bt_pnl['D']['sys_latest']:,.2f}")
-                        st.metric("用家", f"${bt_pnl['D']['usr_latest']:,.2f}")
-                    with btc2:
-                        st.markdown("**每周淨盈虧**")
-                        st.metric("系統", f"${bt_pnl['W']['sys_latest']:,.2f}")
-                        st.metric("用家", f"${bt_pnl['W']['usr_latest']:,.2f}")
-                    with btc3:
-                        st.markdown("**每季淨盈虧**")
-                        st.metric("系統", f"${bt_pnl['Q']['sys_latest']:,.2f}")
-                        st.metric("用家", f"${bt_pnl['Q']['usr_latest']:,.2f}")
-                    with btc4:
-                        st.markdown("**每年淨盈虧**")
-                        st.metric("系統", f"${bt_pnl['Y']['sys_latest']:,.2f}")
-                        st.metric("用家", f"${bt_pnl['Y']['usr_latest']:,.2f}")
-                    
-                    render_pnl_chart_section(sub_df, f"bt_{i}", b_type)
-                    
                     performance_data.append({
                         "盤口類型": b_type,
                         "注單數": t_bets,
@@ -2862,14 +2997,6 @@ def main():
                         "用家淨盈虧": usr_p,
                         "系統單位利潤": sys_u,
                         "用家單位利潤": usr_u,
-                        "系統每日淨盈虧": bt_pnl['D']['sys_latest'],
-                        "用家每日淨盈虧": bt_pnl['D']['usr_latest'],
-                        "系統每周淨盈虧": bt_pnl['W']['sys_latest'],
-                        "用家每周淨盈虧": bt_pnl['W']['usr_latest'],
-                        "系統每季淨盈虧": bt_pnl['Q']['sys_latest'],
-                        "用家每季淨盈虧": bt_pnl['Q']['usr_latest'],
-                        "系統每年淨盈虧": bt_pnl['Y']['sys_latest'],
-                        "用家每年淨盈虧": bt_pnl['Y']['usr_latest'],
                     })
 
             st.divider()
@@ -2883,20 +3010,13 @@ def main():
                         "用家淨盈虧": st.column_config.NumberColumn("用家淨盈虧", format="$%.2f"),
                         "系統單位利潤": st.column_config.NumberColumn("系統單位利潤", format="%.2f U"),
                         "用家單位利潤": st.column_config.NumberColumn("用家單位利潤", format="%.2f U"),
-                        "系統每日淨盈虧": st.column_config.NumberColumn("系統每日淨盈虧", format="$%.2f"),
-                        "用家每日淨盈虧": st.column_config.NumberColumn("用家每日淨盈虧", format="$%.2f"),
-                        "系統每周淨盈虧": st.column_config.NumberColumn("系統每周淨盈虧", format="$%.2f"),
-                        "用家每周淨盈虧": st.column_config.NumberColumn("用家每周淨盈虧", format="$%.2f"),
-                        "系統每季淨盈虧": st.column_config.NumberColumn("系統每季淨盈虧", format="$%.2f"),
-                        "用家每季淨盈虧": st.column_config.NumberColumn("用家每季淨盈虧", format="$%.2f"),
-                        "系統每年淨盈虧": st.column_config.NumberColumn("系統每年淨盈虧", format="$%.2f"),
-                        "用家每年淨盈虧": st.column_config.NumberColumn("用家每年淨盈虧", format="$%.2f"),
                     },
                     use_container_width=True
                 )
-                
-                # 盤口類型對比盈虧折線圖
-                render_bet_type_comparison_chart(df_settled, bet_types, "compare")
+            
+            # --- 深度學習與機器學習盈虧分析 (由『時間維度盈虧記錄分析』板塊移至此處) ---
+            st.divider()
+            render_dl_ml_analysis_section(df_settled)
 
     with t_time_pnl:
         df_settled_tdp = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
