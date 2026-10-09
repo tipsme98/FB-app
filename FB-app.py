@@ -3075,6 +3075,70 @@ def main():
                     use_container_width=True
                 )
             
+            # --- 各賽事名稱績效分析 (與各盤口類型績效分析同格式) ---
+            st.divider()
+            st.markdown("### 🏆 各賽事名稱績效分析")
+            st.caption("按賽事名稱 (Tournament_Name) 分類顯示績效，與各盤口類型績效分析格式相同：注單數、系統/用家淨盈虧、系統/用家單位利潤及勝率。分頁按注單數目由多至少排列。")
+            
+            # 取得賽事名稱清單 (按注單數由多至少；空值/NaN 統一顯示為「未指定賽事」)
+            _tourn_series = df_settled['Tournament_Name'].fillna('').astype(str).str.strip()
+            _tourn_series = _tourn_series.replace('', '未指定賽事').replace('nan', '未指定賽事').replace('None', '未指定賽事')
+            tourn_names = _tourn_series.value_counts().index.tolist()
+            
+            if not tourn_names:
+                st.write("暫無賽事結算紀錄。")
+            else:
+                tourn_tabs = st.tabs(tourn_names)
+                tournament_performance_data = []
+                
+                for i, t_name in enumerate(tourn_names):
+                    with tourn_tabs[i]:
+                        sub_df = df_settled[_tourn_series == t_name]
+                        
+                        t_bets = len(sub_df)
+                        win_bets = len(sub_df[pd.to_numeric(sub_df['Unit_Profit'], errors='coerce') > 0])
+                        win_rate = (win_bets / t_bets) * 100 if t_bets > 0 else 0
+                        
+                        sys_p = pd.to_numeric(sub_df['System_Profit'], errors='coerce').sum()
+                        usr_p = pd.to_numeric(sub_df['User_Profit'], errors='coerce').sum()
+                        sys_u = sub_df['System_Unit_Profit'].sum()
+                        usr_u = sub_df['User_Unit_Profit'].sum()
+                        
+                        tmc1, tmc2, tmc3, tmc4, tmc5 = st.columns(5)
+                        tmc1.metric(f"{t_name} 注單", f"{t_bets} 張")
+                        tmc2.metric("系統淨盈虧", f"${sys_p:,.2f}")
+                        tmc3.metric("用家淨盈虧", f"${usr_p:,.2f}")
+                        tmc4.metric("系統單位利潤", f"{sys_u:.2f} U")
+                        tmc5.metric("用家單位利潤", f"{usr_u:.2f} U")
+                        
+                        st.write(f"**勝率 (贏半或以上):** `{win_rate:.1f}%` ({win_bets}/{t_bets})")
+                        
+                        tournament_performance_data.append({
+                            "賽事名稱": t_name,
+                            "注單數": t_bets,
+                            "勝率 (%)": f"{win_rate:.1f}%",
+                            "系統淨盈虧": sys_p,
+                            "用家淨盈虧": usr_p,
+                            "系統單位利潤": sys_u,
+                            "用家單位利潤": usr_u,
+                        })
+                
+                # --- 賽事績效對比一覽表 ---
+                st.divider()
+                st.markdown("### 📋 賽事績效對比一覽表")
+                if tournament_performance_data:
+                    tourn_df = pd.DataFrame(tournament_performance_data)
+                    st.dataframe(
+                        tourn_df,
+                        column_config={
+                            "系統淨盈虧": st.column_config.NumberColumn("系統淨盈虧", format="$%.2f"),
+                            "用家淨盈虧": st.column_config.NumberColumn("用家淨盈虧", format="$%.2f"),
+                            "系統單位利潤": st.column_config.NumberColumn("系統單位利潤", format="%.2f U"),
+                            "用家單位利潤": st.column_config.NumberColumn("用家單位利潤", format="%.2f U"),
+                        },
+                        use_container_width=True
+                    )
+            
             # --- 深度學習與機器學習盈虧分析 (由『時間維度盈虧記錄分析』板塊移至此處) ---
             st.divider()
             render_dl_ml_analysis_section(df_settled)
