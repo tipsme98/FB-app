@@ -6,6 +6,7 @@ import base64
 import re
 import io
 import requests
+import itertools
 from datetime import datetime, timedelta, timezone
 
 # ==========================================
@@ -16,17 +17,28 @@ HKT = timezone(timedelta(hours=8))
 def get_hkt_now():
     return datetime.now(HKT)
 
+def _has_secret(key):
+    """安全檢查 Streamlit Secrets (未設定 secrets.toml 時不會令程式崩潰)"""
+    try:
+        return key in st.secrets
+    except Exception:
+        return False
+
 try:
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
     from sklearn.linear_model import LogisticRegression
     from sklearn.neural_network import MLPClassifier
     from sklearn.preprocessing import StandardScaler
     from sklearn.model_selection import cross_val_score
+    from sklearn.pipeline import Pipeline
     import numpy as np
     HAS_AI_MODULES = True
 except ImportError:
     HAS_AI_MODULES = False
-    np = None
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
 
 try:
     from sqlalchemy import create_engine
@@ -63,7 +75,7 @@ ML_MIN_SAMPLES = 8
 # ==========================================
 # 1. 初始化設定與資料庫 Schema
 # ==========================================
-st.set_page_config(page_title="Actuarial and fund management system by Dr. EdwinPro", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="Actuarial and fund management system by Dr. EdwinPro (V9)", page_icon="⚽", layout="wide")
 
 DB_COLUMNS = [
     'ID', 'Date', 'Status', 
@@ -149,7 +161,7 @@ def load_db(filename, columns, table_name, force_cloud=False):
     
     df = pd.DataFrame()
     # 優先從雲端 SQL 資料庫讀取
-    if HAS_SQLALCHEMY and "DB_URL" in st.secrets and st.secrets["DB_URL"]:
+    if HAS_SQLALCHEMY and _has_secret("DB_URL") and st.secrets["DB_URL"]:
         try:
             engine = create_engine(st.secrets["DB_URL"])
             df = pd.read_sql_table(table_name, engine)
@@ -158,7 +170,7 @@ def load_db(filename, columns, table_name, force_cloud=False):
             pass
 
     # 其次從 GitHub 雲端倉庫讀取
-    if df.empty and "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
+    if df.empty and _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO"):
         try:
             gh_df = load_db_github(st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
             if gh_df is not None and not gh_df.empty:
@@ -188,7 +200,7 @@ def load_db(filename, columns, table_name, force_cloud=False):
 
 def save_db(df, filename, table_name):
     # 1. 寫入 SQL 雲端資料庫
-    if HAS_SQLALCHEMY and "DB_URL" in st.secrets and st.secrets["DB_URL"]:
+    if HAS_SQLALCHEMY and _has_secret("DB_URL") and st.secrets["DB_URL"]:
         try:
             engine = create_engine(st.secrets["DB_URL"])
             df_to_db = df.copy()
@@ -200,7 +212,7 @@ def save_db(df, filename, table_name):
             st.error(f"SQL 資料庫儲存失敗: {e}")
 
     # 2. 寫入 GitHub 雲端倉庫
-    if "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets:
+    if _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO"):
         try:
             save_db_github(df, st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
         except Exception as e:
@@ -917,6 +929,964 @@ def evaluate_dimension_enhanced(df_subset, dim_name, candidates_base, rating_map
     }
 
 # ==========================================
+# 3c. V9 市場錨定 ML 引擎 (Market-Anchored ML Engine)
+# ==========================================
+# 設計重點：
+#  1) 以「去水後的市場公平機率」為錨點，模型只學習『市場以外』的額外優勢，
+#     並以時間序列前進式驗證 (Walk-Forward) 決定模型可信權重 w；模型未能勝過市場時 w=0 → 不建議投注。
+#  2) 訓練資料由每場已結算比賽的完整 Odds_History 重建：所有盤口、所有盤口線、主客/大小兩邊皆成為樣本，
+#     (不再只學習曾經下注的注單，消除選擇偏差，樣本量約增加 2.5 倍)。
+#  3) 目標值為「有效勝率」e = (單位回報 + 1) / 賠率，完整處理亞洲盤贏半/輸半/走盤，EV = p × 賠率 − 1 為精確期望值。
+#  4) 球隊特徵只使用『比賽日期之前』的數據 (近況、攻防數據、對賽、賽事環境)，杜絕未來數據洩漏。
+#  5) 自動測試各特徵群組的組合 (例如 排名+賠率變化、排名+近5場+賠率變化+攻防數據...)，以樣本外 Log-Loss 選出最佳組合。
+#  6) 以前進式回測計算各盤口類型的樣本外 ROI，長期虧損的盤口自動熔斷 (可於側邊欄手動解除)。
+
+V9_MIN_MATCHES = 30           # 訓練所需最少已結算比賽數
+V9_TEAM_LOOKBACK = 8          # 球隊近況/攻防數據回看場數
+V9_SHRINK_K = 3.0             # 球隊數據收縮強度 (樣本少時向聯賽平均收縮)
+V9_LEAGUE_SHRINK_K = 5.0      # 賽事環境數據收縮強度
+V9_DEFAULTS = {'gf': 1.40, 'cf': 5.0, 'sot': 4.3, 'shots': 11.5, 'da': 45.0}
+V9_BT_THRESHOLDS = [0.0, 0.02, 0.03, 0.05, 0.08]
+
+V9_FEATURE_GROUPS = {
+    '市場賠率': ['f_mkt_logit', 'f_margin'],
+    '賠率變化': ['f_drift_side', 'f_drift_opp', 'f_nsnap'],
+    '排名': ['f_rank_side'],
+    '近5場戰績': ['f_form_side'],
+    '球隊攻防數據': ['f_team_edge', 'f_team_shot_edge', 'f_team_n'],
+    '對賽往績': ['f_h2h_edge', 'f_h2h_n'],
+    '賽事環境': ['f_league_edge'],
+    '盤口結構': ['f_is_hd', 'f_is_ou', 'f_side_hi', 'f_hd_home', 'f_ou_over', 'f_cr_over', 'f_quarter', 'f_line_norm'],
+    '因素交互': ['f_x_rank_drift', 'f_x_form_drift', 'f_x_team_drift', 'f_x_rank_form', 'f_x_team_rank', 'f_x_mkt_drift'],
+}
+V9_ALL_FEATURES = [f for g in V9_FEATURE_GROUPS.values() for f in g]
+
+V9_FEATURE_DESC = {
+    'f_mkt_logit': ('市場賠率', '去水後市場公平勝率 (logit)，模型的錨點'),
+    'f_margin': ('市場賠率', '該盤口抽水 (1/上賠率 + 1/下賠率)'),
+    'f_drift_side': ('賠率變化', '本方向賠率由首個時間點至當前的變化率 (負數=受注降水)'),
+    'f_drift_opp': ('賠率變化', '對面方向賠率變化率'),
+    'f_nsnap': ('賠率變化', '該盤口賠率紀錄次數 (log)'),
+    'f_rank_side': ('排名', '聯賽排名實力差 (按投注方向定正負)'),
+    'f_form_side': ('近5場戰績', '近5場積分差 (按投注方向定正負)'),
+    'f_team_edge': ('球隊攻防數據', '數據庫過往賽事：預期入球差/總入球/總角球 減 盤口線'),
+    'f_team_shot_edge': ('球隊攻防數據', '數據庫過往賽事：射正/危險進攻攻防差'),
+    'f_team_n': ('球隊攻防數據', '兩隊在數據庫內的過往場數 (數據可信度)'),
+    'f_h2h_edge': ('對賽往績', '同一對手過往對賽：入球差/總入球/總角球 減 盤口線'),
+    'f_h2h_n': ('對賽往績', '過往對賽場數'),
+    'f_league_edge': ('賽事環境', '同一賽事過往平均入球/角球/主場優勢 減 盤口線'),
+    'f_is_hd': ('盤口結構', '是否讓球盤'),
+    'f_is_ou': ('盤口結構', '是否入球大小盤'),
+    'f_side_hi': ('盤口結構', '投注方向 (主隊/大 = 1)'),
+    'f_hd_home': ('盤口結構', '讓球 × 買主隊 (學習讓球主客方向偏差)'),
+    'f_ou_over': ('盤口結構', '入球大小 × 買大 (學習入球大小方向偏差)'),
+    'f_cr_over': ('盤口結構', '角球大小 × 買大 (學習角球大小方向偏差)'),
+    'f_quarter': ('盤口結構', '是否四分一盤 (會出現贏半/輸半)'),
+    'f_line_norm': ('盤口結構', '盤口線 (標準化)'),
+    'f_x_rank_drift': ('因素交互', '排名 × 賠率變化'),
+    'f_x_form_drift': ('因素交互', '近5場 × 賠率變化'),
+    'f_x_team_drift': ('因素交互', '攻防數據 × 賠率變化'),
+    'f_x_rank_form': ('因素交互', '排名 × 近5場'),
+    'f_x_team_rank': ('因素交互', '攻防數據 × 排名'),
+    'f_x_mkt_drift': ('因素交互', '市場勝率 × 賠率變化'),
+}
+
+LEGACY_16_FEATURES = [
+    ('hr', '主隊實力分 (排名/字母評級換算 1~5)'),
+    ('ar', '客隊實力分'),
+    ('hf', '主隊近5場積分 (勝3和1)'),
+    ('af', '客隊近5場積分'),
+    ('line', '盤口線'),
+    ('odds', '賠率'),
+    ('rating_diff', '主客實力差'),
+    ('form_diff', '主客近況積分差'),
+    ('stake_log', 'log(系統注碼)：訓練用實際注碼、預測時固定為 0 → 訓練/預測不一致 (缺陷)'),
+    ('odds_margin', '賠率 − 1 (與 odds 完全重複)'),
+    ('odds_drift', '本方向賠率走勢變化'),
+    ('sel_home', '是否買主隊'),
+    ('sel_over', '是否買大'),
+    ('side_str_diff', '按方向的實力差'),
+    ('is_hd', '是否讓球盤'),
+    ('is_ou', '是否入球大小盤'),
+]
+
+
+def v9_clean_bt(bt):
+    return str(bt).replace(' (即場)', '').strip()
+
+
+def v9_unit_return(diff, odds):
+    """亞洲盤單位回報 (與 calculate_settlement 完全相同的判定規則)"""
+    diff = round(float(diff), 2)
+    odds = float(odds)
+    if diff >= 0.5:
+        return odds - 1.0
+    if abs(diff - 0.25) < 1e-9:
+        return (odds - 1.0) / 2.0
+    if abs(diff) < 1e-9:
+        return 0.0
+    if abs(diff + 0.25) < 1e-9:
+        return -0.5
+    return -1.0
+
+
+def v9_diff(btype, side, line, hg, ag, hc, ac):
+    if btype == '讓球':
+        return (hg + line - ag) if side == 'Home' else (ag - line - hg)
+    if btype == '入球大小':
+        return (hg + ag - line) if side == 'Over' else (line - hg - ag)
+    return (hc + ac - line) if side == 'Over' else (line - hc - ac)
+
+
+def v9_devig(o_side, o_opp):
+    """比例法去水：回傳本方向公平機率"""
+    try:
+        a, b = 1.0 / float(o_side), 1.0 / float(o_opp)
+        if a > 0 and b > 0:
+            return a / (a + b), a + b
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return 0.5, 1.0
+
+
+def v9_logit(p):
+    p = min(0.98, max(0.02, float(p)))
+    return float(np.log(p / (1.0 - p)))
+
+
+def v9_sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def v9_parse_oh_time(s, ref_date=None):
+    """解析賠率紀錄時間。馬會格式為 日-月 (例如 18-09 07:11)，優先以 日-月 解析，
+    並依比賽日期推斷年份 (修正舊版先以 月-日 解析導致 05-10 被誤判為 5月10日 的排序錯誤)"""
+    s = str(s or '').strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            pass
+    ref_year = ref_date.year if ref_date is not None else get_hkt_now().year
+    for fmt in ("%d-%m %H:%M", "%d/%m %H:%M", "%m-%d %H:%M", "%m/%d %H:%M"):
+        try:
+            dt = datetime.strptime(f"{ref_year}-{s}", f"%Y-{fmt}")
+            if ref_date is not None and (dt - ref_date).days > 180:
+                dt = dt.replace(year=ref_year - 1)
+            return dt
+        except ValueError:
+            pass
+    return None
+
+
+def v9_group_markets(odds_history, ref_date=None):
+    """將 Odds_History 依 (盤口類型, 盤口線) 分組並依時間排序 (無時間按儲存順序)"""
+    markets = {}
+    if not isinstance(odds_history, list):
+        return markets
+    for pos, h in enumerate(odds_history):
+        try:
+            bt = v9_clean_bt(h.get('type', ''))
+            if bt not in ('讓球', '入球大小', '角球大小'):
+                continue
+            ln = round(float(h.get('line', 0.0)), 3)
+            up, lw = float(h.get('upper')), float(h.get('lower'))
+            if up <= 1.0 or lw <= 1.0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        ts = v9_parse_oh_time(h.get('record_time', ''), ref_date)
+        markets.setdefault((bt, ln), []).append((ts or datetime.min, pos, up, lw))
+    for k in markets:
+        markets[k].sort(key=lambda x: (x[0], x[1]))
+    return markets
+
+
+def v9_safe_float(v, default=np.nan):
+    try:
+        f = float(v)
+        return f if np.isfinite(f) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def v9_strength(rating, league_size):
+    try:
+        return float(rating_to_strength(rating, league_size))
+    except Exception:
+        return 3.0
+
+
+def v9_build_match_table(df_settled):
+    """由已結算注單建立『一場比賽一行』的賽果與賽況數據表 (含最完整的賽前賠率紀錄)"""
+    if df_settled is None or df_settled.empty:
+        return pd.DataFrame()
+    d = df_settled.copy()
+    d['_md'] = pd.to_datetime(d['Match_Date'], errors='coerce')
+    d['_dt'] = pd.to_datetime(d['Date'], errors='coerce')
+    d['_md'] = d['_md'].fillna(d['_dt'].dt.normalize())
+    d = d[d['_md'].notna() & d['Match'].notna()]
+    rows = []
+    for (match, md), g in d.groupby(['Match', '_md'], sort=False):
+        def first_num(col):
+            if col not in g.columns:
+                return np.nan
+            s = pd.to_numeric(g[col], errors='coerce').dropna()
+            return float(s.iloc[0]) if len(s) else np.nan
+        hg, ag, hc, ac = first_num('Home_Goal'), first_num('Away_Goal'), first_num('Home_Corner'), first_num('Away_Corner')
+        if np.isnan(hg) or np.isnan(ag):
+            continue
+        pre = g[~g['Bet_Type'].astype(str).str.contains('即場', na=False)]
+        src = pre if not pre.empty else g
+        best_oh, best_len = [], -1
+        for s in src['Odds_History'].dropna():
+            try:
+                oh = json.loads(str(s))
+                if isinstance(oh, list) and len(oh) > best_len:
+                    best_oh, best_len = oh, len(oh)
+            except Exception:
+                continue
+        r0 = g.iloc[0]
+        ls = get_league_size(r0)
+        rows.append({
+            'key': f"{match}|{md.strftime('%Y-%m-%d')}", 'match': match, 'date': md,
+            'tourn': str(r0.get('Tournament_Name', '')), 'home': str(r0.get('Home_Team', '')), 'away': str(r0.get('Away_Team', '')),
+            'hs': v9_strength(r0.get('Home_Rating'), ls), 'as': v9_strength(r0.get('Away_Rating'), ls),
+            'hfp': float(extract_form_points(r0.get('Home_Form', '0W0D0L'))), 'afp': float(extract_form_points(r0.get('Away_Form', '0W0D0L'))),
+            'hg': hg, 'ag': ag, 'hc': hc if not np.isnan(hc) else np.nan, 'ac': ac if not np.isnan(ac) else np.nan,
+            'hsot': first_num('Home_SoT'), 'asot': first_num('Away_SoT'),
+            'hsoff': first_num('Home_SoFF'), 'asoff': first_num('Away_SoFF'),
+            'hda': first_num('Home_DA'), 'ada': first_num('Away_DA'),
+            'oh': best_oh, 'nbets': len(g), 'oh_len': max(0, best_len),
+        })
+    mt = pd.DataFrame(rows)
+    if mt.empty:
+        return mt
+    mt = v9_dedupe_matches(mt)
+    return mt.sort_values('date').reset_index(drop=True)
+
+
+def v9_dedupe_matches(mt):
+    """同一場比賽被以不同比賽日期重複輸入 (同隊伍、完全相同的入球及角球，日期相距 ≤ 60 日) 會造成『對賽往績』洩漏賽果，
+    只保留注單數最多 (其次賠率紀錄最完整) 的一筆"""
+    if mt is None or mt.empty:
+        return mt
+    order = mt.sort_values(['nbets', 'oh_len'], ascending=False)
+    keep, seen = [], []
+    for i, r in order.iterrows():
+        dup = False
+        for j in seen:
+            q = mt.loc[j]
+            same_score = (r['hg'] == q['hg'] and r['ag'] == q['ag'] and
+                          ((np.isnan(r['hc']) and np.isnan(q['hc'])) or r['hc'] == q['hc']) and
+                          ((np.isnan(r['ac']) and np.isnan(q['ac'])) or r['ac'] == q['ac']))
+            if r['match'] == q['match'] and same_score and abs((r['date'] - q['date']).days) <= 60:
+                dup = True
+                break
+        if not dup:
+            keep.append(i)
+            seen.append(i)
+    return mt.loc[sorted(keep)]
+
+
+def v9_find_duplicate_matches(df_db):
+    """找出疑似重複輸入的比賽 (同一 Match、不同 Match_Date、賽果完全相同)，供資料修正"""
+    try:
+        d = df_db[df_db['Status'] == 'Settled'].copy()
+        if d.empty:
+            return pd.DataFrame()
+        d['_md'] = d['Match_Date'].astype(str).str[:10]
+        g = d.groupby('Match').agg(日期=('_md', lambda x: sorted(set(x))),
+                                   比分=('Home_Goal', lambda x: sorted(set(pd.to_numeric(x, errors='coerce').dropna()))),
+                                   客隊入球=('Away_Goal', lambda x: sorted(set(pd.to_numeric(x, errors='coerce').dropna()))),
+                                   注單數=('ID', 'size'))
+        g = g[(g['日期'].apply(len) > 1) & (g['比分'].apply(len) == 1) & (g['客隊入球'].apply(len) == 1)]
+        if g.empty:
+            return pd.DataFrame()
+        g = g.reset_index()
+        g['日期'] = g['日期'].apply(lambda x: ' / '.join(x))
+        g['比分'] = g.apply(lambda r: f"{int(r['比分'][0])}-{int(r['客隊入球'][0])}", axis=1)
+        return g[['Match', '日期', '比分', '注單數']].rename(columns={'Match': '比賽'})
+    except Exception:
+        return pd.DataFrame()
+
+
+def v9_team_long(mt):
+    """將比賽表轉換為『每隊每場一行』的長表 (進攻=for, 防守=against)"""
+    if mt is None or mt.empty:
+        return pd.DataFrame()
+    recs = []
+    for _, r in mt.iterrows():
+        hsh = r['hsot'] + r['hsoff'] if not (np.isnan(r['hsot']) or np.isnan(r['hsoff'])) else np.nan
+        ash = r['asot'] + r['asoff'] if not (np.isnan(r['asot']) or np.isnan(r['asoff'])) else np.nan
+        recs.append({'team': r['home'], 'date': r['date'], 'tourn': r['tourn'], 'gf': r['hg'], 'ga': r['ag'], 'cf': r['hc'], 'ca': r['ac'],
+                     'sotf': r['hsot'], 'sota': r['asot'], 'shf': hsh, 'sha': ash, 'daf': r['hda'], 'daa': r['ada']})
+        recs.append({'team': r['away'], 'date': r['date'], 'tourn': r['tourn'], 'gf': r['ag'], 'ga': r['hg'], 'cf': r['ac'], 'ca': r['hc'],
+                     'sotf': r['asot'], 'sota': r['hsot'], 'shf': ash, 'sha': hsh, 'daf': r['ada'], 'daa': r['hda']})
+    return pd.DataFrame(recs)
+
+
+def v9_league_profile(mt, tourn, before):
+    """賽事環境 (只用 before 之前的比賽)：平均總入球、總角球、主隊淨勝球，向全局平均收縮"""
+    prior = mt[mt['date'] < before] if (mt is not None and not mt.empty) else pd.DataFrame()
+    g_goals = float((prior['hg'] + prior['ag']).mean()) if len(prior) else 2 * V9_DEFAULTS['gf']
+    g_corn_s = (prior['hc'] + prior['ac']).dropna() if len(prior) else pd.Series(dtype=float)
+    g_corn = float(g_corn_s.mean()) if len(g_corn_s) else 2 * V9_DEFAULTS['cf']
+    g_hgd = float((prior['hg'] - prior['ag']).mean()) if len(prior) else 0.25
+    if not np.isfinite(g_goals):
+        g_goals = 2 * V9_DEFAULTS['gf']
+    if not np.isfinite(g_hgd):
+        g_hgd = 0.25
+    t = prior[prior['tourn'] == tourn] if len(prior) else prior
+    k = V9_LEAGUE_SHRINK_K
+    n = len(t)
+    goals = (float((t['hg'] + t['ag']).sum()) + k * g_goals) / (n + k) if n else g_goals
+    tc = (t['hc'] + t['ac']).dropna() if n else pd.Series(dtype=float)
+    corners = (float(tc.sum()) + k * g_corn) / (len(tc) + k) if len(tc) else g_corn
+    hgd = (float((t['hg'] - t['ag']).sum()) + k * g_hgd) / (n + k) if n else g_hgd
+    return {'goals': goals, 'corners': corners, 'hgd': hgd, 'n': n}
+
+
+def v9_team_profile(tl, team, before, league):
+    """球隊攻防數據 (只用 before 之前最近 V9_TEAM_LOOKBACK 場)，各項向賽事平均收縮"""
+    prior_g = league['goals'] / 2.0
+    prior_c = league['corners'] / 2.0
+    if tl is None or tl.empty:
+        h = pd.DataFrame()
+    else:
+        h = tl[(tl['team'] == team) & (tl['date'] < before)].sort_values('date').tail(V9_TEAM_LOOKBACK)
+    k = V9_SHRINK_K
+
+    def shr(col, prior):
+        if h.empty or col not in h.columns:
+            return prior
+        s = pd.to_numeric(h[col], errors='coerce').dropna()
+        return (float(s.sum()) + k * prior) / (len(s) + k)
+    return {
+        'gf': shr('gf', prior_g), 'ga': shr('ga', prior_g), 'cf': shr('cf', prior_c), 'ca': shr('ca', prior_c),
+        'sotf': shr('sotf', V9_DEFAULTS['sot']), 'sota': shr('sota', V9_DEFAULTS['sot']),
+        'daf': shr('daf', V9_DEFAULTS['da']), 'daa': shr('daa', V9_DEFAULTS['da']),
+        'n': 0 if h.empty else len(h),
+    }
+
+
+def v9_h2h(mt, home, away, before):
+    if mt is None or mt.empty:
+        return []
+    p = mt[(mt['date'] < before) & (((mt['home'] == home) & (mt['away'] == away)) | ((mt['home'] == away) & (mt['away'] == home)))]
+    out = []
+    for _, r in p.iterrows():
+        same = (r['home'] == home)
+        gd = (r['hg'] - r['ag']) if same else (r['ag'] - r['hg'])
+        out.append({'gd': gd, 'tg': r['hg'] + r['ag'], 'tc': (r['hc'] + r['ac']) if not np.isnan(r['hc'] + r['ac']) else np.nan})
+    return out
+
+
+def v9_match_context(mt, tl, home, away, tourn, date, hs, as_, hfp, afp):
+    league = v9_league_profile(mt, tourn, date)
+    return {
+        'hs': float(hs), 'as': float(as_), 'hfp': float(hfp), 'afp': float(afp),
+        'hp': v9_team_profile(tl, home, date, league), 'ap': v9_team_profile(tl, away, date, league),
+        'league': league, 'h2h': v9_h2h(mt, home, away, date),
+    }
+
+
+def v9_side_features(btype, side, line, o_side, o_opp, drift_side, drift_opp, nsnap, ctx):
+    """按投注方向計算特徵 (s=+1 主隊/大，s=-1 客隊/小)，全部只用賽前資料"""
+    s = 1.0 if side in ('Home', 'Over') else -1.0
+    p_mkt, margin = v9_devig(o_side, o_opp)
+    hp, ap, lg = ctx['hp'], ctx['ap'], ctx['league']
+    hs, as_, hfp, afp = ctx['hs'], ctx['as'], ctx['hfp'], ctx['afp']
+    h2h = ctx['h2h']
+    line = float(line)
+    if btype == '讓球':
+        rank = s * (hs - as_) / 4.0
+        form = s * (hfp - afp) / 15.0
+        exp_gd = (hp['gf'] + ap['ga']) / 2.0 - (ap['gf'] + hp['ga']) / 2.0 + lg['hgd'] * 0.5
+        team = s * (exp_gd + line)
+        shot = s * (((hp['sotf'] + ap['sota']) / 2.0) - ((ap['sotf'] + hp['sota']) / 2.0)) / 3.0
+        h2v = s * (float(np.mean([x['gd'] for x in h2h])) + line) if h2h else 0.0
+        leag = s * (lg['hgd'] + line)
+        line_norm = line / 1.5
+    elif btype == '入球大小':
+        rank = s * ((hs + as_) / 2.0 - 3.0) / 2.0
+        form = s * ((hfp + afp) / 2.0 - 7.0) / 7.0
+        exp_t = (hp['gf'] + ap['ga']) / 2.0 + (ap['gf'] + hp['ga']) / 2.0
+        team = s * (exp_t - line)
+        shot = s * (((hp['sotf'] + ap['sota']) / 2.0 + (ap['sotf'] + hp['sota']) / 2.0) - 2 * V9_DEFAULTS['sot']) / 3.0
+        h2v = s * (float(np.mean([x['tg'] for x in h2h])) - line) if h2h else 0.0
+        leag = s * (lg['goals'] - line)
+        line_norm = (line - 2.5) / 1.0
+    else:
+        rank = s * abs(hs - as_) / 4.0
+        form = s * abs(hfp - afp) / 15.0
+        exp_c = (hp['cf'] + ap['ca']) / 2.0 + (ap['cf'] + hp['ca']) / 2.0
+        team = s * (exp_c - line) / 2.0
+        shot = s * (((hp['daf'] + ap['daa']) / 2.0 + (ap['daf'] + hp['daa']) / 2.0) - 2 * V9_DEFAULTS['da']) / 20.0
+        tcs = [x['tc'] for x in h2h if not np.isnan(x['tc'])]
+        h2v = s * (float(np.mean(tcs)) - line) / 2.0 if tcs else 0.0
+        leag = s * (lg['corners'] - line) / 2.0
+        line_norm = (line - 10.0) / 2.0
+    team = float(np.clip(team, -3, 3))
+    h2v = float(np.clip(h2v, -3, 3))
+    leag = float(np.clip(leag, -3, 3))
+    ds = float(np.clip(v9_safe_float(drift_side, 0.0), -0.5, 0.5))
+    do = float(np.clip(v9_safe_float(drift_opp, 0.0), -0.5, 0.5))
+    mk = v9_logit(p_mkt)
+    f = {
+        'f_mkt_logit': mk, 'f_margin': float(margin - 1.0),
+        'f_drift_side': ds, 'f_drift_opp': do, 'f_nsnap': float(np.log1p(max(1, int(nsnap)))),
+        'f_rank_side': float(rank), 'f_form_side': float(form),
+        'f_team_edge': team, 'f_team_shot_edge': float(np.clip(shot, -3, 3)),
+        'f_team_n': float(min(hp['n'], ap['n'])) / V9_TEAM_LOOKBACK,
+        'f_h2h_edge': h2v, 'f_h2h_n': float(min(len(h2h), 3)) / 3.0,
+        'f_league_edge': leag,
+        'f_is_hd': 1.0 if btype == '讓球' else 0.0, 'f_is_ou': 1.0 if btype == '入球大小' else 0.0,
+        'f_side_hi': 1.0 if s > 0 else 0.0,
+        'f_hd_home': 1.0 if (btype == '讓球' and s > 0) else 0.0,
+        'f_ou_over': 1.0 if (btype == '入球大小' and s > 0) else 0.0,
+        'f_cr_over': 1.0 if (btype == '角球大小' and s > 0) else 0.0,
+        'f_quarter': 1.0 if abs((abs(line) * 4) % 2 - 1) < 1e-6 else 0.0,
+        'f_line_norm': float(line_norm),
+    }
+    f['f_x_rank_drift'] = f['f_rank_side'] * ds * 10
+    f['f_x_form_drift'] = f['f_form_side'] * ds * 10
+    f['f_x_team_drift'] = team * ds * 10
+    f['f_x_rank_form'] = f['f_rank_side'] * f['f_form_side']
+    f['f_x_team_rank'] = team * f['f_rank_side']
+    f['f_x_mkt_drift'] = mk * ds * 10
+    return f, p_mkt
+
+
+def v9_build_training_set(mt):
+    """每場比賽、每個盤口 (類型+盤口線) 取最後一個賠率時間點，主客/大小兩邊皆成為訓練樣本"""
+    if mt is None or mt.empty:
+        return pd.DataFrame()
+    tl = v9_team_long(mt)
+    rows = []
+    for _, m in mt.iterrows():
+        ctx = v9_match_context(mt, tl, m['home'], m['away'], m['tourn'], m['date'], m['hs'], m['as'], m['hfp'], m['afp'])
+        markets = v9_group_markets(m['oh'], m['date'].to_pydatetime() if hasattr(m['date'], 'to_pydatetime') else None)
+        for (bt, ln), snaps in markets.items():
+            if bt == '角球大小' and (np.isnan(m['hc']) or np.isnan(m['ac'])):
+                continue
+            first, last = snaps[0], snaps[-1]
+            for side in (['Home', 'Away'] if bt == '讓球' else ['Over', 'Under']):
+                hi = side in ('Home', 'Over')
+                o_side, o_opp = (last[2], last[3]) if hi else (last[3], last[2])
+                o0_side, o0_opp = (first[2], first[3]) if hi else (first[3], first[2])
+                f, p_mkt = v9_side_features(bt, side, ln, o_side, o_opp, o_side / o0_side - 1.0, o_opp / o0_opp - 1.0, len(snaps), ctx)
+                diff = v9_diff(bt, side, ln, m['hg'], m['ag'], 0 if np.isnan(m['hc']) else m['hc'], 0 if np.isnan(m['ac']) else m['ac'])
+                ret = v9_unit_return(diff, o_side)
+                f.update({'key': m['key'], 'date': m['date'], 'tourn': m['tourn'], 'bet_type': bt, 'side': side, 'line': ln,
+                          'odds': o_side, 'p_mkt': p_mkt, 'ret': ret, 'e': (ret + 1.0) / o_side})
+                rows.append(f)
+    return pd.DataFrame(rows)
+
+
+def v9_soft_fit(kind, X, e):
+    """以軟標籤 (有效勝率 e) 訓練：每行複製為 y=1 (權重 e) 與 y=0 (權重 1-e)，等同精確的期望值對數損失"""
+    X = np.asarray(X, dtype=float)
+    e = np.clip(np.asarray(e, dtype=float), 0.0, 1.0)
+    X2 = np.vstack([X, X])
+    y2 = np.concatenate([np.ones(len(X)), np.zeros(len(X))])
+    w2 = np.concatenate([e, 1.0 - e]) + 1e-6
+    if kind == 'LR':
+        mdl = Pipeline([('sc', StandardScaler()), ('lr', LogisticRegression(C=0.3, max_iter=1000))])
+        mdl.fit(X2, y2, lr__sample_weight=w2)
+    else:
+        mdl = GradientBoostingClassifier(n_estimators=80, max_depth=2, learning_rate=0.05, subsample=0.8, min_samples_leaf=20, random_state=42)
+        mdl.fit(X2, y2, sample_weight=w2)
+    return mdl
+
+
+def v9_soft_logloss(p, e):
+    p = np.clip(np.asarray(p, dtype=float), 1e-4, 1 - 1e-4)
+    e = np.asarray(e, dtype=float)
+    return float(-np.mean(e * np.log(p) + (1 - e) * np.log(1 - p)))
+
+
+def v9_folds(dates, n_folds=5, init_frac=0.4):
+    ud = sorted(pd.Series(dates).dropna().unique())
+    if len(ud) < 4:
+        return []
+    start = max(1, int(len(ud) * init_frac))
+    test_dates = ud[start:]
+    if not test_dates:
+        return []
+    chunks = np.array_split(np.array(test_dates, dtype=object), min(n_folds, len(test_dates)))
+    return [(c[0], c[-1]) for c in chunks if len(c)]
+
+
+def v9_walk_forward(ts, cols, kind, folds):
+    """時間序列前進式驗證：每一折只用之前日期的數據訓練，預測之後日期 (完全樣本外)"""
+    preds = pd.Series(np.nan, index=ts.index)
+    for d0, d1 in folds:
+        tr = ts[ts['date'] < d0]
+        te = ts[(ts['date'] >= d0) & (ts['date'] <= d1)]
+        if len(tr) < 80 or te.empty:
+            continue
+        try:
+            if kind == 'AVG':
+                m1 = v9_soft_fit('LR', tr[cols].values, tr['e'].values)
+                m2 = v9_soft_fit('GB', tr[cols].values, tr['e'].values)
+                p = 0.5 * m1.predict_proba(te[cols].values)[:, 1] + 0.5 * m2.predict_proba(te[cols].values)[:, 1]
+            else:
+                m = v9_soft_fit(kind, tr[cols].values, tr['e'].values)
+                p = m.predict_proba(te[cols].values)[:, 1]
+            preds.loc[te.index] = p
+        except Exception:
+            continue
+    return preds
+
+
+def v9_blend(p_mkt, p_model, w):
+    lm = np.log(np.clip(p_mkt, 1e-4, 1 - 1e-4) / (1 - np.clip(p_mkt, 1e-4, 1 - 1e-4)))
+    lp = np.log(np.clip(p_model, 1e-4, 1 - 1e-4) / (1 - np.clip(p_model, 1e-4, 1 - 1e-4)))
+    return v9_sigmoid((1 - w) * lm + w * lp)
+
+
+def v9_market_e(ts):
+    """市場基準的有效勝率：在市場公平賠率下 E[e] = 公平機率；轉換至實際賠率時 EV_mkt = p_mkt × 賠率 − 1"""
+    return ts['p_mkt'].values
+
+
+def v9_backtest(oof, thr):
+    """每場比賽、每種盤口類型最多選一注 (EV 最高且 ≥ 門檻)，以樣本外預測計算真實回報"""
+    if oof is None or oof.empty:
+        return pd.DataFrame()
+    d = oof[oof['ev'] >= thr]
+    if d.empty:
+        return pd.DataFrame(columns=oof.columns)
+    idx = d.groupby(['key', 'bet_type'])['ev'].idxmax()
+    return d.loc[idx]
+
+
+def v9_train_engine(df_settled):
+    """完整訓練流程：建表 → 特徵組合搜尋 → 模型選擇 → 市場錨定權重 → 回測與熔斷"""
+    out = {'trained': False, 'msg': '', 'w': 0.0, 'cols': [], 'groups': [], 'kind': 'MARKET',
+           'n_matches': 0, 'n_rows': 0, 'combo_table': [], 'model_table': [], 'bt_table': [], 'bt_type': {},
+           'models': None, 'll_market': None, 'll_model': None, 'feat_importance': []}
+    if not HAS_AI_MODULES:
+        out['msg'] = '未安裝 scikit-learn，只能使用市場公平機率 (不建議投注)。'
+        return out
+    mt = v9_build_match_table(df_settled)
+    out['n_matches'] = 0 if mt.empty else len(mt)
+    if mt.empty or len(mt) < V9_MIN_MATCHES:
+        out['msg'] = f'已結算比賽不足 {V9_MIN_MATCHES} 場 (目前 {out["n_matches"]} 場)，暫以市場公平機率運算。'
+        return out
+    ts = v9_build_training_set(mt)
+    out['n_rows'] = len(ts)
+    if ts.empty or len(ts) < 150:
+        out['msg'] = '可用盤口樣本不足，暫以市場公平機率運算。'
+        return out
+    ts = ts.reset_index(drop=True)
+    folds = v9_folds(ts['date'])
+    if not folds:
+        out['msg'] = '比賽日期不足以進行前進式驗證。'
+        return out
+    run_ctx = _threadpool_limits(limits=1) if HAS_THREADPOOLCTL else None
+    try:
+        if run_ctx is not None:
+            run_ctx.__enter__()
+        # --- 1) 特徵組合搜尋 (市場賠率為必選錨點 + 其餘群組任意組合，LR 快速評估) ---
+        other = [g for g in V9_FEATURE_GROUPS if g != '市場賠率']
+        valid_mask = None
+        combos = []
+        for k in range(0, len(other) + 1):
+            for comb in itertools.combinations(other, k):
+                if '因素交互' in comb and len(comb) == 1:
+                    continue
+                groups = ['市場賠率'] + list(comb)
+                cols = [c for g in groups for c in V9_FEATURE_GROUPS[g]]
+                p = v9_walk_forward(ts, cols, 'LR', folds)
+                if valid_mask is None:
+                    valid_mask = p.notna()
+                m = valid_mask & p.notna()
+                if m.sum() < 50:
+                    continue
+                combos.append({'groups': groups, 'cols': cols, 'll': v9_soft_logloss(p[m], ts.loc[m, 'e']), 'n': int(m.sum())})
+        if not combos or valid_mask is None or valid_mask.sum() < 50:
+            out['msg'] = '前進式驗證樣本不足。'
+            return out
+        vm = valid_mask
+        ll_market = v9_soft_logloss(ts.loc[vm, 'p_mkt'], ts.loc[vm, 'e'])
+        out['ll_market'] = ll_market
+        combos.sort(key=lambda c: c['ll'])
+        best_ll = combos[0]['ll']
+        # 簡約原則：在最佳 Log-Loss 0.0005 範圍內選擇群組最少的組合，降低過度擬合
+        near = [c for c in combos if c['ll'] <= best_ll + 0.0005]
+        chosen = sorted(near, key=lambda c: (len(c['groups']), c['ll']))[0]
+        out['combo_table'] = [{'特徵組合': ' + '.join(c['groups']), '群組數': len(c['groups']), '樣本外 Log-Loss': round(c['ll'], 5),
+                               '相對市場改善': round(ll_market - c['ll'], 5)} for c in combos]
+        cols = chosen['cols']
+        out['cols'], out['groups'] = cols, chosen['groups']
+        # --- 2) 模型選擇 (LR / GB / 平均集成) ---
+        model_preds = {'LR': v9_walk_forward(ts, cols, 'LR', folds)}
+        if len(ts) >= 400:
+            model_preds['GB'] = v9_walk_forward(ts, cols, 'GB', folds)
+            model_preds['AVG'] = (model_preds['LR'] + model_preds['GB']) / 2.0
+        mtab = []
+        best_kind, best_kind_ll = None, 1e9
+        for kind, p in model_preds.items():
+            m = vm & p.notna()
+            if m.sum() < 50:
+                continue
+            ll = v9_soft_logloss(p[m], ts.loc[m, 'e'])
+            mtab.append({'模型': {'LR': '邏輯迴歸 (LR)', 'GB': '梯度提升樹 (GB)', 'AVG': 'LR+GB 集成'}[kind], '樣本外 Log-Loss': round(ll, 5),
+                         '相對市場改善': round(ll_market - ll, 5)})
+            if ll < best_kind_ll:
+                best_kind, best_kind_ll = kind, ll
+        mtab.append({'模型': '市場公平機率 (基準)', '樣本外 Log-Loss': round(ll_market, 5), '相對市場改善': 0.0})
+        out['model_table'] = mtab
+        if best_kind is None:
+            out['msg'] = '模型訓練失敗，暫以市場公平機率運算。'
+            return out
+        p_oof = model_preds[best_kind]
+        # --- 3) 市場錨定權重 w (樣本外 Log-Loss 最低者；改善不足 0.0005 則 w=0) ---
+        m = vm & p_oof.notna()
+        best_w, best_w_ll = 0.0, ll_market
+        for w in np.linspace(0.0, 1.0, 11):
+            ll = v9_soft_logloss(v9_blend(ts.loc[m, 'p_mkt'].values, p_oof[m].values, w), ts.loc[m, 'e'])
+            if ll < best_w_ll - 1e-9:
+                best_w, best_w_ll = float(w), ll
+        if ll_market - best_w_ll < 0.0005:
+            best_w, best_w_ll = 0.0, ll_market
+        out['w'], out['kind'], out['ll_model'] = best_w, best_kind, best_w_ll
+        # --- 4) 回測 (樣本外) ---
+        oof = ts.loc[m, ['key', 'date', 'bet_type', 'side', 'line', 'odds', 'p_mkt', 'ret']].copy()
+        oof['p'] = v9_blend(oof['p_mkt'].values, p_oof[m].values, best_w)
+        oof['ev'] = oof['p'] * oof['odds'] - 1.0
+        bt_rows = []
+        bt_type = {}
+        for thr in V9_BT_THRESHOLDS:
+            b = v9_backtest(oof, thr)
+            n = len(b)
+            bt_rows.append({'EV 門檻': f"{thr*100:.0f}%", '回測注數': n, '命中率': f"{(b['ret'] > 0).mean()*100:.1f}%" if n else '-',
+                            '單位盈虧 (U)': round(float(b['ret'].sum()), 2) if n else 0.0,
+                            'ROI': f"{b['ret'].mean()*100:.1f}%" if n else '-'})
+            for bt in ('讓球', '入球大小', '角球大小'):
+                bb = b[b['bet_type'] == bt] if n else b
+                bt_type.setdefault(bt, {})[thr] = {'n': int(len(bb)), 'roi': float(bb['ret'].mean()) if len(bb) else 0.0,
+                                                   'units': float(bb['ret'].sum()) if len(bb) else 0.0}
+        # 市場整體 (隨機買任一邊) 的 ROI 作對照
+        for bt in ('讓球', '入球大小', '角球大小'):
+            sub = oof[oof['bet_type'] == bt]
+            bt_type.setdefault(bt, {})['all'] = {'n': int(len(sub)), 'roi': float(sub['ret'].mean()) if len(sub) else 0.0}
+        out['bt_table'] = bt_rows
+        out['bt_type'] = bt_type
+        # --- 5) 以全部數據擬合最終模型 ---
+        models = {}
+        if best_w > 0:
+            if best_kind in ('LR', 'AVG'):
+                models['LR'] = v9_soft_fit('LR', ts[cols].values, ts['e'].values)
+            if best_kind in ('GB', 'AVG'):
+                models['GB'] = v9_soft_fit('GB', ts[cols].values, ts['e'].values)
+            if 'LR' in models:
+                try:
+                    coef = models['LR'].named_steps['lr'].coef_[0]
+                    out['feat_importance'] = sorted([{'特徵': c, '群組': V9_FEATURE_DESC.get(c, ('', ''))[0],
+                                                      '說明': V9_FEATURE_DESC.get(c, ('', ''))[1], '標準化係數': round(float(v), 4)}
+                                                     for c, v in zip(cols, coef)], key=lambda x: -abs(x['標準化係數']))
+                except Exception:
+                    pass
+        out['models'] = models
+        out['trained'] = True
+        if best_w > 0:
+            out['msg'] = f"模型 ({best_kind}) 樣本外表現優於市場，市場錨定權重 w = {best_w:.1f}。"
+        else:
+            out['msg'] = "目前所有特徵組合的樣本外表現均未能穩定勝過市場賠率 → 系統以市場公平機率為準 (w = 0)，EV 會偏負，系統將建議少注或不注，以保護本金。"
+        return out
+    finally:
+        if run_ctx is not None:
+            try:
+                run_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+
+
+def v9_predict_p(engine, feats, p_mkt):
+    """單一候選盤口：市場公平機率與模型機率按 w 混合，回傳 (最終有效勝率, 模型原始機率)"""
+    if not engine or not engine.get('trained') or engine.get('w', 0) <= 0 or not engine.get('models'):
+        return float(p_mkt), float(p_mkt)
+    cols = engine['cols']
+    x = np.array([[float(feats.get(c, 0.0)) for c in cols]])
+    ps = []
+    for name in ('LR', 'GB'):
+        mdl = engine['models'].get(name)
+        if mdl is not None:
+            try:
+                ps.append(float(mdl.predict_proba(x)[0][1]))
+            except Exception:
+                pass
+    if not ps:
+        return float(p_mkt), float(p_mkt)
+    pm = float(np.mean(ps))
+    return float(v9_blend(np.array([p_mkt]), np.array([pm]), engine['w'])[0]), pm
+
+
+def v9_type_gate(engine, bt, thr, allow_override=False):
+    """盤口熔斷：樣本外回測在該門檻下注數 ≥ 20 且 ROI ≤ -3% → 暫停該盤口類型"""
+    if allow_override or not engine or not engine.get('bt_type'):
+        return True, ''
+    info = engine['bt_type'].get(bt, {})
+    keys = [k for k in info.keys() if k != 'all']
+    if not keys:
+        return True, ''
+    k = min(keys, key=lambda t: abs(t - thr))
+    st_ = info.get(k, {})
+    if st_.get('n', 0) >= 20 and st_.get('roi', 0.0) <= -0.03:
+        return False, f"回測 {st_['n']} 注 ROI {st_['roi']*100:.1f}%"
+    return True, ''
+
+
+def v9_engine_input(df_settled):
+    cols = ['ID', 'Date', 'Match', 'Match_Date', 'Tournament_Name', 'Home_Team', 'Away_Team', 'Home_Rating', 'Away_Rating', 'League_Size',
+            'Home_Form', 'Away_Form', 'Bet_Type', 'Odds_History', 'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner',
+            'Home_SoT', 'Away_SoT', 'Home_SoFF', 'Away_SoFF', 'Home_DA', 'Away_DA']
+    d = df_settled.copy()
+    for c in cols:
+        if c not in d.columns:
+            d[c] = np.nan
+    d = d[cols].copy()
+    for c in ['ID', 'Date', 'Match', 'Match_Date', 'Tournament_Name', 'Home_Team', 'Away_Team', 'Home_Rating', 'Away_Rating',
+              'Home_Form', 'Away_Form', 'Bet_Type', 'Odds_History']:
+        d[c] = d[c].apply(lambda v: None if (v is None or (isinstance(v, float) and np.isnan(v))) else str(v))
+    return d.reset_index(drop=True)
+
+
+@st.cache_data(max_entries=8, show_spinner="🧠 V9 引擎訓練中：重建全盤口樣本、特徵組合搜尋、前進式回測 (首次較慢，完成後自動快取)...")
+def v9_train_engine_cached(df_input):
+    return v9_train_engine(df_input)
+
+
+@st.cache_data(max_entries=8)
+def v9_history_tables_cached(df_input):
+    mt = v9_build_match_table(df_input)
+    return mt, v9_team_long(mt)
+
+
+def v9_get_engine(df_db):
+    df_settled = df_db[df_db['Status'] == 'Settled'].copy() if not df_db.empty else df_db.copy()
+    if df_settled.empty:
+        return {'trained': False, 'msg': '尚無已結算數據。', 'w': 0.0, 'bt_type': {}, 'models': None}, pd.DataFrame(), pd.DataFrame()
+    inp = v9_engine_input(df_settled)
+    engine = v9_train_engine_cached(inp)
+    mt, tl = v9_history_tables_cached(inp)
+    return engine, mt, tl
+
+
+def v9_get_settings():
+    return {
+        'min_ev': float(st.session_state.get('v9_min_ev', 3.0)) / 100.0,
+        'kelly': float(st.session_state.get('v9_kelly', 0.25)),
+        'max_pct': float(st.session_state.get('v9_max_pct', 3.0)) / 100.0,
+        'hd_min200': bool(st.session_state.get('v9_hd_min200', False)),
+        'override_gate': bool(st.session_state.get('v9_override_gate', False)),
+        'max_picks': int(st.session_state.get('v9_max_picks', 1)),
+    }
+
+
+def v9_score_candidates(engine, candidates, ctx, settings, nsnap_map=None):
+    """為每個候選盤口計算：市場公平勝率、模型勝率、EV、相對市場優勢、熔斷狀態"""
+    out = []
+    pair = {}
+    for c in candidates:
+        pair.setdefault((v9_clean_bt(c['bet_type']), round(float(c['line']), 3), c.get('history_idx')), {})[c['selection']] = c
+    for c in candidates:
+        c = dict(c)
+        bt = v9_clean_bt(c['bet_type'])
+        grp = pair.get((bt, round(float(c['line']), 3), c.get('history_idx')), {})
+        opp_sel = {'Home': 'Away', 'Away': 'Home', 'Over': 'Under', 'Under': 'Over'}[c['selection']]
+        opp = grp.get(opp_sel)
+        o_opp = float(opp['odds']) if opp else float(c['odds'])
+        d_opp = float(opp.get('odds_drift', 0.0) or 0.0) if opp else 0.0
+        nsnap = (nsnap_map or {}).get((bt, round(float(c['line']), 3), c.get('history_idx')), 1)
+        feats, p_mkt = v9_side_features(bt, c['selection'], float(c['line']), float(c['odds']), o_opp,
+                                        float(c.get('odds_drift', 0.0) or 0.0), d_opp, nsnap, ctx)
+        p_final, p_model = v9_predict_p(engine, feats, p_mkt)
+        if c.get('base_prob_override') is not None:
+            p_final = float(c['base_prob_override'])
+        c['p_mkt'] = p_mkt
+        c['model_prob'] = p_model
+        c['prob'] = p_final
+        c['ev'] = p_final * float(c['odds']) - 1.0
+        c['ev_mkt'] = p_mkt * float(c['odds']) - 1.0
+        c['edge'] = p_final - p_mkt
+        ok, why = v9_type_gate(engine, bt, settings['min_ev'], settings['override_gate'])
+        c['gate_ok'], c['gate_msg'] = ok, why
+        c['sample_count'] = engine.get('n_matches', 0) if engine else 0
+        c['model_name'] = (f"V9-{engine.get('kind')} (w={engine.get('w', 0):.1f})" if engine and engine.get('trained') else '市場公平機率')
+        if not ok:
+            c['status'] = f"⛔ 熔斷 ({why})"
+        elif c['ev'] >= settings['min_ev']:
+            c['status'] = '✅ 建議'
+        elif c['ev'] > 0:
+            c['status'] = '🟡 EV 未達門檻'
+        else:
+            c['status'] = '➖ 負 EV'
+        out.append(c)
+    # 兩邊相對化 (僅顯示用)
+    groups = {}
+    for c in out:
+        groups.setdefault((v9_clean_bt(c['bet_type']), round(float(c['line']), 3), c.get('history_idx')), []).append(c)
+    for g in groups.values():
+        tot = sum(float(x['prob']) for x in g)
+        for x in g:
+            x['relative_prob'] = float(x['prob']) / tot if (len(g) == 2 and tot > 0) else float(x['prob'])
+    out.sort(key=lambda x: (x['gate_ok'], x['ev']), reverse=True)
+    return out
+
+
+# ---------- 即場 Poisson 模型 ----------
+def v9_pois(lam, kmax=20):
+    lam = max(1e-6, float(lam))
+    k = np.arange(kmax + 1)
+    from math import lgamma
+    logp = k * np.log(lam) - lam - np.array([lgamma(i + 1) for i in k])
+    p = np.exp(logp)
+    return p / p.sum()
+
+
+def v9_expected_ret_total(side, line, cur_total, lam, odds):
+    p = v9_pois(lam, 30)
+    er = 0.0
+    for k, pk in enumerate(p):
+        tot = cur_total + k
+        diff = (tot - line) if side == 'Over' else (line - tot)
+        er += pk * v9_unit_return(diff, odds)
+    return er
+
+
+def v9_expected_ret_hd(side, line, cur_h, cur_a, lam_h, lam_a, odds):
+    ph, pa = v9_pois(lam_h, 12), v9_pois(lam_a, 12)
+    er = 0.0
+    for i, pi in enumerate(ph):
+        for j, pj in enumerate(pa):
+            hg, ag = cur_h + i, cur_a + j
+            diff = (hg + line - ag) if side == 'Home' else (ag - line - hg)
+            er += pi * pj * v9_unit_return(diff, odds)
+    return er
+
+
+def v9_solve_total_lambda(line, p_fair_over, lo=0.2, hi=8.0, cur=0):
+    """求出使大盤在公平賠率下期望回報為 0 的 Poisson λ (市場隱含總入球/角球)"""
+    o_f = 1.0 / max(0.02, min(0.98, p_fair_over))
+    best, best_v = None, 1e9
+    for lam in np.arange(lo, hi, 0.05):
+        v = abs(v9_expected_ret_total('Over', line, cur, lam, o_f))
+        if v < best_v:
+            best, best_v = float(lam), v
+    return best
+
+
+def v9_solve_supremacy(line, p_fair_home, lam_t):
+    o_f = 1.0 / max(0.02, min(0.98, p_fair_home))
+    best, best_v = 0.0, 1e9
+    for sup in np.arange(-3.0, 3.01, 0.05):
+        lh, la = max(0.05, (lam_t + sup) / 2.0), max(0.05, (lam_t - sup) / 2.0)
+        v = abs(v9_expected_ret_hd('Home', line, 0, 0, lh, la, o_f))
+        if v < best_v:
+            best, best_v = float(sup), v
+    return best
+
+
+def v9_main_market(odds_history, btype, ref_date=None):
+    """取得某盤口類型最平衡 (主盤) 的最新賠率：回傳 (line, 上賠率, 下賠率) 或 None"""
+    mk = v9_group_markets(odds_history, ref_date)
+    best, best_gap = None, 1e9
+    for (bt, ln), snaps in mk.items():
+        if bt != btype:
+            continue
+        last = snaps[-1]
+        gap = abs(1.0 / last[2] - 1.0 / last[3])
+        if gap < best_gap:
+            best, best_gap = (ln, last[2], last[3]), gap
+    return best
+
+
+def v9_prematch_lambdas(odds_history, ctx):
+    """由賽前主盤賠率反推市場隱含 λ (主入球、客入球、總角球)；缺盤口時以數據庫攻防數據估算"""
+    hp, ap, lg = ctx['hp'], ctx['ap'], ctx['league']
+    lam_t = (hp['gf'] + ap['ga']) / 2.0 + (ap['gf'] + hp['ga']) / 2.0
+    sup = (hp['gf'] + ap['ga']) / 2.0 - (ap['gf'] + hp['ga']) / 2.0 + lg['hgd'] * 0.5
+    lam_c = (hp['cf'] + ap['ca']) / 2.0 + (ap['cf'] + hp['ca']) / 2.0
+    src = {'goals': '數據庫攻防數據', 'hd': '數據庫攻防數據', 'corners': '數據庫攻防數據'}
+    ou = v9_main_market(odds_history, '入球大小')
+    if ou:
+        p_over, _ = v9_devig(ou[1], ou[2])
+        lam_t = v9_solve_total_lambda(ou[0], p_over, 0.3, 7.0)
+        src['goals'] = f"入球大小主盤 {ou[0]:g}"
+    hd = v9_main_market(odds_history, '讓球')
+    if hd:
+        p_home, _ = v9_devig(hd[1], hd[2])
+        sup = v9_solve_supremacy(hd[0], p_home, lam_t)
+        src['hd'] = f"讓球主盤 {hd[0]:g}"
+    cr = v9_main_market(odds_history, '角球大小')
+    if cr:
+        p_over_c, _ = v9_devig(cr[1], cr[2])
+        lam_c = v9_solve_total_lambda(cr[0], p_over_c, 2.0, 20.0)
+        src['corners'] = f"角球大小主盤 {cr[0]:g}"
+    lam_h = max(0.05, (lam_t + sup) / 2.0)
+    lam_a = max(0.05, (lam_t - sup) / 2.0)
+    return lam_h, lam_a, lam_c, src
+
+
+def v9_inplay_lambdas(lam_h, lam_a, lam_c, minute, h_red, a_red, h_shots, a_shots, h_da, a_da):
+    """即場剩餘時間 λ：按剩餘時間比例 × 攻勢強度 (射門/危險進攻相對正常節奏) × 紅牌調整"""
+    rem = max(0.0, 90.0 - float(minute)) / 90.0
+    m = max(1.0, float(minute))
+    exp_shots_pm = V9_DEFAULTS['shots'] / 90.0
+    exp_da_pm = V9_DEFAULTS['da'] / 90.0
+    if minute >= 10:
+        ih = float(np.clip(0.7 + 0.3 * (h_shots / m) / exp_shots_pm, 0.6, 1.6))
+        ia = float(np.clip(0.7 + 0.3 * (a_shots / m) / exp_shots_pm, 0.6, 1.6))
+        ic = float(np.clip(0.7 + 0.3 * ((h_da + a_da) / m) / (2 * exp_da_pm), 0.6, 1.6)) if (h_da + a_da) > 0 else 1.0
+    else:
+        ih = ia = ic = 1.0
+    rh = (0.70 ** h_red) * (1.20 ** a_red)
+    ra = (0.70 ** a_red) * (1.20 ** h_red)
+    return lam_h * rem * ih * rh, lam_a * rem * ia * ra, lam_c * rem * ic, (ih, ia, ic)
+
+
+def v9_calc_stake(cand, bankroll, max_stake, settings):
+    """分數 Kelly：注碼 = 本金 × Kelly 分數 × (EV / (賠率−1))，上限為本金 max_pct 及系統單注上限，四捨五入至 $10"""
+    if not cand.get('gate_ok', True) or bankroll <= 0:
+        return 0.0, 0.0
+    ev = float(cand.get('ev', 0.0))
+    o = float(cand.get('odds', 1.9))
+    if ev < settings['min_ev'] or o <= 1.0:
+        return 0.0, 0.0
+    f = max(0.0, ev / (o - 1.0))
+    raw = bankroll * settings['kelly'] * f
+    cap = min(float(max_stake) if max_stake > 0 else raw, bankroll * settings['max_pct'])
+    stake = float(round(min(raw, cap) / 10.0) * 10.0)
+    if stake < 10.0:
+        stake = 0.0
+    if settings.get('hd_min200') and '讓球' in str(cand.get('bet_type', '')) and 0 < stake < 200:
+        stake = 200.0 if (ev >= 0.05 and bankroll * settings['max_pct'] >= 200) else 0.0
+    return stake, raw
+
+
+def v9_dimension_stats(df_subset, dim_name):
+    """三維度歷史統計 (只作參考顯示)：樣本數、系統實注 ROI、勝率"""
+    n = len(df_subset)
+    out = {'dim': dim_name, 'n': n, 'valid': n >= 15, 'msg': '運算成功' if n >= 15 else f"樣本數不足 ({n} < 15張)",
+           'roi': 0.0, 'acc': 0.0, 'n_bet': 0}
+    if n == 0:
+        return out
+    stake = pd.to_numeric(df_subset['System_Stake'], errors='coerce').fillna(0.0)
+    prof = pd.to_numeric(df_subset['System_Profit'], errors='coerce').fillna(0.0)
+    up = pd.to_numeric(df_subset['Unit_Profit'], errors='coerce')
+    out['n_bet'] = int((stake > 0).sum())
+    out['roi'] = float(prof[stake > 0].sum() / stake[stake > 0].sum()) if stake.sum() > 0 else 0.0
+    out['acc'] = float((up > 0).mean()) if up.notna().any() else 0.0
+    return out
+
+
+# ==========================================
 # 4. 注單載入與修改輔助邏輯 (新增/覆蓋)
 # ==========================================
 # 賽前建檔表單所有固定 key 的 widget：載入注單時必須清除，
@@ -1550,7 +2520,7 @@ def parse_dt_for_comparison(dt_str, fallback_idx):
     if not dt_str or not str(dt_str).strip():
         return (datetime.min, fallback_idx)
     s = str(dt_str).strip()
-    for fmt in ["%Y-%m-%d %H:%M", "%m-%d %H:%M", "%d-%m %H:%M", "%Y/%m/%d %H:%M", "%m/%d %H:%M"]:
+    for fmt in ["%Y-%m-%d %H:%M", "%d-%m %H:%M", "%m-%d %H:%M", "%Y/%m/%d %H:%M", "%d/%m %H:%M", "%m/%d %H:%M"]:
         try:
             return (datetime.strptime(s, fmt), fallback_idx)
         except ValueError:
@@ -1807,29 +2777,8 @@ def render_odds_section(odds_history_state, prefix="pre"):
     odds_history_state.extend(new_history)
 
 def calc_suggested_stake(cand, sys_bankroll, sys_max_stake):
-    suggested_stake = 0.0
-    raw_stake = 0.0
-    if cand.get('ev', 0) > 0 and sys_bankroll > 0:
-        b = cand.get('odds', 1.90) - 1
-        prob = cand.get('prob', cand.get('base_prob', 0.5))
-        if b > 0:
-            kelly = max(0.0, min((prob * b - (1 - prob)) / b, 0.10))
-            # 增強：根據模型信心與樣本數調整 Kelly 分數
-            model_confidence = cand.get('model_prob', prob)
-            sample_penalty = min(1.0, cand.get('sample_count', 15) / 50.0) if cand.get('sample_count', 0) > 0 else 0.3
-            confidence_factor = (0.5 + 0.5 * model_confidence) * sample_penalty
-            raw_stake = (sys_bankroll * (kelly * 0.5 * confidence_factor))
-            suggested_stake = min(float(sys_max_stake), float(round(raw_stake / 10) * 10))
-            
-            if "讓球" in cand.get('bet_type', ''):
-                if 0 < suggested_stake < 200:
-                    if cand.get('ev', 0) >= 0.03 and prob >= 0.50:
-                        suggested_stake = 200.0
-                    else:
-                        suggested_stake = 0.0
-            else:
-                suggested_stake = max(10.0, suggested_stake)
-    return suggested_stake, raw_stake
+    """V9 建議注碼 (分數 Kelly + 熔斷 + EV 門檻)，參數設定見側邊欄「V9 投注策略與風控設定」"""
+    return v9_calc_stake(cand, sys_bankroll, sys_max_stake, v9_get_settings())
 
 # ==========================================
 # 5.5 即場投注輔助函式 (賠率連動與機率計算)
@@ -2394,85 +3343,86 @@ def run_ml_analysis_cached(df_settled):
     return analysis
 
 def render_dl_ml_analysis_section(df_settled):
-    """渲染深度學習與機器學習盈虧分析：多模型交叉驗證結果 + 時間趨勢 ML 預測建議
-    (涵蓋讓球、入球大小、角球大小三種盤口；ML 結果經快取，不會重複訓練)"""
-    st.markdown("### 🧠 深度學習與機器學習盈虧分析")
-    st.caption(f"本板塊涵蓋讓球、入球大小、角球大小三種盤口；ML 分析最低樣本門檻為 {ML_MIN_SAMPLES} 場。小樣本 (8-14 場) 時模型結果波動較大，僅供參考。")
-    
+    """V9 全局模型板塊：特徵說明、特徵組合搜尋結果、模型比較、前進式回測、盤口熔斷狀態"""
+    st.markdown("### 🧠 V9 市場錨定機器學習分析 (特徵組合 + 前進式回測)")
     if not HAS_AI_MODULES:
         st.warning("未安裝 sklearn 套件，無法執行 ML 模型訓練。")
         return
-    
-    # 呼叫快取的 ML 分析 (資料變更時自動重算，平時直接讀取快取)
-    analysis = run_ml_analysis_cached(df_settled)
-    
-    bet_types = ["讓球", "入球大小", "角球大小"]
-    
-    ml_col1, ml_col2 = st.columns(2)
-    
-    with ml_col1:
-        st.markdown("##### 多模型交叉驗證結果")
-        
-        for bt in bet_types:
-            entry = analysis.get(bt, {})
-            n = entry.get('n', 0)
-            
-            if not entry.get('trained', False):
-                if n < ML_MIN_SAMPLES:
-                    st.warning(f"{bt}: 樣本數不足 ({n} < {ML_MIN_SAMPLES})，無法訓練 ML 模型。")
-                elif not entry.get('class_ok', True):
-                    st.warning(f"{bt}: 目標類別不足，無法訓練 ML 模型。")
-                else:
-                    st.warning(f"{bt}: 所有模型訓練失敗。")
-                continue
-            
-            st.markdown(f"**{bt}** (樣本數: {n})")
-            model_data = []
-            for name, res in entry.get('model_results', {}).items():
-                model_data.append({
-                    '模型': name,
-                    '交叉驗證準確率': f"{res['cv_mean']*100:.1f}%",
-                    '標準差': f"{res['cv_std']*100:.1f}%",
-                })
-            st.dataframe(pd.DataFrame(model_data), use_container_width=True, hide_index=True)
-            
-            if entry.get('best_model'):
-                st.success(f"最佳模型: {entry['best_model']}")
-    
-    with ml_col2:
-        st.markdown("##### 時間趨勢 ML 預測建議")
-        
-        any_suggestion = False
-        for bt in bet_types:
-            entry = analysis.get(bt, {})
-            n = entry.get('n', 0)
-            
-            if not entry.get('trained', False):
-                if n < ML_MIN_SAMPLES:
-                    st.caption(f"{bt}: 樣本數不足 ({n} < {ML_MIN_SAMPLES})，無法生成 ML 預測建議。")
-                continue
-            
-            any_suggestion = True
-            recent_win_rate = entry.get('recent_win_rate', 0.0)
-            
-            # 建議
-            if recent_win_rate >= 0.6:
-                trend = "上升趨勢 📈"
-                suggestion = f"{bt} 近期勝率 {recent_win_rate*100:.0f}%，建議繼續關注。"
-            elif recent_win_rate >= 0.4:
-                trend = "平穩 ➡️"
-                suggestion = f"{bt} 近期勝率 {recent_win_rate*100:.0f}%，建議謹慎下注。"
-            else:
-                trend = "下降趨勢 📉"
-                suggestion = f"{bt} 近期勝率 {recent_win_rate*100:.0f}%，建議減少下注或反向操作。"
-            
-            st.markdown(f"**{bt}** ({trend})")
-            st.write(f"最佳模型: {entry.get('best_model', 'N/A')}")
-            st.write(suggestion)
-            st.caption(f"近期平均賠率: {entry.get('recent_odds', 0.0):.2f} | 樣本數: {n}")
-        
-        if not any_suggestion:
-            st.info(f"需要更多已結算注單 (≥{ML_MIN_SAMPLES}場/盤口類型) 才能生成 ML 預測建議。")
+    engine, _mt, _tl = v9_get_engine(st.session_state.df_db)
+    v9_set = v9_get_settings()
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("訓練比賽數", f"{engine.get('n_matches', 0)} 場")
+    k2.metric("全盤口訓練樣本", f"{engine.get('n_rows', 0)} 個")
+    k3.metric("市場錨定權重 w", f"{engine.get('w', 0.0):.1f}")
+    k4.metric("採用模型", str(engine.get('kind', 'MARKET')))
+    st.info(engine.get('msg', ''))
+    _dups = v9_find_duplicate_matches(st.session_state.df_db)
+    if not _dups.empty:
+        st.warning(f"🧹 資料品質提示：發現 {len(_dups)} 場比賽疑似以不同比賽日期重複輸入 (賽果完全相同)。V9 訓練時已自動合併，但建議到「已完成注單資料修改」更正 Match_Date。")
+        st.dataframe(_dups, use_container_width=True, hide_index=True)
+    if engine.get('trained'):
+        st.write(f"自動選出的特徵組合: **{' + '.join(engine.get('groups') or ['市場賠率'])}**")
+        if engine.get('ll_market') is not None and engine.get('ll_model') is not None:
+            st.caption(f"樣本外 Log-Loss：市場 {engine['ll_market']:.5f} → 模型 {engine['ll_model']:.5f} (越低越好；改善 {engine['ll_market'] - engine['ll_model']:.5f})")
+
+    t1, t2, t3, t4 = st.tabs(["📈 前進式回測 / 熔斷", "🧩 特徵組合排名", "🤖 模型比較 / 特徵權重", "📚 特徵說明 (新舊對照)"])
+    with t1:
+        st.caption("回測方法：每一折只用『之前日期』的比賽訓練，預測『之後日期』的比賽 (完全樣本外)；每場每種盤口類型最多選一注 (EV 最高且 ≥ 門檻)。")
+        if engine.get('bt_table'):
+            st.dataframe(pd.DataFrame(engine['bt_table']), use_container_width=True, hide_index=True)
+        rows = []
+        for bt in ('讓球', '入球大小', '角球大小'):
+            info = (engine.get('bt_type') or {}).get(bt, {})
+            ok, why = v9_type_gate(engine, bt, v9_set['min_ev'], v9_set['override_gate'])
+            keys = [k for k in info.keys() if k != 'all']
+            k = min(keys, key=lambda t: abs(t - v9_set['min_ev'])) if keys else None
+            sel = info.get(k, {}) if k is not None else {}
+            rows.append({'盤口類型': bt,
+                         '隨機買任一邊 ROI (市場基準)': f"{info.get('all', {}).get('roi', 0.0)*100:.1f}%" if info.get('all') else '-',
+                         f'模型回測注數 (門檻 {v9_set["min_ev"]*100:.0f}%)': sel.get('n', 0),
+                         '模型回測 ROI': f"{sel.get('roi', 0.0)*100:.1f}%" if sel.get('n') else '-',
+                         '模型回測單位盈虧 (U)': round(sel.get('units', 0.0), 2) if sel.get('n') else 0.0,
+                         '狀態': '✅ 允許' if ok else f'⛔ 熔斷 ({why})'})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption("熔斷規則：樣本外回測注數 ≥ 20 且 ROI ≤ −3% 的盤口類型暫停建議。可於側邊欄「V9 投注策略與風控設定」解除 (不建議)。")
+        st.warning("⚠ 回測結果有統計波動：數百注的 ROI 標準誤約 ±5%。任何模型都無法保證盈利；請以小注碼、嚴格門檻、長期記錄驗證。")
+
+    with t2:
+        st.caption("系統自動測試『市場賠率』+ 其餘 8 個因素群組的所有組合 (共 255 種)，例如「排名+賠率變化」、「排名+近5場戰績+賠率變化」、「排名+近5場戰績+賠率變化+球隊攻防數據」等，"
+                   "以樣本外 Log-Loss 排名 (越低越好)。在最佳值 0.0005 範圍內會優先選擇群組最少的組合，以降低過度擬合。")
+        if engine.get('combo_table'):
+            ct = pd.DataFrame(engine['combo_table'])
+            st.dataframe(ct.head(40), use_container_width=True, hide_index=True)
+            single = []
+            for g in V9_FEATURE_GROUPS:
+                if g == '市場賠率':
+                    continue
+                r = ct[ct['特徵組合'] == f"市場賠率 + {g}"]
+                if not r.empty:
+                    single.append({'因素群組': g, '單獨加入市場後的改善': float(r.iloc[0]['相對市場改善'])})
+            if single:
+                st.markdown("##### 各因素『獨立』加入市場賠率後的效果")
+                st.dataframe(pd.DataFrame(single).sort_values('單獨加入市場後的改善', ascending=False), use_container_width=True, hide_index=True)
+                st.caption("正數 = 該因素提供了市場以外的額外資訊；負數或接近 0 = 該因素已被賠率反映或數據量不足。")
+        else:
+            st.info("數據不足，尚未進行特徵組合搜尋。")
+
+    with t3:
+        if engine.get('model_table'):
+            st.dataframe(pd.DataFrame(engine['model_table']), use_container_width=True, hide_index=True)
+        if engine.get('feat_importance'):
+            st.markdown("##### 邏輯迴歸標準化係數 (正數 = 提高該方向勝率)")
+            st.dataframe(pd.DataFrame(engine['feat_importance']), use_container_width=True, hide_index=True)
+        elif engine.get('trained'):
+            st.caption("w = 0 時不擬合最終模型 (系統以市場公平機率為準)。")
+
+    with t4:
+        st.markdown("##### 舊版 V8 的 16 個學習特徵")
+        st.dataframe(pd.DataFrame([{'#': i + 1, '特徵': n, '學習內容': d} for i, (n, d) in enumerate(LEGACY_16_FEATURES)]), use_container_width=True, hide_index=True)
+        st.markdown("##### V9 特徵 (按因素群組)")
+        st.dataframe(pd.DataFrame([{'群組': V9_FEATURE_DESC[f][0], '特徵': f, '學習內容': V9_FEATURE_DESC[f][1]} for f in V9_ALL_FEATURES]),
+                     use_container_width=True, hide_index=True)
 
 # ==========================================
 # 6. 主程式 UI 
@@ -2495,8 +3445,8 @@ def main():
     cap_table = "football_cap"
 
     # --- 數據雲端同步狀態提示與手動刷新 ---
-    has_sql = HAS_SQLALCHEMY and "DB_URL" in st.secrets and st.secrets["DB_URL"]
-    has_gh = "GITHUB_TOKEN" in st.secrets and "GITHUB_REPO" in st.secrets
+    has_sql = HAS_SQLALCHEMY and _has_secret("DB_URL") and st.secrets["DB_URL"]
+    has_gh = _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO")
     
     st.sidebar.subheader("☁️ 數據同步狀態看板")
     if has_sql:
@@ -2540,6 +3490,24 @@ def main():
     st.sidebar.metric("用家總提取本金", f"${usr_wit:,.2f}")
     st.sidebar.metric("用家真實累積總盈虧 (PnL)", f"${usr_pnl:,.2f}", delta=f"${usr_pnl:,.2f}")
     st.sidebar.metric("用家當前真實可用資金 (Bankroll)", f"${usr_bankroll:,.2f}")
+
+
+    with st.sidebar.expander("🎯 V9 投注策略與風控設定", expanded=False):
+        st.number_input("最低 EV 門檻 (%)", min_value=0.0, max_value=20.0, value=3.0, step=0.5, key="v9_min_ev",
+                        help="只有期望值 ≥ 此門檻的盤口才會被建議。馬會抽水約 5%~8%，門檻太低會令大量邊緣投注拖低回報。")
+        st.select_slider("Kelly 分數", options=[0.1, 0.15, 0.2, 0.25, 0.33, 0.5], value=0.25, key="v9_kelly",
+                         help="全 Kelly 波動極大，建議 0.25 或以下。")
+        st.number_input("單注上限 (% 系統本金)", min_value=0.5, max_value=10.0, value=3.0, step=0.5, key="v9_max_pct")
+        st.number_input("每場最多建議注數", min_value=1, max_value=3, value=1, step=1, key="v9_max_picks",
+                        help="同一場比賽的多個盤口高度相關，建議每場只下 1 注。")
+        st.checkbox("啟用舊版「讓球最低 $200」規則", value=False, key="v9_hd_min200",
+                    help="舊版會把 EV 偏低的讓球注碼強制升至 $200，放大了邊緣投注的虧損，預設關閉。")
+        st.checkbox("解除盤口熔斷 (不建議)", value=False, key="v9_override_gate",
+                    help="回測長期虧損的盤口類型 (例如角球大小) 預設暫停建議。")
+        if st.button("♻ 重新訓練 V9 模型", use_container_width=True, key="v9_retrain"):
+            v9_train_engine_cached.clear()
+            v9_history_tables_cached.clear()
+            st.toast("已清除模型快取，下次分析時會重新訓練。", icon="♻")
 
     with st.sidebar.expander("💸 資金存提管理"):
         cap_account = st.radio("目標帳戶 (Account)", ["🤖 系統本金 (System)", "👤 用家本金 (User)", "🔄 兩者同步 (Both)"], index=2)
@@ -2673,7 +3641,7 @@ def main():
                 st.caption(f"⚠ 主隊舊資料為字母評級 ({_raw_hr})，已自動換算為約略排名 {default_h_rank}，請直接修改為實際排名；如不修改，提交時會保留原有字母評級。")
             if _raw_ar and _parse_rank_int(_raw_ar) is None:
                 st.caption(f"⚠ 客隊舊資料為字母評級 ({_raw_ar})，已自動換算為約略排名 {default_a_rank}，請直接修改為實際排名；如不修改，提交時會保留原有字母評級。")
-        st.caption("💡 排名輸入1代表排名第一 (實力最高)；系統學習及分析數據時會結合聯賽排名、盤口賠率變化及過往賽果，找出關聯並計算勝率最高投注項目及注碼。")
+        st.caption("💡 排名輸入1代表排名第一 (實力最高)。V9 引擎以去水市場賠率為錨點，結合聯賽排名、近5場戰績、賠率變化、數據庫內兩隊過往攻防數據、對賽往績及賽事環境，自動測試因素組合並以前進式回測驗證，只在 EV 達標時建議投注。")
 
         st.markdown("##### 2. 近 5 場狀態 (勝/和/敗)")
         f1, f2, f3, f4, f5, f6 = st.columns(6)
@@ -2696,172 +3664,163 @@ def main():
         
         if st.button("🚀 賽前數據分析執行", type="primary", use_container_width=True):
             st.session_state.show_analysis = True
+            v9_set = v9_get_settings()
+            engine, mt_hist, tl_hist = v9_get_engine(st.session_state.df_db)
             df_settled = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
-            
-            # 聯賽排名 → 實力分 (1~5，與舊字母尺度一致)
-            rating_map = {"S": 5, "A": 4, "B": 3, "C": 2, "D": 1}
+
+            # 聯賽排名 → 實力分 (1~5，與舊字母尺度一致)；近5場 → 積分
             hr_val = rank_to_strength(home_rank, league_size)
             ar_val = rank_to_strength(away_rank, league_size)
-            
-            # 計算各盤口市場的賠率走勢變化：每個時間點的候選盤口只使用
-            # 「截至該時間點」的賠率序列 (最初 → 該時間點)，不會用到未來時間點的資料
-            _market_series = {}
-            for _gi, r in enumerate(st.session_state.odds_history):
-                try:
-                    _mk = (str(r.get('type', '讓球')), round(float(r.get('line', 0.0)), 3))
-                    _market_series.setdefault(_mk, []).append((_gi, r))
-                except (TypeError, ValueError):
-                    continue
-            
-            def _market_drift(mk, side, upto_idx):
-                rows = [x for x in _market_series.get(mk, []) if x[0] <= upto_idx]
-                key = 'upper' if side in ('Home', 'Over') else 'lower'
-                vals = []
-                for _gi, x in rows:
-                    try:
-                        v = x.get(key)
-                        if v is not None and float(v) > 0:
-                            vals.append(float(v))
-                    except (TypeError, ValueError):
-                        continue
-                if len(vals) >= 2 and vals[0] > 0:
-                    return vals[-1] / vals[0] - 1.0
-                return 0.0
-            
+            hf_val = float(extract_form_points(home_form))
+            af_val = float(extract_form_points(away_form))
+            try:
+                _md_ts = pd.Timestamp(match_date)
+            except Exception:
+                _md_ts = pd.Timestamp(get_hkt_now().strftime('%Y-%m-%d'))
+
+            # 依時間排序每個盤口 (類型+盤口線) 的賠率序列：每個時間點只使用「截至該時間點」的賠率 (不用未來數據)
+            _mk_sorted = v9_group_markets(st.session_state.odds_history, _md_ts.to_pydatetime())
+            _pos_info = {}
+            for (_bt, _ln), _snaps in _mk_sorted.items():
+                _first = _snaps[0]
+                for _rank, _sn in enumerate(_snaps):
+                    _pos_info[_sn[1]] = {
+                        'drift_up': _sn[2] / _first[2] - 1.0 if _first[2] > 0 else 0.0,
+                        'drift_lw': _sn[3] / _first[3] - 1.0 if _first[3] > 0 else 0.0,
+                        'nsnap': _rank + 1,
+                        'is_latest': _rank == len(_snaps) - 1,
+                    }
+
             candidates_base = []
+            nsnap_map = {}
             for idx, r in enumerate(st.session_state.odds_history):
-                b_type, line_val = r['type'], float(r['line'])
+                try:
+                    b_type, line_val = str(r['type']), float(r['line'])
+                    up_odds, lw_odds = float(r['upper']), float(r['lower'])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if up_odds <= 1.0 or lw_odds <= 1.0:
+                    continue
                 rec_time = r.get('record_time', '')
+                pinfo = _pos_info.get(idx, {'drift_up': 0.0, 'drift_lw': 0.0, 'nsnap': 1, 'is_latest': True})
+                nsnap_map[(v9_clean_bt(b_type), round(line_val, 3), idx)] = pinfo['nsnap']
+                line_str = f"{line_val:g}"
                 if b_type == "讓球":
-                    p_up = max(0.1, min(0.9, 0.5 + ((hr_val - ar_val) * 0.03)))
-                    line_str = f"{line_val:g}"
                     label_h, label_a = (f"{line_str}主隊(上盤)", f"{line_str}客隊(下盤)") if line_val <= 0 else (f"{line_str}主隊(下盤)", f"{line_str}客隊(上盤)")
-                    _mk = (str(b_type), round(line_val, 3))
                     candidates_base.extend([
-                        {'bet_type': b_type, 'selection': 'Home', 'base_prob': p_up, 'odds': float(r['upper']), 'line': line_val, 'label': label_h, 'history_idx': idx, 'record_time': rec_time, 'odds_drift': _market_drift(_mk, 'Home', idx)},
-                        {'bet_type': b_type, 'selection': 'Away', 'base_prob': 1-p_up, 'odds': float(r['lower']), 'line': line_val, 'label': label_a, 'history_idx': idx, 'record_time': rec_time, 'odds_drift': _market_drift(_mk, 'Away', idx)}
+                        {'bet_type': b_type, 'selection': 'Home', 'base_prob': 0.5, 'odds': up_odds, 'line': line_val, 'label': label_h, 'history_idx': idx, 'record_time': rec_time, 'odds_drift': pinfo['drift_up'], 'is_latest': pinfo['is_latest']},
+                        {'bet_type': b_type, 'selection': 'Away', 'base_prob': 0.5, 'odds': lw_odds, 'line': line_val, 'label': label_a, 'history_idx': idx, 'record_time': rec_time, 'odds_drift': pinfo['drift_lw'], 'is_latest': pinfo['is_latest']}
                     ])
                 else:
-                    p_up = max(0.1, min(0.9, 0.5 + ((hr_val + ar_val - (6 if b_type=="入球大小" else 5)) * (0.02 if b_type=="入球大小" else 0.01))))
-                    line_str = f"{line_val:g}"
-                    label_over = f"{line_str}大盤(Over)"
-                    label_under = f"{line_str}小盤(Under)"
-                    _mk = (str(b_type), round(line_val, 3))
                     candidates_base.extend([
-                        {'bet_type': b_type, 'selection': 'Over', 'base_prob': p_up, 'odds': float(r['upper']), 'line': line_val, 'label': label_over, 'history_idx': idx, 'record_time': rec_time, 'odds_drift': _market_drift(_mk, 'Over', idx)},
-                        {'bet_type': b_type, 'selection': 'Under', 'base_prob': 1-p_up, 'odds': float(r['lower']), 'line': line_val, 'label': label_under, 'history_idx': idx, 'record_time': rec_time, 'odds_drift': _market_drift(_mk, 'Under', idx)}
+                        {'bet_type': b_type, 'selection': 'Over', 'base_prob': 0.5, 'odds': up_odds, 'line': line_val, 'label': f"{line_str}大盤(Over)", 'history_idx': idx, 'record_time': rec_time, 'odds_drift': pinfo['drift_up'], 'is_latest': pinfo['is_latest']},
+                        {'bet_type': b_type, 'selection': 'Under', 'base_prob': 0.5, 'odds': lw_odds, 'line': line_val, 'label': f"{line_str}小盤(Under)", 'history_idx': idx, 'record_time': rec_time, 'odds_drift': pinfo['drift_lw'], 'is_latest': pinfo['is_latest']}
                     ])
 
-            h_data = {'hr': hr_val, 'ar': ar_val, 'hf': extract_form_points(home_form), 'af': extract_form_points(away_form)}
-            
-            df_micro = df_settled[df_settled['Tournament_Name'] == tournament_name]
-            df_meso = df_settled[df_settled['Tournament_Category'] == tournament_category]
-            df_macro = df_settled
-            
-            res_micro = evaluate_dimension_enhanced(df_micro, "微觀 - 賽事名稱", candidates_base, rating_map, h_data)
-            res_meso = evaluate_dimension_enhanced(df_meso, "中觀 - 賽事分類", candidates_base, rating_map, h_data)
-            res_macro = evaluate_dimension_enhanced(df_macro, "宏觀 - 總數據", candidates_base, rating_map, h_data)
-            
-            valid_res = [r for r in [res_micro, res_meso, res_macro] if r['valid']]
-            best_model = max(valid_res, key=lambda x: x['score']) if valid_res else res_macro
-            if not valid_res: best_model['msg'] = "所有維度樣本數不足，降級為純基礎期望值運算。"
+            # 賽前情境：只使用比賽日期之前的數據庫資料 (球隊攻防數據、對賽往績、賽事環境)
+            v9_ctx = v9_match_context(mt_hist, tl_hist, home_team, away_team, tournament_name, _md_ts, hr_val, ar_val, hf_val, af_val)
+            scored = v9_score_candidates(engine, candidates_base, v9_ctx, v9_set, nsnap_map) if candidates_base else []
 
-            best_bet = best_model['best'] if 'best' in best_model else candidates_base[0]
+            # 推薦：只考慮每個盤口的最新賠率；每種盤口類型最多一注，總數不超過設定上限
+            picks, _used_types = [], set()
+            for c in scored:
+                if not c.get('is_latest', True) or c.get('status') != '✅ 建議':
+                    continue
+                _bt = v9_clean_bt(c['bet_type'])
+                if _bt in _used_types:
+                    continue
+                picks.append(c)
+                _used_types.add(_bt)
+                if len(picks) >= v9_set['max_picks']:
+                    break
+
+            try:
+                _lh, _la, _lc, _lsrc = v9_prematch_lambdas(st.session_state.odds_history, v9_ctx)
+            except Exception:
+                _lh, _la, _lc, _lsrc = None, None, None, {}
 
             st.session_state.analysis_result = {
-                'micro': res_micro, 'meso': res_meso, 'macro': res_macro, 'best_model': best_model,
-                'best_bet': best_bet, 't_name': tournament_name, 't_cat': tournament_category
+                'v9': True,
+                'dims': [v9_dimension_stats(df_settled[df_settled['Tournament_Name'] == tournament_name], "A. 微觀 (賽事名稱)"),
+                         v9_dimension_stats(df_settled[df_settled['Tournament_Category'] == tournament_category], "B. 中觀 (賽事分類)"),
+                         v9_dimension_stats(df_settled, "C. 宏觀 (全局數據)")],
+                'engine': {k: engine.get(k) for k in ('trained', 'msg', 'w', 'kind', 'groups', 'n_matches', 'n_rows', 'll_market', 'll_model')},
+                'candidates': scored, 'picks': picks,
+                'ctx': {'h_n': v9_ctx['hp']['n'], 'a_n': v9_ctx['ap']['n'], 'h2h_n': len(v9_ctx['h2h']), 'league_n': v9_ctx['league']['n'],
+                        'h_gf': v9_ctx['hp']['gf'], 'h_ga': v9_ctx['hp']['ga'], 'a_gf': v9_ctx['ap']['gf'], 'a_ga': v9_ctx['ap']['ga'],
+                        'h_cf': v9_ctx['hp']['cf'], 'a_cf': v9_ctx['ap']['cf']},
+                'lambdas': (_lh, _la, _lc, _lsrc),
+                't_name': tournament_name, 't_cat': tournament_category
             }
-            
+
+        if st.session_state.get('show_analysis', False) and not st.session_state.get('analysis_result', {}).get('v9'):
+            st.session_state.show_analysis = False
+
         if st.session_state.get('show_analysis', False):
             res = st.session_state.analysis_result
-            st.success("✅ 三維度數據分析與 EV 運算完成！")
-            
-            latest_history_map = {}
-            for idx, r in enumerate(st.session_state.odds_history):
-                b_type = str(r.get('type', '讓球'))
-                try:
-                    line_val = float(r.get('line', 0.0))
-                except:
-                    line_val = 0.0
-                rec_time = str(r.get('record_time', ''))
-                
-                key = (b_type, line_val)
-                dt_tuple = parse_dt_for_comparison(rec_time, idx)
-                if key not in latest_history_map or dt_tuple > latest_history_map[key][1]:
-                    latest_history_map[key] = (idx, dt_tuple)
+            v9_set = v9_get_settings()
+            eng = res['engine']
+            st.success("✅ V9 市場錨定分析與 EV 運算完成！")
 
             c1, c2, c3 = st.columns(3)
-            for col, r, title in zip([c1, c2, c3], [res['micro'], res['meso'], res['macro']], ["A. 微觀 (賽事名稱)", "B. 中觀 (賽事分類)", "C. 宏觀 (全局數據)"]):
+            for col, dstat in zip([c1, c2, c3], res['dims']):
                 with col.container(border=True):
-                    st.markdown(f"**{title}**")
-                    if r['valid']:
-                        st.write(f"樣本數: `{r['n']}` 場")
-                        st.write(f"系統策略 ROI: `{r['roi']*100:.1f}%`")
-                        st.write(f"歷史勝率: `{r['acc']*100:.1f}%`")
+                    st.markdown(f"**{dstat['dim']}**")
+                    if dstat['valid']:
+                        st.write(f"樣本數: `{dstat['n']}` 張 (系統實注 `{dstat['n_bet']}` 張)")
+                        st.write(f"系統實注 ROI: `{dstat['roi']*100:.1f}%`")
+                        st.write(f"歷史勝率 (贏半或以上): `{dstat['acc']*100:.1f}%`")
                     else:
-                        st.warning(r['msg'])
+                        st.warning(dstat['msg'])
 
-            bm = res['best_model']
-            bb = res['best_bet']
-            dim_label_map = {"微觀 - 賽事名稱": "微觀", "中觀 - 賽事分類": "中觀", "宏觀 - 總數據": "宏觀"}
-            dim_short = dim_label_map.get(bm['dim'], "宏觀")
-            
-            # 顯示最佳模型資訊
-            if 'best_model_name' in bm:
-                st.info(f"最佳 ML 模型: **{bm['best_model_name']}** | 採用『{bm['dim']}』級別的模型進行運算，其歷史準確率與 EV 獲利期望值最高。")
-                if 'model_results' in bm and bm['model_results']:
-                    model_data = []
-                    for name, mr in bm['model_results'].items():
-                        model_data.append({
-                            '模型': name,
-                            '交叉驗證準確率': f"{mr['cv_mean']*100:.1f}%",
-                            '標準差': f"{mr['cv_std']*100:.1f}%",
-                        })
-                    if model_data:
-                        st.markdown("##### 📊 多模型交叉驗證對比")
-                        st.dataframe(pd.DataFrame(model_data), use_container_width=True, hide_index=True)
-            else:
-                st.info(f"系統分析顯示，針對『{res['t_name']}』，採用『{bm['dim']}』級別的模型進行運算，其歷史準確率與 EV 獲利期望值最高，故本次投注策略依據此模型生成。")
-            
-            st.markdown(f"### 🧠 AI 預測模型推薦")
-            
+            with st.container(border=True):
+                st.markdown("##### 🧠 V9 模型狀態")
+                if eng.get('trained'):
+                    st.write(f"訓練比賽數: `{eng.get('n_matches', 0)}` 場 | 全盤口樣本: `{eng.get('n_rows', 0)}` 個 | 模型: `{eng.get('kind')}` | 市場錨定權重 w = `{eng.get('w', 0):.1f}`")
+                    st.write(f"自動選出的特徵組合: **{' + '.join(eng.get('groups') or ['市場賠率'])}**")
+                else:
+                    st.write(f"訓練比賽數: `{eng.get('n_matches', 0)}` 場")
+                st.caption(eng.get('msg', ''))
+                cx = res.get('ctx', {})
+                st.caption(f"本場數據庫資料：主隊過往 {cx.get('h_n', 0)} 場、客隊過往 {cx.get('a_n', 0)} 場、對賽往績 {cx.get('h2h_n', 0)} 場、同賽事過往 {cx.get('league_n', 0)} 場 "
+                           f"| 主隊場均入球/失球 {cx.get('h_gf', 0):.2f}/{cx.get('h_ga', 0):.2f}，客隊 {cx.get('a_gf', 0):.2f}/{cx.get('a_ga', 0):.2f} (已向聯賽平均收縮)")
+                _lh, _la, _lc, _lsrc = res.get('lambdas', (None, None, None, {}))
+                if _lh is not None:
+                    st.caption(f"市場隱含預期：主隊 {_lh:.2f} 球、客隊 {_la:.2f} 球、總角球 {_lc:.1f} (來源: {', '.join(f'{k}={v}' for k, v in (_lsrc or {}).items())})")
+
+            st.markdown("### 🧠 AI 預測模型推薦")
             st.markdown("#### 📊 所有盤口評估明細 (完整歷史時間點評估與 EV 運算)")
-            cand_list = bm.get('candidates', [])
-            
+            cand_list = res.get('candidates', [])
+
             category_order = ["讓球", "入球大小", "角球大小"]
             all_options = []
             option_map = {}
-            
+
             if cand_list:
                 df_show = pd.DataFrame(cand_list)
                 df_show['推薦排序'] = range(1, len(df_show) + 1)
-                df_show = df_show[['推薦排序', 'bet_type', 'line', 'label', 'odds', 'relative_prob', 'ev']]
-                df_show.columns = ['推薦排序', '盤口類型', '盤口線', '投注方向', '賠率', '預期勝率 (兩邊相對化)', '期望值 (EV)']
-                df_show['預期勝率 (兩邊相對化)'] = df_show['預期勝率 (兩邊相對化)'].apply(lambda x: f"{x*100:.2f}%")
-                df_show['期望值 (EV)'] = df_show['期望值 (EV)'].apply(lambda x: f"{x:.3f}")
-                
+                df_show['最新賠率'] = df_show['is_latest'].apply(lambda v: '✔' if v else '')
+                df_show = df_show[['推薦排序', 'status', 'bet_type', 'line', 'label', 'odds', 'record_time', '最新賠率', 'p_mkt', 'prob', 'relative_prob', 'edge', 'ev']]
+                df_show.columns = ['推薦排序', '狀態', '盤口類型', '盤口線', '投注方向', '賠率', '時間', '最新賠率', '市場公平勝率', '模型有效勝率', '兩邊相對化', '相對市場優勢', '期望值 (EV)']
+                for _c in ['市場公平勝率', '模型有效勝率', '兩邊相對化']:
+                    df_show[_c] = df_show[_c].apply(lambda x: f"{x*100:.2f}%")
+                df_show['相對市場優勢'] = df_show['相對市場優勢'].apply(lambda x: f"{x*100:+.2f}%")
+                df_show['期望值 (EV)'] = df_show['期望值 (EV)'].apply(lambda x: f"{x:+.3f}")
+
                 def highlight_first(row):
-                    if row.name == 0:
+                    if str(row['狀態']).startswith('✅'):
                         return ['background-color: rgba(40, 167, 69, 0.2)'] * len(row)
+                    if str(row['狀態']).startswith('⛔'):
+                        return ['color: #999999'] * len(row)
                     return [''] * len(row)
-                    
-                st.dataframe(df_show.style.apply(highlight_first, axis=1), use_container_width=True)
-                st.caption("💡 「預期勝率」已兩邊相對化：同一盤口兩邊加總 = 100%，可直接比較應買哪一邊。註：讓球整數盤存在走盤退款情況，相對化勝率為兩邊相對強度比較基準；EV 及建議注碼仍以模型原始勝率 (二元簡化計算，未含走盤退款) 運算。")
-                
+
+                st.dataframe(df_show.style.apply(highlight_first, axis=1), use_container_width=True, hide_index=True)
+                st.caption("💡 「模型有效勝率」= 預期 (單位回報+1)/賠率，已完整計入亞洲盤贏半/輸半/走盤，故 EV = 有效勝率 × 賠率 − 1 為精確期望值。"
+                           f"「相對市場優勢」= 模型有效勝率 − 去水後市場公平勝率。只有 EV ≥ {v9_set['min_ev']*100:.1f}% 且盤口未被熔斷的最新賠率才會被建議。")
+
                 for cat in category_order:
-                    cat_cands = [c for c in cand_list if c.get('bet_type') == cat]
-                    for c in cat_cands:
-                        try:
-                            line_val = float(c.get('line', 0.0))
-                        except:
-                            line_val = 0.0
-                        c_idx = c.get('history_idx')
-                        
-                        latest_info = latest_history_map.get((cat, line_val))
-                        latest_idx = latest_info[0] if latest_info else None
-                        
-                        if c_idx is None or c_idx == latest_idx:
+                    for c in [c for c in cand_list if v9_clean_bt(c.get('bet_type')) == cat]:
+                        if c.get('history_idx') is None or c.get('is_latest', True):
                             opt_str = f"【{c['bet_type']}】{c['label']} @ {c['odds']}"
                             if opt_str not in option_map:
                                 all_options.append(opt_str)
@@ -2879,22 +3838,31 @@ def main():
                                     all_options.append(opt_str)
                                     option_map[opt_str] = c
                                 break
-            
-            st.info(f"系統分析顯示，針對『{res['t_name']}』，採用『{bm['dim']}』級別的模型進行運算，其歷史準確率與 EV 獲利期望值最高，故本次投注策略依據此模型生成。")
-            
+
+            picks = res.get('picks', [])
             mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("💡 首選推薦", f"{bb['bet_type']} - {bb['label']}")
-            mc2.metric(f"🎯 相對勝率 (兩邊加總100%)", f"{bb.get('relative_prob', bb.get('prob', 0))*100:.1f}%")
-            mc3.metric("📊 修正 EV", f"{bb.get('ev', 0):.3f}")
-            
+            if picks:
+                bb = picks[0]
+                mc1.metric("💡 首選推薦", f"{bb['bet_type']} - {bb['label']} @ {bb['odds']}")
+                mc2.metric("🎯 模型有效勝率 / 市場", f"{bb['prob']*100:.1f}% / {bb['p_mkt']*100:.1f}%")
+                mc3.metric("📊 EV", f"{bb.get('ev', 0):+.3f}")
+                if len(picks) > 1:
+                    st.caption("其他建議：" + "；".join(f"{p['bet_type']} {p['label']} @ {p['odds']} (EV {p['ev']:+.3f})" for p in picks[1:]))
+            else:
+                mc1.metric("💡 首選推薦", "⛔ 本場不建議投注")
+                _top = cand_list[0] if cand_list else None
+                mc2.metric("🎯 最佳候選 EV", f"{_top['ev']:+.3f}" if _top else "-")
+                mc3.metric("📏 EV 門檻", f"{v9_set['min_ev']*100:.1f}%")
+                st.info("系統未找到 EV 達標且未被熔斷的盤口。不投注本身就是最有效的風險控制：在馬會約 5%~8% 抽水下，沒有優勢的投注長期必然虧損。")
+
             st.markdown("---")
             st.markdown("### 🎯 最終投注決策與注碼配置 (已簡化分組選單)")
-            
+
             col_sys, col_usr = st.columns(2)
-            
+
             with col_sys:
                 st.markdown("#### 🤖 系統投注 (System)")
-                st.caption("供模型學習及系統資金策略驗證使用")
+                st.caption(f"供模型學習及系統資金策略驗證使用。注碼 = 分數 Kelly ({v9_set['kelly']:.2f}) × 優勢，單注上限 {v9_set['max_pct']*100:.1f}% 本金。")
                 default_sys = []
                 if is_editing and st.session_state.get('edit_sys_stake', 0) > 0:
                     eb = st.session_state.get('edit_bet_type')
@@ -2904,14 +3872,13 @@ def main():
                         if c['bet_type'] == eb and abs(float(c['line']) - float(el)) < 1e-4 and c['selection'] == es:
                             default_sys.append(opt)
                             break
-                elif not is_editing and cand_list:
-                    best_c = cand_list[0]
-                    if best_c.get('ev', 0) > 0:
+                elif not is_editing:
+                    for p in picks:
                         for opt, c in option_map.items():
-                            if c['bet_type'] == best_c['bet_type'] and abs(float(c['line']) - float(best_c['line'])) < 1e-4 and c['selection'] == best_c['selection']:
+                            if c['bet_type'] == p['bet_type'] and abs(float(c['line']) - float(p['line'])) < 1e-4 and c['selection'] == p['selection'] and opt not in default_sys:
                                 default_sys.append(opt)
                                 break
-                
+
                 sys_selected = st.multiselect("選擇系統投注項目", all_options, default=default_sys, key="sys_multi")
                 sys_stakes = {}
                 for sel in sys_selected:
@@ -2924,15 +3891,12 @@ def main():
                         if _orig_stk > 0:
                             _stk_val = _orig_stk
                     sys_stakes[sel] = st.number_input(f"系統建議金額: {sel}", value=_stk_val, disabled=True, key=f"s_stk_{sel}")
-                    if "讓球" in cand['bet_type'] and 0 < raw_stk < 200:
-                        if cand.get('ev', 0) >= 0.03 and cand.get('prob', 0) >= 0.50:
-                            st.caption(f"💡 `{cand['bet_type']}` EV/勝率達標，系統自動升級最低注碼 $200")
-                        else:
-                            st.caption(f"⚠ `{cand['bet_type']}` EV未達標，系統建議放棄 (注碼 $0)")
-            
+                    if _stk_val <= 0:
+                        st.caption(f"⚠ `{cand['bet_type']}` {cand.get('status', '')}：EV {cand.get('ev', 0):+.3f}，系統建議注碼 $0 (只作記錄供學習)")
+
             with col_usr:
                 st.markdown("#### 👤 用家投注 (User)")
-                st.caption("真實資金決策，不用於系統學習。可跟單或反買")
+                st.caption("真實資金決策，不用於系統學習。建議只跟隨「✅ 建議」項目，並使用不高於系統建議的注碼。")
                 default_usr = []
                 if is_editing and st.session_state.get('edit_user_stake', 0) > 0:
                     eb = st.session_state.get('edit_bet_type')
@@ -2942,15 +3906,17 @@ def main():
                         if c['bet_type'] == eb and abs(float(c['line']) - float(el)) < 1e-4 and c['selection'] == es:
                             default_usr.append(opt)
                             break
-                
+
                 usr_selected = st.multiselect("選擇用家投注項目", all_options, default=default_usr, key="usr_multi")
                 usr_stakes = {}
                 for sel in usr_selected:
                     def_val = 100.0
                     if is_editing and sel in default_usr:
                         def_val = float(st.session_state.get('edit_user_stake', 100.0))
+                    _uc = option_map[sel]
+                    if not str(_uc.get('status', '')).startswith('✅'):
+                        st.caption(f"⚠ `{sel}` 不在系統建議內 ({_uc.get('status', '')}，EV {_uc.get('ev', 0):+.3f})，請審慎考慮。")
                     usr_stakes[sel] = st.number_input(f"用家自訂金額 ($): {sel}", min_value=0.0, step=10.0, value=def_val, key=f"u_stk_{sel}")
-            
             st.write("")
             submit_btn_label = f"🔄 確定修改並覆蓋雲端資料庫 (ID: {st.session_state.editing_bet_id})" if is_editing else "✅ 確定投注並寫入雲端資料庫"
             
@@ -3209,9 +4175,15 @@ def main():
                 # --- 即場數據分析執行 ---
                 if st.button("🚀 即場數據分析執行", type="primary", use_container_width=True, key="btn_inplay_analysis"):
                     st.session_state.show_inplay_analysis = True
+                    v9_set = v9_get_settings()
+                    # 即場沒有歷史即場賠率可供驗證，因此提高 EV 門檻 2% 作安全邊際
+                    v9_set_ip = dict(v9_set)
+                    v9_set_ip['min_ev'] = v9_set['min_ev'] + 0.02
+                    engine, mt_hist, tl_hist = v9_get_engine(st.session_state.df_db)
 
-                    # 取得比賽資料
-                    ip_last_row = matching_bets.iloc[-1]
+                    # 取得比賽資料 (優先使用賽前注單作為賽前資料來源)
+                    _pre_rows = matching_bets[~matching_bets['Bet_Type'].astype(str).str.contains('即場', na=False)]
+                    ip_last_row = _pre_rows.iloc[-1] if not _pre_rows.empty else matching_bets.iloc[-1]
                     ip_t_name = str(ip_last_row.get('Tournament_Name', '')) if pd.notna(ip_last_row.get('Tournament_Name')) else ''
                     ip_t_cat = str(ip_last_row.get('Tournament_Category', CATEGORY_OPTIONS[0])) if pd.notna(ip_last_row.get('Tournament_Category')) else CATEGORY_OPTIONS[0]
                     ip_h_team = str(ip_last_row.get('Home_Team', '')) if pd.notna(ip_last_row.get('Home_Team')) else ''
@@ -3223,74 +4195,83 @@ def main():
 
                     # 聯賽排名 → 實力分 (新數據為數字排名，舊數據為字母自動換算)
                     ip_league_size = get_league_size(ip_last_row)
-                    ip_h_rank = rating_to_rank(ip_h_rating, ip_league_size)
-                    ip_a_rank = rating_to_rank(ip_a_rating, ip_league_size)
-                    _rating_map = {"S": 5, "A": 4, "B": 3, "C": 2, "D": 1}
-                    ip_hr_val = rank_to_strength(ip_h_rank, ip_league_size)
-                    ip_ar_val = rank_to_strength(ip_a_rank, ip_league_size)
-                    ip_h_data = {'hr': ip_hr_val, 'ar': ip_ar_val, 'hf': extract_form_points(ip_h_form), 'af': extract_form_points(ip_a_form)}
+                    ip_hr_val = rating_to_strength(ip_h_rating, ip_league_size)
+                    ip_ar_val = rating_to_strength(ip_a_rating, ip_league_size)
+                    ip_match_date = get_row_match_date(ip_last_row)
+                    try:
+                        _ip_md_ts = pd.Timestamp(ip_match_date)
+                    except Exception:
+                        _ip_md_ts = pd.Timestamp(get_hkt_now().strftime('%Y-%m-%d'))
+                    ip_ctx = v9_match_context(mt_hist, tl_hist, ip_h_team, ip_a_team, ip_t_name, _ip_md_ts, ip_hr_val, ip_ar_val,
+                                              float(extract_form_points(ip_h_form)), float(extract_form_points(ip_a_form)))
 
-                    # 建立即場候選盤口 (結合剩餘時間與攻勢危險度計算基礎機率)
-                    ip_candidates_base = []
+                    # 賽前主盤賠率 → 市場隱含 λ；再按剩餘時間、攻勢強度、紅牌調整為剩餘時間 λ
+                    try:
+                        _pre_oh = json.loads(str(ip_last_row.get('Odds_History', '[]')))
+                        if not isinstance(_pre_oh, list):
+                            _pre_oh = []
+                    except Exception:
+                        _pre_oh = []
+                    _lh, _la, _lc, _lsrc = v9_prematch_lambdas(_pre_oh, ip_ctx)
+                    _rlh, _rla, _rlc, _ints = v9_inplay_lambdas(_lh, _la, _lc, ip_minute, h_red, a_red,
+                                                                h_sot + h_soff, a_sot + a_soff, h_da, a_da)
 
-                    # 讓球
+                    def _ip_cand(bt, sel, line, odds, opp_odds, label, hidx):
+                        if bt == '讓球':
+                            er = v9_expected_ret_hd(sel, float(line), h_g, a_g, _rlh, _rla, float(odds))
+                        elif bt == '入球大小':
+                            er = v9_expected_ret_total(sel, float(line), h_g + a_g, _rlh + _rla, float(odds))
+                        else:
+                            er = v9_expected_ret_total(sel, float(line), h_c + a_c, _rlc, float(odds))
+                        p_pois = float(np.clip((er + 1.0) / float(odds), 0.0, 1.0))
+                        p_mkt_ip, _ = v9_devig(float(odds), float(opp_odds))
+                        # 即場：市場公平機率與 Poisson 模型各佔一半 (市場錨定，避免模型過度自信)
+                        p_final = 0.5 * p_mkt_ip + 0.5 * p_pois
+                        return {'bet_type': bt, 'selection': sel, 'base_prob': p_pois, 'base_prob_override': p_final, 'p_pois': p_pois,
+                                'odds': float(odds), 'line': float(line), 'label': label, 'history_idx': hidx,
+                                'record_time': get_hkt_now().strftime('%d-%m %H:%M'), 'odds_drift': 0.0, 'is_latest': True}
+
                     _hd_line_str = f"{ip_hd_line:g}"
-                    _hd_p_home = calc_inplay_base_prob("讓球", "Home", ip_hd_line, h_g, a_g, h_c, a_c, ip_minute, h_firepower, a_firepower, h_corner_eff, a_corner_eff)
-                    _hd_p_away = calc_inplay_base_prob("讓球", "Away", ip_hd_line, h_g, a_g, h_c, a_c, ip_minute, h_firepower, a_firepower, h_corner_eff, a_corner_eff)
                     if ip_hd_line <= 0:
                         _hd_label_h, _hd_label_a = f"{_hd_line_str}主隊(上盤)", f"{_hd_line_str}客隊(下盤)"
                     else:
                         _hd_label_h, _hd_label_a = f"{_hd_line_str}主隊(下盤)", f"{_hd_line_str}客隊(上盤)"
-                    ip_candidates_base.extend([
-                        {'bet_type': '讓球', 'selection': 'Home', 'base_prob': _hd_p_home, 'odds': float(ip_hd_upper), 'line': float(ip_hd_line), 'label': _hd_label_h, 'history_idx': 0, 'record_time': get_hkt_now().strftime('%m-%d %H:%M'), 'odds_drift': 0.0},
-                        {'bet_type': '讓球', 'selection': 'Away', 'base_prob': _hd_p_away, 'odds': float(ip_hd_lower), 'line': float(ip_hd_line), 'label': _hd_label_a, 'history_idx': 0, 'record_time': get_hkt_now().strftime('%m-%d %H:%M'), 'odds_drift': 0.0},
-                    ])
-
-                    # 入球大小
                     _ou_line_str = f"{ip_ou_line:g}"
-                    _ou_p_over = calc_inplay_base_prob("入球大小", "Over", ip_ou_line, h_g, a_g, h_c, a_c, ip_minute, h_firepower, a_firepower, h_corner_eff, a_corner_eff)
-                    _ou_p_under = calc_inplay_base_prob("入球大小", "Under", ip_ou_line, h_g, a_g, h_c, a_c, ip_minute, h_firepower, a_firepower, h_corner_eff, a_corner_eff)
-                    ip_candidates_base.extend([
-                        {'bet_type': '入球大小', 'selection': 'Over', 'base_prob': _ou_p_over, 'odds': float(ip_ou_upper), 'line': float(ip_ou_line), 'label': f"{_ou_line_str}大盤(Over)", 'history_idx': 1, 'record_time': get_hkt_now().strftime('%m-%d %H:%M'), 'odds_drift': 0.0},
-                        {'bet_type': '入球大小', 'selection': 'Under', 'base_prob': _ou_p_under, 'odds': float(ip_ou_lower), 'line': float(ip_ou_line), 'label': f"{_ou_line_str}小盤(Under)", 'history_idx': 1, 'record_time': get_hkt_now().strftime('%m-%d %H:%M'), 'odds_drift': 0.0},
-                    ])
-
-                    # 角球大小
                     _cr_line_str = f"{ip_cr_line:g}"
-                    _cr_p_over = calc_inplay_base_prob("角球大小", "Over", ip_cr_line, h_g, a_g, h_c, a_c, ip_minute, h_firepower, a_firepower, h_corner_eff, a_corner_eff)
-                    _cr_p_under = calc_inplay_base_prob("角球大小", "Under", ip_cr_line, h_g, a_g, h_c, a_c, ip_minute, h_firepower, a_firepower, h_corner_eff, a_corner_eff)
-                    ip_candidates_base.extend([
-                        {'bet_type': '角球大小', 'selection': 'Over', 'base_prob': _cr_p_over, 'odds': float(ip_cr_upper), 'line': float(ip_cr_line), 'label': f"{_cr_line_str}大盤(Over)", 'history_idx': 2, 'record_time': get_hkt_now().strftime('%m-%d %H:%M'), 'odds_drift': 0.0},
-                        {'bet_type': '角球大小', 'selection': 'Under', 'base_prob': _cr_p_under, 'odds': float(ip_cr_lower), 'line': float(ip_cr_line), 'label': f"{_cr_line_str}小盤(Under)", 'history_idx': 2, 'record_time': get_hkt_now().strftime('%m-%d %H:%M'), 'odds_drift': 0.0},
-                    ])
+                    ip_candidates_base = [
+                        _ip_cand('讓球', 'Home', ip_hd_line, ip_hd_upper, ip_hd_lower, _hd_label_h, 0),
+                        _ip_cand('讓球', 'Away', ip_hd_line, ip_hd_lower, ip_hd_upper, _hd_label_a, 0),
+                        _ip_cand('入球大小', 'Over', ip_ou_line, ip_ou_upper, ip_ou_lower, f"{_ou_line_str}大盤(Over)", 1),
+                        _ip_cand('入球大小', 'Under', ip_ou_line, ip_ou_lower, ip_ou_upper, f"{_ou_line_str}小盤(Under)", 1),
+                        _ip_cand('角球大小', 'Over', ip_cr_line, ip_cr_upper, ip_cr_lower, f"{_cr_line_str}大盤(Over)", 2),
+                        _ip_cand('角球大小', 'Under', ip_cr_line, ip_cr_lower, ip_cr_upper, f"{_cr_line_str}小盤(Under)", 2),
+                    ]
+                    ip_scored = v9_score_candidates(engine, ip_candidates_base, ip_ctx, v9_set_ip, {})
+                    ip_picks, _ip_used = [], set()
+                    for c in ip_scored:
+                        if c.get('status') == '✅ 建議' and c['bet_type'] not in _ip_used:
+                            ip_picks.append(c)
+                            _ip_used.add(c['bet_type'])
+                            if len(ip_picks) >= v9_set['max_picks']:
+                                break
 
-                    # 三維度分析
                     df_settled_ip = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
-                    df_ip_micro = df_settled_ip[df_settled_ip['Tournament_Name'] == ip_t_name]
-                    df_ip_meso = df_settled_ip[df_settled_ip['Tournament_Category'] == ip_t_cat]
-                    df_ip_macro = df_settled_ip
-
-                    ip_res_micro = evaluate_dimension_enhanced(df_ip_micro, "微觀 - 賽事名稱", ip_candidates_base, _rating_map, ip_h_data)
-                    ip_res_meso = evaluate_dimension_enhanced(df_ip_meso, "中觀 - 賽事分類", ip_candidates_base, _rating_map, ip_h_data)
-                    ip_res_macro = evaluate_dimension_enhanced(df_ip_macro, "宏觀 - 總數據", ip_candidates_base, _rating_map, ip_h_data)
-
-                    ip_valid_res = [r for r in [ip_res_micro, ip_res_meso, ip_res_macro] if r['valid']]
-                    ip_best_model = max(ip_valid_res, key=lambda x: x['score']) if ip_valid_res else ip_res_macro
-                    if not ip_valid_res:
-                        ip_best_model['msg'] = "所有維度樣本數不足，降級為純基礎期望值運算。"
-
-                    ip_best_bet = ip_best_model['best'] if 'best' in ip_best_model else ip_candidates_base[0]
 
                     # 建立即場賠率歷史 JSON
+                    _ip_now = get_hkt_now().strftime('%d-%m %H:%M')
                     ip_odds_history = [
-                        {"id": 0, "type": "讓球", "record_time": get_hkt_now().strftime('%m-%d %H:%M'), "line": float(ip_hd_line), "upper": float(ip_hd_upper), "lower": float(ip_hd_lower), "unlock": True, "margin": round(1.0/ip_hd_upper + 1.0/ip_hd_lower, 3) if ip_hd_upper > 0 and ip_hd_lower > 0 else 1.085},
-                        {"id": 1, "type": "入球大小", "record_time": get_hkt_now().strftime('%m-%d %H:%M'), "line": float(ip_ou_line), "upper": float(ip_ou_upper), "lower": float(ip_ou_lower), "unlock": True, "margin": round(1.0/ip_ou_upper + 1.0/ip_ou_lower, 3) if ip_ou_upper > 0 and ip_ou_lower > 0 else 1.085},
-                        {"id": 2, "type": "角球大小", "record_time": get_hkt_now().strftime('%m-%d %H:%M'), "line": float(ip_cr_line), "upper": float(ip_cr_upper), "lower": float(ip_cr_lower), "unlock": True, "margin": round(1.0/ip_cr_upper + 1.0/ip_cr_lower, 3) if ip_cr_upper > 0 and ip_cr_lower > 0 else 1.085},
+                        {"id": 0, "type": "讓球", "record_time": _ip_now, "line": float(ip_hd_line), "upper": float(ip_hd_upper), "lower": float(ip_hd_lower), "unlock": True, "margin": round(1.0/ip_hd_upper + 1.0/ip_hd_lower, 3) if ip_hd_upper > 0 and ip_hd_lower > 0 else 1.085},
+                        {"id": 1, "type": "入球大小", "record_time": _ip_now, "line": float(ip_ou_line), "upper": float(ip_ou_upper), "lower": float(ip_ou_lower), "unlock": True, "margin": round(1.0/ip_ou_upper + 1.0/ip_ou_lower, 3) if ip_ou_upper > 0 and ip_ou_lower > 0 else 1.085},
+                        {"id": 2, "type": "角球大小", "record_time": _ip_now, "line": float(ip_cr_line), "upper": float(ip_cr_upper), "lower": float(ip_cr_lower), "unlock": True, "margin": round(1.0/ip_cr_upper + 1.0/ip_cr_lower, 3) if ip_cr_upper > 0 and ip_cr_lower > 0 else 1.085},
                     ]
 
                     st.session_state.inplay_analysis_result = {
-                        'micro': ip_res_micro, 'meso': ip_res_meso, 'macro': ip_res_macro,
-                        'best_model': ip_best_model, 'best_bet': ip_best_bet,
+                        'v9': True,
+                        'dims': [v9_dimension_stats(df_settled_ip[df_settled_ip['Tournament_Name'] == ip_t_name], "A. 微觀 (賽事名稱)"),
+                                 v9_dimension_stats(df_settled_ip[df_settled_ip['Tournament_Category'] == ip_t_cat], "B. 中觀 (賽事分類)"),
+                                 v9_dimension_stats(df_settled_ip, "C. 宏觀 (全局數據)")],
+                        'candidates': ip_scored, 'picks': ip_picks, 'min_ev': v9_set_ip['min_ev'],
+                        'lambdas_pre': (_lh, _la, _lc, _lsrc), 'lambdas_rem': (_rlh, _rla, _rlc, _ints),
                         't_name': ip_t_name, 't_cat': ip_t_cat,
                         'h_team': ip_h_team, 'a_team': ip_a_team,
                         'h_rating': ip_h_rating, 'a_rating': ip_a_rating,
@@ -3298,40 +4279,36 @@ def main():
                         'h_form': ip_h_form, 'a_form': ip_a_form,
                         'odds_history': ip_odds_history,
                         'remaining_min': max(0, 90 - ip_minute),
-                        'match_date': get_row_match_date(ip_last_row),
+                        'match_date': ip_match_date,
                     }
+
+                if st.session_state.get('show_inplay_analysis', False) and not st.session_state.get('inplay_analysis_result', {}).get('v9'):
+                    st.session_state.show_inplay_analysis = False
 
                 # --- 顯示即場分析結果 ---
                 if st.session_state.get('show_inplay_analysis', False):
                     ip_res = st.session_state.inplay_analysis_result
-                    st.success("✅ 三維度即場數據分析與 EV 運算完成！")
-                    st.info(f"⏱ 剩餘比賽時間: {ip_res['remaining_min']} 分鐘 | 系統結合剩餘時間、進攻火力與角球效率計算即場期望值。")
+                    st.success("✅ V9 即場 Poisson + 市場錨定分析完成！")
+                    _plh, _pla, _plc, _psrc = ip_res['lambdas_pre']
+                    _rlh, _rla, _rlc, _ints = ip_res['lambdas_rem']
+                    st.info(f"⏱ 剩餘比賽時間: {ip_res['remaining_min']} 分鐘 | 賽前隱含預期: 主 {_plh:.2f} 球 / 客 {_pla:.2f} 球 / 角球 {_plc:.1f} "
+                            f"| 剩餘時間預期: 主 +{_rlh:.2f} 球 / 客 +{_rla:.2f} 球 / 角球 +{_rlc:.1f} (攻勢係數 主 {_ints[0]:.2f}、客 {_ints[1]:.2f}、角球 {_ints[2]:.2f})")
+                    st.caption("來源：" + ", ".join(f"{k}={v}" for k, v in (_psrc or {}).items()) + "。即場模型 = 50% 去水市場機率 + 50% Poisson 剩餘時間模型；EV 門檻自動提高 2%。")
 
                     ip_c1, ip_c2, ip_c3 = st.columns(3)
-                    for col, r, title in zip([ip_c1, ip_c2, ip_c3], [ip_res['micro'], ip_res['meso'], ip_res['macro']], ["A. 微觀 (賽事名稱)", "B. 中觀 (賽事分類)", "C. 宏觀 (全局數據)"]):
+                    for col, dstat in zip([ip_c1, ip_c2, ip_c3], ip_res['dims']):
                         with col.container(border=True):
-                            st.markdown(f"**{title}**")
-                            if r['valid']:
-                                st.write(f"樣本數: `{r['n']}` 場")
-                                st.write(f"系統策略 ROI: `{r['roi']*100:.1f}%`")
-                                st.write(f"歷史勝率: `{r['acc']*100:.1f}%`")
+                            st.markdown(f"**{dstat['dim']}**")
+                            if dstat['valid']:
+                                st.write(f"樣本數: `{dstat['n']}` 張 (系統實注 `{dstat['n_bet']}` 張)")
+                                st.write(f"系統實注 ROI: `{dstat['roi']*100:.1f}%`")
+                                st.write(f"歷史勝率: `{dstat['acc']*100:.1f}%`")
                             else:
-                                st.warning(r['msg'])
+                                st.warning(dstat['msg'])
 
-                    ip_bm = ip_res['best_model']
-                    ip_bb = ip_res['best_bet']
-                    ip_dim_label_map = {"微觀 - 賽事名稱": "微觀", "中觀 - 賽事分類": "中觀", "宏觀 - 總數據": "宏觀"}
-                    ip_dim_short = ip_dim_label_map.get(ip_bm['dim'], "宏觀")
-
-                    st.markdown(f"### 🧠 AI 預測模型推薦 (即場)")
-                    # 顯示最佳模型資訊
-                    if 'best_model_name' in ip_bm:
-                        st.info(f"最佳 ML 模型: **{ip_bm['best_model_name']}** | 採用『{ip_bm['dim']}』級別的模型進行運算。剩餘比賽時間: {ip_res['remaining_min']} 分鐘。")
-                    else:
-                        st.info(f"系統分析顯示，針對『{ip_res['t_name']}』，採用『{ip_bm['dim']}』級別的模型進行運算，其歷史準確率與 EV 獲利期望值最高，故本次即場投注策略依據此模型生成。")
-
+                    st.markdown("### 🧠 AI 預測模型推薦 (即場)")
                     st.markdown("#### 📊 所有盤口評估明細 (即場 EV 運算)")
-                    ip_cand_list = ip_bm.get('candidates', [])
+                    ip_cand_list = ip_res.get('candidates', [])
 
                     ip_all_options = []
                     ip_option_map = {}
@@ -3339,18 +4316,19 @@ def main():
                     if ip_cand_list:
                         ip_df_show = pd.DataFrame(ip_cand_list)
                         ip_df_show['推薦排序'] = range(1, len(ip_df_show) + 1)
-                        ip_df_show = ip_df_show[['推薦排序', 'bet_type', 'line', 'label', 'odds', 'relative_prob', 'ev']]
-                        ip_df_show.columns = ['推薦排序', '盤口類型', '盤口線', '投注方向', '賠率', '預期勝率 (兩邊相對化)', '期望值 (EV)']
-                        ip_df_show['預期勝率 (兩邊相對化)'] = ip_df_show['預期勝率 (兩邊相對化)'].apply(lambda x: f"{x*100:.2f}%")
-                        ip_df_show['期望值 (EV)'] = ip_df_show['期望值 (EV)'].apply(lambda x: f"{x:.3f}")
+                        ip_df_show = ip_df_show[['推薦排序', 'status', 'bet_type', 'line', 'label', 'odds', 'p_mkt', 'p_pois', 'prob', 'relative_prob', 'ev']]
+                        ip_df_show.columns = ['推薦排序', '狀態', '盤口類型', '盤口線', '投注方向', '賠率', '市場公平勝率', 'Poisson 有效勝率', '最終有效勝率', '兩邊相對化', '期望值 (EV)']
+                        for _c in ['市場公平勝率', 'Poisson 有效勝率', '最終有效勝率', '兩邊相對化']:
+                            ip_df_show[_c] = ip_df_show[_c].apply(lambda x: f"{x*100:.2f}%")
+                        ip_df_show['期望值 (EV)'] = ip_df_show['期望值 (EV)'].apply(lambda x: f"{x:+.3f}")
 
                         def _highlight_first_ip(row):
-                            if row.name == 0:
+                            if str(row['狀態']).startswith('✅'):
                                 return ['background-color: rgba(40, 167, 69, 0.2)'] * len(row)
                             return [''] * len(row)
 
-                        st.dataframe(ip_df_show.style.apply(_highlight_first_ip, axis=1), use_container_width=True)
-                        st.caption("💡 「預期勝率」已兩邊相對化：同一盤口兩邊加總 = 100%，可直接比較應買哪一邊。註：讓球整數盤存在走盤退款情況，相對化勝率為兩邊相對強度比較基準；EV 及建議注碼仍以模型原始勝率 (二元簡化計算，未含走盤退款) 運算。")
+                        st.dataframe(ip_df_show.style.apply(_highlight_first_ip, axis=1), use_container_width=True, hide_index=True)
+                        st.caption(f"💡 有效勝率已計入亞洲盤贏半/輸半/走盤，EV = 有效勝率 × 賠率 − 1。即場建議門檻: EV ≥ {ip_res.get('min_ev', 0.05)*100:.1f}%。")
 
                         for c in ip_cand_list:
                             opt_str = f"【{c['bet_type']}】{c['label']} @ {c['odds']}"
@@ -3358,10 +4336,17 @@ def main():
                                 ip_all_options.append(opt_str)
                                 ip_option_map[opt_str] = c
 
+                    ip_picks = ip_res.get('picks', [])
                     ip_mc1, ip_mc2, ip_mc3 = st.columns(3)
-                    ip_mc1.metric("💡 首選推薦", f"{ip_bb['bet_type']} - {ip_bb['label']}")
-                    ip_mc2.metric(f"🎯 相對勝率 (兩邊加總100%)", f"{ip_bb.get('relative_prob', ip_bb.get('prob', 0))*100:.1f}%")
-                    ip_mc3.metric("📊 修正 EV", f"{ip_bb.get('ev', 0):.3f}")
+                    if ip_picks:
+                        ip_bb = ip_picks[0]
+                        ip_mc1.metric("💡 首選推薦", f"{ip_bb['bet_type']} - {ip_bb['label']} @ {ip_bb['odds']}")
+                        ip_mc2.metric("🎯 有效勝率 / 市場", f"{ip_bb['prob']*100:.1f}% / {ip_bb['p_mkt']*100:.1f}%")
+                        ip_mc3.metric("📊 EV", f"{ip_bb.get('ev', 0):+.3f}")
+                    else:
+                        ip_mc1.metric("💡 首選推薦", "⛔ 現時不建議即場投注")
+                        ip_mc2.metric("🎯 最佳候選 EV", f"{ip_cand_list[0]['ev']:+.3f}" if ip_cand_list else "-")
+                        ip_mc3.metric("📏 即場 EV 門檻", f"{ip_res.get('min_ev', 0.05)*100:.1f}%")
 
                     st.markdown("---")
                     st.markdown("### 🎯 最終即場投注決策與注碼配置")
@@ -3372,25 +4357,22 @@ def main():
                         st.markdown("#### 🤖 系統投注 (System)")
                         st.caption("供模型學習及系統資金策略驗證使用。下注金額將自動從系統可用資金中扣除。")
                         ip_default_sys = []
-                        if ip_cand_list:
-                            ip_best_c = ip_cand_list[0]
-                            if ip_best_c.get('ev', 0) > 0:
-                                for opt, c in ip_option_map.items():
-                                    if c['bet_type'] == ip_best_c['bet_type'] and abs(float(c['line']) - float(ip_best_c['line'])) < 1e-4 and c['selection'] == ip_best_c['selection']:
-                                        ip_default_sys.append(opt)
-                                        break
+                        for p in ip_picks:
+                            for opt, c in ip_option_map.items():
+                                if c['bet_type'] == p['bet_type'] and abs(float(c['line']) - float(p['line'])) < 1e-4 and c['selection'] == p['selection'] and opt not in ip_default_sys:
+                                    ip_default_sys.append(opt)
+                                    break
 
                         ip_sys_selected = st.multiselect("選擇系統即場投注項目", ip_all_options, default=ip_default_sys, key="ip_sys_multi")
                         ip_sys_stakes = {}
+                        _ip_stake_set = dict(v9_get_settings())
+                        _ip_stake_set['min_ev'] = ip_res.get('min_ev', _ip_stake_set['min_ev'] + 0.02)
                         for sel in ip_sys_selected:
                             cand = ip_option_map[sel]
-                            sug_stk, raw_stk = calc_suggested_stake(cand, sys_bankroll, sys_max_stake)
+                            sug_stk, raw_stk = v9_calc_stake(cand, sys_bankroll, sys_max_stake, _ip_stake_set)
                             ip_sys_stakes[sel] = st.number_input(f"系統建議金額: {sel}", value=float(sug_stk), disabled=True, key=f"ip_s_stk_{sel}")
-                            if "讓球" in cand['bet_type'] and 0 < raw_stk < 200:
-                                if cand.get('ev', 0) >= 0.03 and cand.get('prob', 0) >= 0.50:
-                                    st.caption(f"💡 `{cand['bet_type']}` EV/勝率達標，系統自動升級最低注碼 $200")
-                                else:
-                                    st.caption(f"⚠ `{cand['bet_type']}` EV未達標，系統建議放棄 (注碼 $0)")
+                            if sug_stk <= 0:
+                                st.caption(f"⚠ `{cand['bet_type']}` {cand.get('status', '')}：EV {cand.get('ev', 0):+.3f}，系統建議注碼 $0")
 
                     with ip_col_usr:
                         st.markdown("#### 👤 用家投注 (User)")
@@ -3399,7 +4381,6 @@ def main():
                         ip_usr_stakes = {}
                         for sel in ip_usr_selected:
                             ip_usr_stakes[sel] = st.number_input(f"用家自訂金額 ($): {sel}", min_value=0.0, step=10.0, value=100.0, key=f"ip_u_stk_{sel}")
-
                     st.write("")
                     if st.button("✅ 確定即場投注並寫入雲端資料庫", type="primary", use_container_width=True, key="btn_submit_inplay"):
                         ip_all_keys = set(ip_sys_selected + ip_usr_selected)
