@@ -1,0 +1,8 @@
+Key,Value
+v9_min_ev,3.0
+v9_kelly,0.25
+v9_max_pct,10.0
+v9_max_picks,1
+v9_hd_min200,False
+v9_override_gate,False
+v10_mode,看盤規則
