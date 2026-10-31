@@ -2946,15 +2946,16 @@ def v11_data_audit(df_db):
                     continue
                 if up <= 1.0 or lw <= 1.0:
                     continue
-                tag = f"{bt} {ln:g} @ {up:g}/{lw:g}"
+                _rt = str(h.get('record_time', '') or '').strip()
+                tag = f"{bt} {ln:g} @ {up:g}/{lw:g}" + (f" [紀錄時間 {_rt}]" if _rt else '')
                 if not v11_valid_pair(up, lw):
                     bad_list.append(tag + f" (抽水 {1/up + 1/lw:.2f})")
                 elif bt == '讓球' and abs(ln) >= 3.5:
                     bad_list.append(tag + " (讓球盤口線異常深，請確認)")
         if bad_list:
             bad_list = list(dict.fromkeys(bad_list))
-            issues.append(_v11_issue('🟠 中', '賠率輸入錯誤', g.iloc[0], f"不合理的賠率紀錄：{'；'.join(bad_list[:6])}。正常抽水約 1.03~1.12；兩邊同一數值或任何一邊 >15 多數是輸入/貼上錯誤。V11 訓練時已自動忽略這些紀錄。",
-                                     '修正該場的賠率紀錄', list(g['_ID'])[:3], md=md_))
+            issues.append(_v11_issue('🟠 中', '賠率輸入錯誤', g.iloc[0], f"賠率走勢紀錄 (Odds_History 欄位內) 有不合理數值：{'；'.join(bad_list[:6])}。正常抽水約 1.03~1.12；抽水過高 (例如 1.46/1.46)、低於 1 (例如 2.1/3.14) 或任何一邊 >15 多數是輸入/貼上錯誤。V11 訓練時已自動忽略抽水不合理的紀錄。",
+                                     '用下方「⑤ 移除不合理賠率紀錄」一鍵清除；深盤 (≥3.5) 若屬實可勾選確認無誤', list(g['_ID'])[:3], md=md_))
 
     # 6) 近況不等於 5 場 / 未改動的預設近況
     mrow = d.drop_duplicates(['_m', '_md'])
@@ -3030,6 +3031,33 @@ def v11_data_audit(df_db):
 
 
 V11_IGN_PREFIX = 'IGN|'
+
+
+def v11_strip_bad_odds(js):
+    """從一張注單的 Odds_History 移除抽水不合理的紀錄，回傳 (新 JSON, 移除數目)"""
+    try:
+        oh = json.loads(str(js))
+    except Exception:
+        return js, 0
+    if not isinstance(oh, list):
+        return js, 0
+    keep, n = [], 0
+    for h in oh:
+        try:
+            up, lw = float(h.get('upper')), float(h.get('lower'))
+        except (TypeError, ValueError, AttributeError):
+            keep.append(h)
+            continue
+        if up > 1.0 and lw > 1.0 and not v11_valid_pair(up, lw):
+            n += 1
+            continue
+        keep.append(h)
+    if n == 0:
+        return js, 0
+    for i, h in enumerate(keep):
+        if isinstance(h, dict):
+            h['id'] = i
+    return json.dumps(keep, ensure_ascii=False), n
 
 
 def v11_issue_key(row):
@@ -3232,6 +3260,35 @@ def render_v11_data_quality():
                     d.loc[sel_na, 'Away_Rating'] = 'NA'
                 v11_save_league_size(t, new_ls, silent=True)
                 _v11_commit_db(d, f"✅ 已更新「{t}」的分類、隊伍數目及排名設定")
+
+    with st.container(border=True):
+        st.markdown("**⑤ 移除不合理賠率紀錄 (Odds_History)**")
+        st.caption("只移除賠率走勢紀錄中抽水不合理的單一條紀錄 (例如 1.46/1.46、2.1/3.14、22/19)，同一場所有注單一併處理；"
+                   "注單本身的投注賠率、注碼及盈虧不會改動。深盤 (例如 -3.75) 不會被移除，屬實請勾選確認無誤。")
+        _d = df_db.copy()
+        _d['_m'] = _d['Match'].astype(str).map(v11_clean_name)
+        _d['_md'] = v10_md_series(_d)
+        _cnt = _d['Odds_History'].map(lambda x: v11_strip_bad_odds(x)[1] if pd.notna(x) else 0)
+        _bad = _d[_cnt > 0]
+        _opts = []
+        for (m_, md_), g in _bad.groupby(['_m', '_md'], sort=False):
+            _opts.append(f"{md_} | {m_}")
+        if not _opts:
+            st.success("✅ 沒有抽水不合理的賠率紀錄。")
+        else:
+            sel5 = st.multiselect(f"選擇要清理的比賽 (共 {len(_opts)} 場)", _opts, default=_opts, key="v11_badodds_sel")
+            if st.button("🧽 移除選中比賽的不合理賠率紀錄", key="v11_fix_badodds", use_container_width=True, disabled=not sel5):
+                d = df_db.copy()
+                tot = 0
+                for lab in sel5:
+                    md_, m_ = lab.split(' | ', 1)
+                    mk = (_d['_m'] == m_) & (_d['_md'].astype(str) == md_)
+                    for idx in d.index[mk.values]:
+                        nj, k = v11_strip_bad_odds(d.at[idx, 'Odds_History'])
+                        if k:
+                            d.at[idx, 'Odds_History'] = nj
+                            tot += k
+                _v11_commit_db(d, f"✅ 已從 {len(sel5)} 場比賽移除 {tot} 條不合理賠率紀錄")
 
 
 # ---------- 模型擂台：所有模型在同一測試期、完全樣本外比較 ----------
