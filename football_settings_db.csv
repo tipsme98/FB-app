@@ -5,4 +5,8 @@ v9_max_pct,5.0
 v9_max_picks,1
 v9_hd_min200,True
 v9_override_gate,False
-v10_mode,看盤規則
+v10_mode,🛡 自動 (只用已驗證策略)
+v11_new_league_paper,True
+v11_league_breaker,True
+v11_migrated,True
+LS|亞冠二級聯賽,32
