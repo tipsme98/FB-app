@@ -2609,12 +2609,15 @@ def v10_load_settings_into_state():
         return
     saved = {}
     ls_map = {}
+    ign = set()
     try:
         df_s = load_db(SETTINGS_FILE, SETTINGS_COLUMNS, SETTINGS_TABLE)
         for _, r in df_s.iterrows():
             k = str(r.get('Key', ''))
             if k in V10_SETTING_DEFAULTS and pd.notna(r.get('Value')):
                 saved[k] = _v10_cast(k, r.get('Value'))
+            elif k.startswith('IGN|'):
+                ign.add(k[4:])
             elif k.startswith(V11_LS_PREFIX) and pd.notna(r.get('Value')):
                 try:
                     ls_map[k[len(V11_LS_PREFIX):]] = int(float(r.get('Value')))
@@ -2623,6 +2626,7 @@ def v10_load_settings_into_state():
     except Exception:
         saved = {}
     st.session_state['_v11_ls_map'] = ls_map
+    st.session_state['_v11_ign'] = ign
     # V11 升級：舊版儲存的建議引擎改為新的自動保護模式 (只執行一次，之後用家可自行更改)
     if saved and 'v11_migrated' not in saved:
         saved['v10_mode'] = V11_MODE_AUTO
@@ -2642,6 +2646,7 @@ def v10_load_settings_into_state():
 def v10_save_settings(silent=False):
     rows = [{'Key': k, 'Value': str(st.session_state.get(k, d))} for k, d in V10_SETTING_DEFAULTS.items()]
     rows += [{'Key': f"{V11_LS_PREFIX}{t}", 'Value': str(int(n))} for t, n in (st.session_state.get('_v11_ls_map', {}) or {}).items()]
+    rows += [{'Key': f"IGN|{k}", 'Value': '1'} for k in sorted(st.session_state.get('_v11_ign', set()) or set())]
     try:
         save_db(pd.DataFrame(rows, columns=SETTINGS_COLUMNS), SETTINGS_FILE, SETTINGS_TABLE)
         st.session_state['_v10_settings_saved'] = True
@@ -2912,6 +2917,8 @@ def v11_data_audit(df_db):
                                          '檢查比賽日期或球隊名稱', [g.loc[i - 1, '_ID'], g.loc[i, '_ID']], tourn=f"{g.loc[i - 1, '_t']} / {g.loc[i, '_t']}", match=team, md=g.loc[i, '_md']))
     home_t = long.groupby('team')['_t'].agg(lambda x: x.value_counts().to_dict())
     for _, r in mu.iterrows():
+        if v11_is_cup_like(r['_t']) or v11_is_intl(r['_t']):
+            continue  # 盃賽/洲際賽的球隊本來就屬於其他聯賽，不屬錯誤
         bad = True
         for tm in (r['_h'], r['_a']):
             tc = home_t.get(tm, {})
@@ -3022,9 +3029,45 @@ def v11_data_audit(df_db):
     return out.sort_values(['_o', '類別', '比賽日期']).drop(columns='_o').reset_index(drop=True)
 
 
+V11_IGN_PREFIX = 'IGN|'
+
+
+def v11_issue_key(row):
+    """每項問題的固定編號 (數據改動後編號會改變，問題會重新出現)"""
+    import hashlib
+    raw = '|'.join(str(row.get(c, '')) for c in ('類別', '賽事', '比賽', '比賽日期', '注單ID', '問題說明'))
+    return hashlib.md5(raw.encode('utf-8')).hexdigest()[:12]
+
+
+def v11_ignored_keys():
+    return set(st.session_state.get('_v11_ign', set()) or set())
+
+
+def v11_set_ignored(keys):
+    st.session_state['_v11_ign'] = set(keys)
+    v10_save_settings(silent=True)
+
+
+def v11_issues_active(issues):
+    """移除用家已確認無誤的項目"""
+    if issues is None or issues.empty:
+        return issues
+    ign = v11_ignored_keys()
+    if not ign:
+        return issues
+    return issues[~issues['編號'].isin(ign)]
+
+
 @st.cache_data(max_entries=4, show_spinner="🧹 正在檢查數據質素...")
 def v11_data_audit_cached(df_db):
-    return v11_data_audit(df_db)
+    out = v11_data_audit(df_db)
+    if out is not None and not out.empty:
+        out = out.copy()
+        out['編號'] = out.apply(v11_issue_key, axis=1)
+    elif out is not None:
+        out = out.copy()
+        out['編號'] = pd.Series(dtype=str)
+    return out
 
 
 def v11_settlement_mismatch_ids(issues):
@@ -3058,21 +3101,58 @@ def _v11_commit_db(df_new, msg, undo_rows=None):
 def render_v11_data_quality():
     """V11 數據質素檢查面板 + 安全修正工具"""
     df_db = st.session_state.df_db
-    issues = v11_data_audit_cached(df_db)
+    all_issues = v11_data_audit_cached(df_db)
+    ign = v11_ignored_keys()
+    issues = all_issues
     st.markdown("##### 🧹 數據質素檢查 (錯誤數據比虧損數據更傷害模型)")
-    if issues.empty:
-        st.success("沒有發現數據問題。")
+    with st.expander("ℹ️ 如何處理每一項問題？", expanded=False):
+        st.markdown(
+            "1. **數據真的錯了** → 到「⚖ 賽果結算與管理 → 已完成注單資料修改」用注單 ID 搜尋並修改，或用下方一鍵修正。修改後該項會自動消失。\n"
+            "2. **你已核實數據正確** (例如盤口真的是 -3.75、球隊真的兩日內出賽) → 在表格最右的「✅ 確認無誤」打勾，再按「💾 儲存確認」。"
+            "該項之後不再計入問題數目，亦不會再出現提示 (設定會永久儲存)。\n"
+            "3. 若之後該場數據再被修改，問題內容不同，系統會重新檢查並再次提示。")
+    if all_issues.empty:
+        st.success("✅ 沒有發現數據問題。")
     else:
+        issues = all_issues[~all_issues['編號'].isin(ign)]
+        n_conf = int(all_issues['編號'].isin(ign).sum())
         cnt = issues['嚴重程度'].value_counts()
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("🔴 高", int(cnt.get('🔴 高', 0)))
         c2.metric("🟠 中", int(cnt.get('🟠 中', 0)))
         c3.metric("🟡 低", int(cnt.get('🟡 低', 0)))
-        cats = ['全部'] + list(dict.fromkeys(issues['類別']))
+        c4.metric("✅ 已確認無誤", n_conf)
+        if issues.empty:
+            st.success("✅ 所有問題已修正或已確認無誤。")
+        show_conf = st.checkbox("顯示已確認無誤的項目 (可取消確認)", value=False, key="v11_dq_show_conf")
+        base = all_issues if show_conf else issues
+        cats = ['全部'] + list(dict.fromkeys(base['類別']))
         pick = st.selectbox("篩選問題類別", cats, key="v11_dq_filter")
-        show = issues if pick == '全部' else issues[issues['類別'] == pick]
-        st.dataframe(show, use_container_width=True, hide_index=True)
+        show = base if pick == '全部' else base[base['類別'] == pick]
+        if not show.empty:
+            view = show.copy()
+            view.insert(0, '✅ 確認無誤', view['編號'].isin(ign))
+            ed = st.data_editor(view, use_container_width=True, hide_index=True, key=f"v11_dq_editor_{pick}_{show_conf}",
+                                disabled=[c for c in view.columns if c != '✅ 確認無誤'],
+                                column_config={'✅ 確認無誤': st.column_config.CheckboxColumn('✅ 確認無誤', help='已核實數據正確，不需要修改'),
+                                               '編號': None})
+            b1, b2 = st.columns(2)
+            if b1.button("💾 儲存確認", key="v11_dq_save_ign", use_container_width=True, type="primary"):
+                new_ign = set(ign)
+                for _, r in ed.iterrows():
+                    if bool(r['✅ 確認無誤']):
+                        new_ign.add(r['編號'])
+                    else:
+                        new_ign.discard(r['編號'])
+                new_ign &= set(all_issues['編號'])  # 清走已不存在的舊編號
+                v11_set_ignored(new_ign)
+                st.toast(f"✅ 已儲存：{len(new_ign)} 項標記為確認無誤。", icon="💾")
+                st.rerun()
+            if b2.button("↩ 取消全部確認", key="v11_dq_clear_ign", use_container_width=True, disabled=not ign):
+                v11_set_ignored(set())
+                st.rerun()
         st.caption("注單 ID 可在「⚖ 賽果結算與管理 → 已完成注單資料修改」搜尋並修改。修改後模型會自動重新訓練。")
+        issues = all_issues
 
     st.markdown("##### 🛠 一鍵安全修正")
     f1, f2 = st.columns(2)
@@ -5113,10 +5193,10 @@ def main():
 
         if sys_bankroll <= 0: st.warning("⚠ 目前系統可用資金不足！無法精確計算建議注碼。請先至側邊欄存入本金。")
         try:
-            _iss = v11_data_audit_cached(st.session_state.df_db)
+            _iss = v11_issues_active(v11_data_audit_cached(st.session_state.df_db))
             _nh = int((_iss['嚴重程度'] == '🔴 高').sum()) if not _iss.empty else 0
             if _nh:
-                st.warning(f"🧹 數據質素檢查發現 {_nh} 項嚴重問題 (重複注單、賽事標籤錯誤、排名未填、結算不符等)，會令模型學錯。請到「🤖 全局模型 → 🧹 V11 數據質素檢查」查看及修正。")
+                st.warning(f"🧹 數據質素檢查發現 {_nh} 項嚴重問題 (重複注單、賽事標籤錯誤、排名未填、結算不符等)，會令模型學錯。請到「🤖 全局模型 → 🧹 V11 數據質素檢查」修正，或核實數據正確後勾選「✅ 確認無誤」。")
         except Exception:
             pass
         
