@@ -417,6 +417,30 @@ def _parse_rank_int(value):
         return None
     return None
 
+V11_LETTER_ORDER = ['S', 'A', 'B', 'C', 'D']
+# 隊伍數目不能被 5 整除時，多出的隊伍依次分到 B、C、A、D、S 級
+# (例如 12 隊：S 1-2、A 3-4、B 5-7、C 8-10、D 11-12；20 隊：每級 4 隊)
+V11_LETTER_EXTRA_ORDER = ['B', 'C', 'A', 'D', 'S']
+
+
+def v11_letter_rank(letter, league_size=20):
+    """字母評級 → 該級別排名範圍的中位數 (可為小數，例如 20 隊的 S = 第 2.5 名)；非字母回傳 None"""
+    s = str(letter).strip().upper() if letter is not None else ''
+    if s not in V11_LETTER_ORDER:
+        return None
+    n = max(5, int(league_size))
+    base, extra = divmod(n, 5)
+    sizes = {k: base for k in V11_LETTER_ORDER}
+    for k in V11_LETTER_EXTRA_ORDER[:extra]:
+        sizes[k] += 1
+    start = 1
+    for k in V11_LETTER_ORDER:
+        if k == s:
+            return start + (sizes[k] - 1) / 2.0
+        start += sizes[k]
+    return None
+
+
 def rating_to_rank(rating, league_size=20):
     """將 DB 儲存值換算為聯賽排名 (1=最強)。
     新數據為數字排名 (支援 5 / 5.0 / '5' 等形式)；舊數據為字母評級 (S/A/B/C/D)，依百分位換算為約略排名。"""
@@ -432,6 +456,9 @@ def rating_to_rank(rating, league_size=20):
     except (TypeError, ValueError):
         pass
     s = str(rating).strip().upper()
+    _lr = v11_letter_rank(s, n)
+    if _lr is not None:
+        return max(1, min(n, int(round(_lr))))
     pct = RATING_LETTER_PCTILE.get(s, 0.5)
     return max(1, min(n, round(n * pct)))
 
@@ -453,10 +480,11 @@ def rating_to_strength(rating, league_size=20):
         except (TypeError, ValueError):
             pass
         s = str(rating).strip().upper()
-        if s in RATING_LETTER_PCTILE:
-            r = rating_to_rank(s, n)
-        else:
-            return rank_to_strength(max(1, round(n * 0.5)), n)
+        _lr = v11_letter_rank(s, n)
+        if _lr is not None:
+            # 舊字母評級：用該級排名中位數 (小數) 計算實力分，與數字排名使用同一尺度
+            return 1.0 + 4.0 * (n - max(1.0, min(float(n), _lr))) / (n - 1)
+        return rank_to_strength(max(1, round(n * 0.5)), n)
     return rank_to_strength(r, n)
 
 def extract_odds_drift(r):
@@ -1328,6 +1356,38 @@ def v9_side_features(btype, side, line, o_side, o_opp, drift_side, drift_opp, ns
     return f, p_mkt
 
 
+V11_OFFER_TOL_MIN = 15
+
+
+def v11_offered_lines(odds_history, ref_date=None):
+    """每種盤口類型在『最後一次記錄時間』(容許 15 分鐘內) 仍有記錄的盤口線 = 莊家臨場仍提供的盤口。
+    舊盤口 (例如初盤 0，之後已轉為 0.25) 莊家已不再提供，不能投注。
+    回傳 {盤口類型: set(盤口線)}；沒有記錄時間的盤口類型回傳 None (無法判斷，視為全部仍提供)。"""
+    out = {}
+    try:
+        snaps = v10_snapshots(odds_history, ref_date)
+    except Exception:
+        return out
+    for bt in V10_TYPES:
+        S = [s for s in snaps if s['type'] == bt]
+        if not S:
+            continue
+        T = [s for s in S if s['has_t']]
+        if not T:
+            out[bt] = None
+            continue
+        tmax = max(s['t'] for s in T)
+        tol = timedelta(minutes=V11_OFFER_TOL_MIN)
+        out[bt] = {round(s['line'], 3) for s in T if tmax - s['t'] <= tol}
+    return out
+
+
+def v11_is_offered(offered, bt, line):
+    if not offered or bt not in offered or offered[bt] is None:
+        return True
+    return round(float(line), 3) in offered[bt]
+
+
 def v9_build_training_set(mt):
     """每場比賽、每個盤口 (類型+盤口線) 取最後一個賠率時間點，主客/大小兩邊皆成為訓練樣本"""
     if mt is None or mt.empty:
@@ -1337,6 +1397,7 @@ def v9_build_training_set(mt):
     for _, m in mt.iterrows():
         ctx = v9_match_context(mt, tl, m['home'], m['away'], m['tourn'], m['date'], m['hs'], m['as'], m['hfp'], m['afp'])
         markets = v9_group_markets(m['oh'], m['date'].to_pydatetime() if hasattr(m['date'], 'to_pydatetime') else None)
+        _offered = v11_offered_lines(m['oh'], m['date'])
         for (bt, ln), snaps in markets.items():
             if bt == '角球大小' and (np.isnan(m['hc']) or np.isnan(m['ac'])):
                 continue
@@ -1349,7 +1410,8 @@ def v9_build_training_set(mt):
                 diff = v9_diff(bt, side, ln, m['hg'], m['ag'], 0 if np.isnan(m['hc']) else m['hc'], 0 if np.isnan(m['ac']) else m['ac'])
                 ret = v9_unit_return(diff, o_side)
                 f.update({'key': m['key'], 'date': m['date'], 'tourn': m['tourn'], 'bet_type': bt, 'side': side, 'line': ln,
-                          'odds': o_side, 'p_mkt': p_mkt, 'ret': ret, 'e': (ret + 1.0) / o_side})
+                          'odds': o_side, 'p_mkt': p_mkt, 'ret': ret, 'e': (ret + 1.0) / o_side,
+                          'offered': bool(v11_is_offered(_offered, bt, ln))})
                 rows.append(f)
     return pd.DataFrame(rows)
 
@@ -1426,6 +1488,8 @@ def v9_backtest(oof, thr):
     if oof is None or oof.empty:
         return pd.DataFrame()
     d = oof[oof['ev'] >= thr]
+    if 'offered' in d.columns:
+        d = d[d['offered'].astype(bool)]  # V11：舊盤口莊家已不再提供，回測不能計算
     if d.empty:
         return pd.DataFrame(columns=oof.columns)
     idx = d.groupby(['key', 'bet_type'])['ev'].idxmax()
@@ -1524,7 +1588,7 @@ def v9_train_engine(df_settled):
             best_w, best_w_ll = 0.0, ll_market
         out['w'], out['kind'], out['ll_model'] = best_w, best_kind, best_w_ll
         # --- 4) 回測 (樣本外) ---
-        oof = ts.loc[m, ['key', 'date', 'bet_type', 'side', 'line', 'odds', 'p_mkt', 'ret']].copy()
+        oof = ts.loc[m, ['key', 'date', 'bet_type', 'side', 'line', 'odds', 'p_mkt', 'ret'] + (['offered'] if 'offered' in ts.columns else [])].copy()
         oof['p'] = v9_blend(oof['p_mkt'].values, p_oof[m].values, best_w)
         oof['ev'] = oof['p'] * oof['odds'] - 1.0
         out['oof'] = oof.reset_index(drop=True)
@@ -1626,6 +1690,10 @@ def v9_engine_input(df_settled):
     # V11：去除名稱多餘空格 (' 托盧卡' 與 '托盧卡' 視為同一球隊)
     for c in ['Match', 'Tournament_Name', 'Home_Team', 'Away_Team']:
         d[c] = d[c].apply(lambda v: v11_clean_name(v) if v is not None else None)
+    # V11：缺少隊伍數目的舊紀錄，用系統內建的聯賽隊伍數目 (不再一律當 20 隊)
+    _ls = pd.to_numeric(d['League_Size'], errors='coerce')
+    _fill = d['Tournament_Name'].map(lambda t: V11_DEFAULT_LEAGUE_SIZES.get(t) if t is not None else None)
+    d['League_Size'] = _ls.where(_ls.notna(), pd.to_numeric(_fill, errors='coerce'))
     return d.reset_index(drop=True)
 
 
@@ -2584,6 +2652,7 @@ V10_SETTING_DEFAULTS = {
     'v9_min_ev': 3.0, 'v9_kelly': 0.25, 'v9_max_pct': 3.0, 'v9_max_picks': 1,
     'v9_hd_min200': False, 'v9_override_gate': False, 'v10_mode': V11_MODE_AUTO,
     'v11_new_league_paper': True, 'v11_league_breaker': True, 'v11_migrated': True,
+    'v11_auto_sys': True,
 }
 V10_MODE_OPTIONS = [V11_MODE_AUTO, '看盤規則', V11_MODE_STRICT, '看盤規則 + V9', '只用 V9 模型']
 V11_LS_PREFIX = 'LS|'
@@ -2997,9 +3066,7 @@ def v11_data_audit(df_db):
         cats = g['Tournament_Category'].dropna().astype(str).unique()
         if v11_is_cup_like(t) and any(c.startswith('國內聯賽') for c in cats):
             issues.append(_v11_issue('🟡 低', '賽事分類可能錯誤', None, f"「{t}」屬盃賽/洲際賽，但分類為「國內聯賽」。", '按下方「賽事設定」修改分類', None, tourn=t))
-        letters = g['Home_Rating'].dropna().astype(str).str.upper().isin(list(RATING_LETTER_PCTILE.keys())).mean()
-        if 0 < letters < 1:
-            issues.append(_v11_issue('🟡 低', '排名格式混合', None, f"{letters*100:.0f}% 比賽使用舊字母評級 (S~D)，其餘使用數字排名。字母評級只能換算為約略排名。", '如有時間可改為實際排名', None, tourn=t))
+        # 舊字母評級 (S~D) 已由系統按當時的分級方法 (每級約 1/5 隊伍) 自動換算為該級排名中位數，不需用家修改
 
     # 8) 結算結果與比分不符
     sd = d[d['Status'] == 'Settled']
@@ -3378,6 +3445,8 @@ def v11_arena(df_input):
         o = o.copy()
         o['date'] = pd.to_datetime(o['date'])
         x = o[(o['ev'] >= V11_STRAT_THR['v9']) & (o['date'] >= t0)]
+        if 'offered' in x.columns:
+            x = x[x['offered'].astype(bool)]
         if len(x):
             x = x.loc[x.groupby(['key', 'bet_type'])['ev'].idxmax()].copy()
             x['tourn'] = x['key'].map(tmap)
@@ -3467,6 +3536,35 @@ def render_v11_arena_panel():
                f"(「聯賽專屬偏差模型」正是這樣做，結果最差)，只用作熔斷：某聯賽樣本外 ≥ {V11_LG_MIN_N} 注且 ROI ≤ {V11_LG_MAX_ROI*100:.0f}% 時暫停該聯賽的實注。")
 
 
+def v11_is_real_pick(cand, picks):
+    for p in picks or []:
+        if (v9_clean_bt(p['bet_type']) == v9_clean_bt(cand['bet_type']) and p['selection'] == cand['selection']
+                and abs(float(p['line']) - float(cand['line'])) < 1e-6 and abs(float(p['odds']) - float(cand['odds'])) < 1e-6):
+            return True
+    return False
+
+
+def v11_auto_sys_picks(scored, picks, settings):
+    """系統自動預選：每種盤口類型一注。
+    有 ✅ 實注就用實注；否則在莊家最新仍提供的盤口線 (最新賠率) 中選估計 EV 最高的一邊作 $0 模擬注。
+    同一盤口類型只選一注：相鄰盤口線 (2.5 小 / 2.75 小 / 3.25 小) 結果高度相關，重複記錄不會增加新資訊，反而令統計失真。"""
+    out = list(picks or [])
+    if not settings.get('auto_sys', True):
+        return out
+    used = {v9_clean_bt(p['bet_type']) for p in out}
+    pool = [c for c in scored if c.get('is_latest', True) and c.get('is_offered', True)]
+    for bt in ('讓球', '入球大小', '角球大小'):
+        if bt in used:
+            continue
+        cs = [c for c in pool if v9_clean_bt(c['bet_type']) == bt]
+        if not cs:
+            continue
+        best = max(cs, key=lambda c: float(c.get('ev', -9) if c.get('ev') is not None else -9))
+        out.append(best)
+        used.add(bt)
+    return out
+
+
 def v9_get_settings():
     return {
         'min_ev': float(st.session_state.get('v9_min_ev', V10_SETTING_DEFAULTS['v9_min_ev'])) / 100.0,
@@ -3478,6 +3576,7 @@ def v9_get_settings():
         'mode': str(st.session_state.get('v10_mode', V11_MODE_AUTO)),
         'new_league_paper': bool(st.session_state.get('v11_new_league_paper', True)),
         'league_breaker': bool(st.session_state.get('v11_league_breaker', True)),
+        'auto_sys': bool(st.session_state.get('v11_auto_sys', True)),
     }
 
 
@@ -5159,6 +5258,9 @@ def main():
         st.checkbox("新聯賽觀察期 (已結算 < 15 場只作模擬注)", key="v11_new_league_paper", on_change=v10_save_settings,
                     help="新加入的聯賽未有足夠數據，模型對其特性一無所知；先記錄賽果讓系統學習，再實際落注。")
         st.checkbox("聯賽熔斷 (某聯賽樣本外 ≥15 注且 ROI ≤ −15% 暫停實注)", key="v11_league_breaker", on_change=v10_save_settings)
+        st.checkbox("系統自動預選每種盤口 (讓球 / 入球 / 角球各一注)", key="v11_auto_sys", on_change=v10_save_settings,
+                    help="每種盤口類型在莊家最新仍提供的盤口線中，自動選出系統認為最合適的一邊：通過驗證的 ✅ 建議用 Kelly 注碼實注，其餘為 $0 模擬注。"
+                         "確保每場輸入的比賽都會存入數據庫供學習，並追蹤系統每種盤口的真實表現。舊盤口及同方向的相關盤口線 (例如 2.5 小之外再加 2.75 小) 不會重複預選。")
         st.number_input("最低 EV 門檻 (%)", min_value=0.0, max_value=20.0, step=0.5, key="v9_min_ev", on_change=v10_save_settings,
                         help="只有估計期望值 ≥ 此門檻的盤口才會被建議。0% = 注數多但包含大量優勢極薄、估計誤差內的投注；3% = 注數少但每注質素較高。")
         st.select_slider("Kelly 分數", options=[0.1, 0.15, 0.2, 0.25, 0.33, 0.5], key="v9_kelly", on_change=v10_save_settings,
@@ -5482,6 +5584,13 @@ def main():
             _league_ctx = {'tourn': tournament_name, 'n_matches': v11_league_match_count(st.session_state.df_db, tournament_name)}
             _mode_now = v9_set['mode'] if (kp_engine.get('trained') or v9_set['mode'] == V11_MODE_AUTO) else '只用 V9 模型'
             scored = v10_apply_to_candidates(scored, kp_map, _mode_now, v9_set, kp_engine, arena, _league_ctx)
+            # V11：莊家已不再提供的舊盤口線 (例如初盤 0 已轉為 0.25) → 不建議、不作模擬注
+            _offered_now = v11_offered_lines(st.session_state.odds_history, _md_ts)
+            for c in scored:
+                c['is_offered'] = bool(v11_is_offered(_offered_now, v9_clean_bt(c['bet_type']), c['line']))
+                if not c['is_offered']:
+                    c['status'] = '⏸ 舊盤口 (莊家已不再提供)'
+                    c['gate_ok'] = False
             kp_summary = []
             for (_kbt, _kln, _ksd), _kv in kp_map.items():
                 kp_summary.append({'盤口類型': _kbt, '方向': {'Home': '主隊', 'Away': '客隊', 'Over': '大', 'Under': '小'}.get(_ksd, _ksd),
@@ -5494,7 +5603,7 @@ def main():
             # 推薦：只考慮每個盤口的最新賠率；每種盤口類型最多一注，總數不超過設定上限
             picks, _used_types = [], set()
             for c in scored:
-                if not c.get('is_latest', True) or c.get('status') != '✅ 建議':
+                if not c.get('is_latest', True) or not c.get('is_offered', True) or c.get('status') != '✅ 建議':
                     continue
                 _bt = v9_clean_bt(c['bet_type'])
                 if _bt in _used_types:
@@ -5505,7 +5614,7 @@ def main():
                     break
             # V11 模擬注：未通過驗證 / 新聯賽觀察期的最佳候選 (注碼 $0，只供追蹤)
             paper_picks, _pused = [], set()
-            for c in sorted([c for c in scored if c.get('is_latest', True) and str(c.get('status', '')).startswith('📝')], key=lambda x: -x.get('ev', -9)):
+            for c in sorted([c for c in scored if c.get('is_latest', True) and c.get('is_offered', True) and str(c.get('status', '')).startswith('📝')], key=lambda x: -x.get('ev', -9)):
                 _bt = v9_clean_bt(c['bet_type'])
                 if _bt in _pused:
                     continue
@@ -5526,6 +5635,7 @@ def main():
                          v9_dimension_stats(df_settled, "C. 宏觀 (全局數據)")],
                 'engine': {k: engine.get(k) for k in ('trained', 'msg', 'w', 'kind', 'groups', 'n_matches', 'n_rows', 'll_market', 'll_model')},
                 'candidates': scored, 'picks': picks, 'paper_picks': paper_picks, 'kp_summary': kp_summary,
+                'auto_sys': v11_auto_sys_picks(scored, picks, v9_set),
                 'arena_msg': arena.get('msg', ''), 'league_ctx': _league_ctx, 'no_rank': bool(no_rank),
                 'kp_engine': {k: kp_engine.get(k) for k in ('trained', 'msg', 'n_matches', 'n_rows')}, 'mode': v9_set['mode'],
                 'ctx': {'h_n': v9_ctx['hp']['n'], 'a_n': v9_ctx['ap']['n'], 'h2h_n': len(v9_ctx['h2h']), 'league_n': v9_ctx['league']['n'],
@@ -5688,7 +5798,7 @@ def main():
                             default_sys.append(opt)
                             break
                 elif not is_editing:
-                    for p in picks:
+                    for p in (res.get('auto_sys') or picks):
                         for opt, c in option_map.items():
                             if c['bet_type'] == p['bet_type'] and abs(float(c['line']) - float(p['line'])) < 1e-4 and c['selection'] == p['selection'] and opt not in default_sys:
                                 default_sys.append(opt)
@@ -5701,6 +5811,9 @@ def main():
                     sug_stk, raw_stk = calc_suggested_stake(cand, sys_bankroll, sys_max_stake)
                     # 修改模式下，若此項目對應原本下注的項目，還原原本已輸入的系統注碼
                     _stk_val = float(sug_stk)
+                    # V11：不在系統實注名單內的項目 (模擬注 / 超出每場注數上限) 注碼一律 $0
+                    if not is_editing and not v11_is_real_pick(cand, res.get('picks', [])):
+                        _stk_val = 0.0
                     if is_editing and sel in default_sys:
                         _orig_stk = float(st.session_state.get('edit_sys_stake', 0.0) or 0.0)
                         if _orig_stk > 0:
