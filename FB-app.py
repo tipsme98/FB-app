@@ -345,6 +345,269 @@ def display_cumulative_metrics(df):
     st.divider()
 
 # ==========================================
+# 2b. CLV (收盤線價值) 追蹤與蒙地卡羅本金模擬 (V11.1 新增)
+#     只讀取現有資料欄位即時計算，不會改動資料庫 Schema 或任何現有功能
+# ==========================================
+
+def compute_bet_clv(r):
+    """計算單一注單的 CLV (Closing Line Value, 收盤線價值)：
+    CLV = 下注賠率 ÷ 同盤口線的收盤賠率 − 1 (正數 = 買得比市場最終價格便宜)。
+
+    只使用賽前的賠率快照 (Odds_History)；即場注單、或該盤口線只有一個快照時無法計算，
+    回傳 None。收盤賠率 = 該盤口線最後一個快照 (依時間排序；無時間的依儲存位置)。"""
+    try:
+        bt_raw = str(r.get('Bet_Type', ''))
+        if '即場' in bt_raw:
+            return None
+        bt = v9_clean_bt(bt_raw)
+        sel = str(r.get('Selection', ''))
+        if sel not in ('Home', 'Away', 'Over', 'Under'):
+            return None
+        try:
+            ln = round(float(r.get('Initial_Line', 0.0)), 3)
+        except (TypeError, ValueError):
+            return None
+        try:
+            odds = float(r.get('Initial_Odds'))
+        except (TypeError, ValueError):
+            return None
+        if not odds or odds <= 1.0:
+            return None
+        try:
+            oh = json.loads(str(r.get('Odds_History', '[]')))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(oh, list) or len(oh) < 2:
+            return None
+        key = 'upper' if sel in ('Home', 'Over') else 'lower'
+        matched = []
+        for pos, h in enumerate(oh):
+            try:
+                raw_type = str(h.get('type', ''))
+                if '即場' in raw_type:
+                    continue  # 跳過即場快照
+                if v9_clean_bt(raw_type) != bt:
+                    continue
+                if round(float(h.get('line', 0.0)), 3) != ln:
+                    continue
+                try:
+                    v = float(h.get(key))
+                except (TypeError, ValueError):
+                    continue
+                if v > 1.0:
+                    matched.append((pos, h, v))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        if len(matched) < 2:
+            return None
+        matched.sort(key=lambda item: (_oh_sort_ts(item[1], item[0]), item[0]))
+        close_odds = matched[-1][2]
+        if close_odds <= 1.0:
+            return None
+        return odds / close_odds - 1.0
+    except Exception:
+        return None
+
+
+def render_clv_section(df_settled):
+    """CLV (收盤線價值) 追蹤面板：以數據庫既有欄位即時計算，不改動資料庫 Schema"""
+    st.markdown("#### 🎯 CLV (收盤線價值) 追蹤")
+    st.caption("CLV = 你的下注賠率 ÷ 同盤口線的收盤賠率 − 1。正數代表你買得比市場最終價格便宜；"
+               "長期平均 +1% 至 +3% 是專業級訊號，而且比盈虧數字更早 (約 200–300 注) 反映策略是否真的有優勢。"
+               "即場注單及只有一個快照的盤口無法計算 CLV，會自動略過。"
+               "收盤價 = 該盤口線最後一個賽前快照 — 建議下注後開賽前再記錄一次賠率，CLV 才有意義。")
+    if df_settled is None or df_settled.empty:
+        st.info("尚無已結算注單，無法計算 CLV。")
+        return
+    d = df_settled.copy()
+    d['CLV'] = d.apply(compute_bet_clv, axis=1)
+    valid = d[d['CLV'].notna()].copy()
+    if valid.empty:
+        st.info("現有注單的賠率紀錄不足以計算 CLV (每注需要至少兩個同盤口線的賽前快照)。")
+        return
+    valid['CLV'] = pd.to_numeric(valid['CLV'], errors='coerce')
+    n = len(valid)
+    avg_clv = valid['CLV'].mean()
+    med_clv = valid['CLV'].median()
+    pos_rate = (valid['CLV'] > 0).mean()
+    zero_rate = (valid['CLV'] == 0).mean()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("可計算 CLV 的注單", f"{n} 注")
+    c2.metric("平均 CLV", f"{avg_clv * 100:+.2f}%")
+    c3.metric("CLV 中位數", f"{med_clv * 100:+.2f}%")
+    c4.metric("跑贏收盤線比率", f"{pos_rate * 100:.1f}%")
+    if zero_rate > 0.5:
+        st.info("📌 重要說明：目前大部分注單的 CLV 剛好等於 0 — 因為賠率快照通常只記錄到下注那一刻，"
+                "「收盤價」其實就是你下注時的價格。要令 CLV 真正發揮作用，請在下注之後、開賽之前"
+                "(例如開賽前 1 小時) 再記錄一次賠率快照，系統便會以該快照作為收盤價，"
+                "CLV 就能反映「你的價格 vs 市場最終價格」。")
+    elif pos_rate >= 0.60:
+        st.success("✅ 解讀：超過 60% 的注單買得比收盤便宜 — 這是長期盈利的專業級訊號，"
+                   "只要維持，盈利通常會在之後的注單反映出來。")
+    elif pos_rate >= 0.50:
+        st.info("🟡 解讀：約一半注單跑贏收盤線 — 目前與市場打成平手，優勢未確立；"
+                "樣本累積到 200–300 注後再判斷。")
+    else:
+        st.warning("⚠️ 解讀：多數注單買得比收盤貴 — 選注時機可能落後於市場，值得檢視下注流程。")
+
+    # 分盤口類型統計
+    valid['_bt'] = valid['Bet_Type'].astype(str).apply(v9_clean_bt)
+    st.markdown("**分盤口類型 CLV 統計**")
+    rows = []
+    for bt, g in valid.groupby('_bt'):
+        staked_mask = pd.to_numeric(g['System_Stake'], errors='coerce') > 0
+        unit_sum = pd.to_numeric(g.loc[staked_mask, 'Unit_Profit'], errors='coerce').sum()
+        rows.append({'盤口類型': bt, '注數': len(g),
+                     '平均CLV': f"{g['CLV'].mean() * 100:+.2f}%",
+                     '跑贏收盤率': f"{(g['CLV'] > 0).mean() * 100:.0f}%",
+                     '實注單位盈虧': f"{unit_sum:+.2f}U"})
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # CLV 與賽果的關係 (驗證 CLV 是否真的預示盈利)
+    st.markdown("**CLV 與賽果的關係 (驗證 CLV 是否真的預示盈利)**")
+    ev1, ev2 = st.columns(2)
+    hi = valid[valid['CLV'] > 0]
+    lo = valid[valid['CLV'] <= 0]
+
+    def _clv_block(col, title, part):
+        with col:
+            st.markdown(f"**{title}**")
+            if len(part) == 0:
+                st.write("無樣本")
+                return
+            wr = (pd.to_numeric(part['Unit_Profit'], errors='coerce') > 0).mean() * 100
+            unit_sum = pd.to_numeric(part['Unit_Profit'], errors='coerce').sum()
+            m1, m2, m3 = st.columns(3)
+            m1.metric("注數", f"{len(part)}")
+            m2.metric("命中率 (贏半或以上)", f"{wr:.1f}%")
+            m3.metric("單位盈虧", f"{unit_sum:+.2f}U")
+
+    _clv_block(ev1, "CLV 為正 (買得比收盤便宜)", hi)
+    _clv_block(ev2, "CLV 為零或負 (買得比收盤貴)", lo)
+
+    # 按月趨勢
+    valid['_month'] = valid['Match_Date'].astype(str).str[:7]
+    mm = valid[valid['_month'] != ''].groupby('_month')['CLV'].agg(['count', 'mean']).sort_index()
+    if not mm.empty:
+        st.markdown("**平均 CLV 按月趨勢**")
+        ch = pd.DataFrame({'平均CLV%': (mm['mean'] * 100).round(2)})
+        st.line_chart(ch, use_container_width=True)
+
+    # 最近注單 CLV 明細
+    st.markdown("**最近 15 注 CLV 明細**")
+    show_cols = ['Date', 'Match', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 'CLV', 'Result_Label']
+    recent = valid.sort_values('Date', ascending=False).head(15)[show_cols].copy()
+    recent['CLV'] = (recent['CLV'] * 100).round(2)
+    st.dataframe(recent, use_container_width=True, hide_index=True)
+    st.caption("💡 CLV 以「同盤口線的最後一個賽前快照」作收盤價；若盤口在開賽前已轉線，"
+               "則以該舊盤口線消失前的最後快照計算，屬最接近的可行近似。")
+
+
+def build_mc_records(df_settled, start_bankroll, stake_col='System_Stake', profit_col='System_Profit'):
+    """由已結算注單重建 (注碼比例, 單位回報) 序列，供蒙地卡羅本金模擬抽樣。
+
+    注碼比例 = 注碼 ÷ 當時本金；本金由起始值按歷史盈虧逐注重演推算 (不含存提款，屬近似值)。
+    單位回報 = 盈虧 ÷ 注碼 (與 Unit_Profit 一致)。注碼比例上限 25% 本金，避免單注極端值令模擬爆炸。"""
+    if df_settled is None or df_settled.empty:
+        return []
+    d = df_settled.copy()
+    d['_stake'] = pd.to_numeric(d[stake_col], errors='coerce')
+    d['_profit'] = pd.to_numeric(d[profit_col], errors='coerce')
+    d = d[(d['_stake'] > 0) & d['_profit'].notna()]
+    if d.empty:
+        return []
+    d['_dt'] = pd.to_datetime(d['Date'], errors='coerce')
+    d = d.sort_values('_dt', kind='stable')
+    bank = float(start_bankroll) if start_bankroll and float(start_bankroll) > 0 else 10000.0
+    recs = []
+    for _, r in d.iterrows():
+        stake = float(r['_stake'])
+        profit = float(r['_profit'])
+        unit = profit / stake
+        frac = stake / bank if bank > 0 else 0.0
+        frac = min(max(frac, 0.0), 0.25)
+        recs.append((frac, unit))
+        bank = bank + profit
+        if bank < 1.0:
+            bank = 1.0
+    return recs
+
+
+def run_bankroll_simulation(recs, start_bankroll, n_future_bets, n_sims, seed=42):
+    """蒙地卡羅本金模擬：以歷史 (注碼比例, 單位回報) 有放回抽樣，重組未來注單序列。
+
+    本金以複利演進：bank × (1 + 注碼比例 × 單位回報)。
+    回傳 (最終本金陣列, 每路徑最大回撤陣列, 前 15 條樣本金路徑)。"""
+    rng = np.random.default_rng(int(seed))
+    fracs = np.array([f for f, _ in recs], dtype=float)
+    rets = np.array([r for _, r in recs], dtype=float)
+    n_sims = max(int(n_sims), 1)
+    n_bets = max(int(n_future_bets), 1)
+    idx = rng.integers(0, len(recs), size=(n_sims, n_bets))
+    growth = 1.0 + fracs[idx] * rets[idx]
+    paths = float(start_bankroll) * np.cumprod(growth, axis=1)
+    paths = np.hstack([np.full((paths.shape[0], 1), float(start_bankroll)), paths])
+    finals = paths[:, -1]
+    peaks = np.maximum.accumulate(paths, axis=1)
+    max_dds = 1.0 - (paths / peaks).min(axis=1)
+    sample_paths = paths[:15, :]
+    return finals, max_dds, sample_paths
+
+
+def render_monte_carlo_section(df_settled, sys_bankroll):
+    """蒙地卡羅本金模擬面板：用歷史注單回報分布模擬未來本金路徑，評估注碼策略能否捱過波動"""
+    st.markdown("#### 🎲 蒙地卡羅本金模擬")
+    st.caption("以歷史注單的「注碼比例 + 單位回報」有放回抽樣，模擬未來 N 注的本金路徑。"
+               "假設未來的注單分布與過去相似；注碼比例沿用歷史 (單注上限 25% 本金)；不包含存提款。"
+               "用途：評估現時注碼策略在正常波動下能否捱得過最大回撤，而非預測實際盈利。")
+    if df_settled is None or df_settled.empty:
+        st.info("尚無已結算注單，無法進行本金模擬。")
+        return
+    try:
+        start_default = float(sys_bankroll) if sys_bankroll and float(sys_bankroll) > 0 else 10000.0
+    except (TypeError, ValueError):
+        start_default = 10000.0
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        account = st.selectbox("資金帳戶", ["System", "User"], key="mc_account")
+        start_bank = st.number_input("起始本金 ($)", min_value=1.0, value=start_default, step=100.0, key="mc_start_bank")
+        horizon = st.slider("模擬未來注數", min_value=50, max_value=1000, value=300, step=50, key="mc_horizon")
+        n_sims = st.slider("模擬路徑數", min_value=500, max_value=5000, value=3000, step=500, key="mc_sims")
+    stake_col = 'System_Stake' if account == 'System' else 'User_Stake'
+    profit_col = 'System_Profit' if account == 'System' else 'User_Profit'
+    recs = build_mc_records(df_settled, start_bank, stake_col, profit_col)
+    if len(recs) < 30:
+        st.info(f"{account} 帳戶有實際注碼的已結算注單只有 {len(recs)} 注 (少於 30 注)，樣本不足以進行有意義的模擬。")
+        return
+    finals, max_dds, sample_paths = run_bankroll_simulation(recs, start_bank, horizon, n_sims, seed=42)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    med_final = float(np.median(finals))
+    p10, p90 = np.percentile(finals, [10, 90])
+    med_dd = float(np.median(max_dds))
+    p_profit = float((finals > start_bank).mean())
+    p_half = float((finals < start_bank * 0.5).mean())
+    m1.metric("中位數最終本金", f"${med_final:,.0f}")
+    m2.metric("最終本金 P10 / P90", f"${p10:,.0f} / ${p90:,.0f}")
+    m3.metric("中位數最大回撤", f"{med_dd * 100:.1f}%")
+    m4.metric("最終盈利機率", f"{p_profit * 100:.1f}%")
+    m5.metric("跌剩一半本金機率", f"{p_half * 100:.1f}%")
+    hist_frac = float(np.mean([f for f, _ in recs]))
+    hist_unit = float(np.sum([r for _, r in recs]))
+    st.caption(f"模擬基準：{account} 帳戶歷史實注 {len(recs)} 注、平均注碼比例 {hist_frac * 100:.2f}% 本金、"
+               f"歷史累計單位回報 {hist_unit:+.2f}U。")
+    st.markdown("**樣本金路徑 (前 15 條模擬路徑)**")
+    pdf = pd.DataFrame(sample_paths.T, columns=[f"路徑{i + 1}" for i in range(sample_paths.shape[0])])
+    pdf.index.name = '注數'
+    st.line_chart(pdf, use_container_width=True)
+    st.markdown("**最終本金分布**")
+    bins = pd.cut(finals, bins=12)
+    dist = pd.DataFrame({'注數': bins.value_counts().sort_index().values}, index=[str(i).replace('(', '').replace(']', '') for i in bins.value_counts().sort_index().index])
+    st.bar_chart(dist, use_container_width=True)
+    st.caption("⚠️ 模擬結果假設未來注單分布與歷史相似；若策略改動或市場環境改變，實際路徑可能顯著不同。"
+               "最大回撤是「捱得過波動」的指標，不是盈利預測。")
+
+
+# ==========================================
 # 3. 三維度 ML 與 EV 分析引擎
 # ==========================================
 def extract_form_points(form_str):
@@ -4063,6 +4326,14 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
         st.caption("💡 原始單位利潤包含未下注注單的賠率結果；系統/用家單位利潤僅計算有實際下注 (Stake>0) 的注單，與全局模型一致。")
         st.divider()
 
+        # V11.1 新增：為預覽表格加入 CLV (收盤線價值) 欄位 (只作顯示與下載，不會寫回資料庫)
+        try:
+            if not show_df.empty:
+                show_df = show_df.copy()
+                show_df['CLV%'] = (show_df.apply(compute_bet_clv, axis=1) * 100).round(2)
+        except Exception:
+            pass
+
         summary_data = {col: None for col in show_df.columns}
         if 'ID' in summary_data: summary_data['ID'] = "TOTAL (總計)"
         if 'System_Profit' in summary_data: summary_data['System_Profit'] = round(total_sys_profit, 2)
@@ -5318,7 +5589,7 @@ def main():
     if st.sidebar.button("🗂 已完成注單資料修改 (可直接編輯任何欄位)", use_container_width=True):
         edit_settled_bets_dialog(db_file, db_table)
 
-    t_pre, t_inplay, t_settle, t_ai, t_time_pnl = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖ 賽果結算與管理", "🤖 全局模型", "📅 時間維度盈虧記錄分析"])
+    t_pre, t_inplay, t_settle, t_ai, t_time_pnl, t_clv = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖ 賽果結算與管理", "🤖 全局模型", "📅 時間維度盈虧記錄分析", "🎯 CLV 與本金模擬"])
 
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
@@ -6464,6 +6735,23 @@ def main():
     with t_time_pnl:
         df_settled_tdp = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
         render_time_dimension_pnl_tab(df_settled_tdp, sys_bankroll, sys_max_stake)
+
+    with t_clv:
+        st.subheader("🎯 CLV (收盤線價值) 追蹤與蒙地卡羅本金模擬 (V11.1 新增)")
+        st.caption("CLV 追蹤：量度選注決策質素 (買得比收盤便宜還是貴)，比盈虧數字更早反映策略優勢；"
+                   "蒙地卡羅本金模擬：以歷史注單回報分布模擬未來本金路徑，評估注碼策略能否捱過波動。"
+                   "兩者皆只讀取現有數據即時計算，不會改動資料庫結構。")
+        _df_all_clv = st.session_state.df_db
+        _df_settled_clv = _df_all_clv[_df_all_clv['Status'] == 'Settled'].copy() if not _df_all_clv.empty else _df_all_clv.copy()
+        try:
+            render_clv_section(_df_settled_clv)
+        except Exception as e:
+            st.error(f"CLV 追蹤發生錯誤：{e}")
+        st.divider()
+        try:
+            render_monte_carlo_section(_df_settled_clv, sys_bankroll)
+        except Exception as e:
+            st.error(f"蒙地卡羅模擬發生錯誤：{e}")
 
     with t_ai:
         st.subheader("🤖 全局模型與績效分析")
