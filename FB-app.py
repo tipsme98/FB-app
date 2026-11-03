@@ -81,6 +81,8 @@ DB_COLUMNS = [
     'ID', 'Date', 'Status', 
     'Tournament_Name', 'Tournament_Category', 'Match', 'Match_Date', 'Home_Team', 'Away_Team', 
     'Home_Rating', 'Away_Rating', 'League_Size', 'Home_Form', 'Away_Form',
+    'Home_Form10', 'Away_Form10', 'Home_Recent_Matches', 'Away_Recent_Matches',
+    'H2H_Records', 'Home_League_Stats', 'Away_League_Stats', 'Bookmaker_Odds', 'HKJC_Extra_Odds',
     'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 
     'System_Stake', 'User_Stake', 'Odds_History',
     'InPlay_Minute', 'Home_DA', 'Away_DA', 'Home_SoT', 'Away_SoT', 'Home_SoFF', 'Away_SoFF',
@@ -156,7 +158,10 @@ def load_db(filename, columns, table_name, force_cloud=False):
     string_cols = [
         'ID', 'Date', 'Status', 'Tournament_Name', 'Tournament_Category', 
         'Match', 'Match_Date', 'Home_Team', 'Away_Team', 'Home_Rating', 'Away_Rating', 
-        'Home_Form', 'Away_Form', 'Bet_Type', 'Selection', 'Odds_History', 'Result_Label',
+        'Home_Form', 'Away_Form', 'Home_Form10', 'Away_Form10',
+        'Home_Recent_Matches', 'Away_Recent_Matches', 'H2H_Records',
+        'Home_League_Stats', 'Away_League_Stats', 'Bookmaker_Odds', 'HKJC_Extra_Odds',
+        'Bet_Type', 'Selection', 'Odds_History', 'Result_Label',
         'Half_Score',
         'Type', 'Account', 'Note'
     ]
@@ -4805,8 +4810,8 @@ def _tipsme_match_dt(t):
         pass
     return None
 
-def tipsme_form_from_matches(matches, before_date):
-    """由近況比賽清單計算近 5 場勝和負：只用比賽日之前的賽事，取最近 5 場 (由該隊角度的 matchResult)"""
+def tipsme_form_from_matches(matches, before_date, n=5):
+    """由近況比賽清單計算近 n 場勝和負：只用比賽日之前的賽事，取最近 n 場 (由該隊角度的 matchResult)"""
     dated = []
     for m in (matches or []):
         dt = _tipsme_match_dt(m.get('time'))
@@ -4815,7 +4820,7 @@ def tipsme_form_from_matches(matches, before_date):
     dated.sort(key=lambda x: x[0], reverse=True)
     if before_date is not None:
         dated = [x for x in dated if x[0].date() < before_date]
-    use = dated[:5]
+    use = dated[:n]
     w = d_ = l = 0
     for _, m in use:
         r = str(m.get('matchResult', '')).strip()
@@ -4826,6 +4831,137 @@ def tipsme_form_from_matches(matches, before_date):
         elif r == '負':
             l += 1
     return w, d_, l, len(dated)
+
+def tipsme_form_details(matches, before_date, n=10):
+    """近況比賽清單 → 結構化逐場記錄 (最近 n 場、比賽日之前)，供存入資料庫作學習特徵。
+    每場包含：日期、賽事、主客隊、比分、半場比分、該隊勝/和/負、讓球盤及結果、入球大小結果、角球、紅牌"""
+    dated = []
+    for m in (matches or []):
+        dt = _tipsme_match_dt(m.get('time'))
+        if dt is not None:
+            dated.append((dt, m))
+    dated.sort(key=lambda x: x[0], reverse=True)
+    if before_date is not None:
+        dated = [x for x in dated if x[0].date() < before_date]
+    rows = []
+    for dt, m in dated[:n]:
+        rows.append({
+            'date': dt.strftime('%Y-%m-%d'),
+            'league': str(m.get('league') or ''),
+            'home': str(m.get('homeTeam') or ''),
+            'away': str(m.get('awayTeam') or ''),
+            'score': str(m.get('score') or ''),
+            'half': str(m.get('halfScore') or ''),
+            'result': str(m.get('matchResult') or ''),
+            'cap': str(m.get('hdpCap') or ''),
+            'hdp': str(m.get('hdpResult') or ''),
+            'hilo': str(m.get('hiloResult') or ''),
+            'corner': f"{m.get('homeCorner') or ''}-{m.get('awayCorner') or ''}".strip('-'),
+            'red': str(m.get('homeRedCard') or m.get('awayRedCard') or ''),
+        })
+    return rows
+
+def _tipsme_league_rank(league_details):
+    """聯賽積分資料 (h2h 頁) → 總排名 (這是『比賽當天』的排名，而非最新排名)；取不到回 None"""
+    for row in (league_details or []):
+        if str(row.get('type', '')).strip() in ('總', '总'):
+            r = _tipsme_int(row.get('rank'))
+            if r:
+                return r
+    return None
+
+def _tipsme_league_stats_rows(league_details):
+    """聯賽積分資料 → 結構化 4 行 (總/主場/客場/近6)：場數、勝和負、入球、失球、得失差、積分、排名"""
+    rows = []
+    for row in (league_details or []):
+        rows.append({
+            'type': str(row.get('type') or ''),
+            'P': _tipsme_int(row.get('matchCount')),
+            'W': _tipsme_int(row.get('winCount')),
+            'D': _tipsme_int(row.get('drawCount')),
+            'L': _tipsme_int(row.get('loseCount')),
+            'GF': _tipsme_int(row.get('winGoalCount')),
+            'GA': _tipsme_int(row.get('loseGoalCount')),
+            'GD': _tipsme_int(row.get('goalDiff')),
+            'Pts': _tipsme_int(row.get('point')),
+            'Rank': _tipsme_int(row.get('rank')),
+        })
+    return rows
+
+def _tipsme_h2h_rows(h2h_list, n=10):
+    """對賽往績 → 結構化逐場記錄 (最近 n 次)：日期、賽事、主客、比分、半場、角球、讓球盤及賠率、主客和賠率"""
+    rows = []
+    for m in (h2h_list or [])[:n]:
+        rows.append({
+            'date': str(m.get('matchDate') or ''),
+            'league': str(m.get('league') or ''),
+            'home': str(m.get('home') or ''),
+            'away': str(m.get('away') or ''),
+            'score': str(m.get('score') or ''),
+            'corner': str(m.get('corner') or ''),
+            'cap': str(m.get('hdpCap') or ''),
+            'hdp_h': m.get('hdpWinOdds'),
+            'hdp_a': m.get('hdpAwayOdds'),
+            'had_h': m.get('homeWinOdds'),
+            'had_d': m.get('drawWinOdds'),
+            'had_a': m.get('awayWinOdds'),
+            'had_r': str(m.get('hadWinResult') or ''),
+            'hdp_r': str(m.get('hdpWinResult') or ''),
+            'hilo_r': str(m.get('hiloWinResult') or ''),
+        })
+    return rows
+
+def tipsme_fetch_bookmaker_odds(match_id):
+    """讀取其他莊家盤口比較 (初盤/終盤)：
+    讓球 → 賠率頁內嵌 JSON (oddsResponse.hdpDetails)；
+    入球大小 / 主客和 → 網站 API /api/match-odds/{id}/{market}。
+    回傳 dict {updated, hdp:[], hilo:[], had:[]}；完全失敗回 None"""
+    out = {'updated': '', 'hdp': [], 'hilo': [], 'had': []}
+    # --- 讓球：賠率頁 SSR 內嵌 ---
+    txt = _tipsme_get(f"https://tipsme.hk/zh-HK/match/{match_id}/odds")
+    if txt:
+        m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', txt, re.S)
+        if m:
+            try:
+                d = json.loads(m.group(1))
+                resp = (d.get('props', {}).get('pageProps', {}) or {}).get('oddsResponse') or {}
+                out['updated'] = str(resp.get('lastUpdatedTime') or '')
+                for r in resp.get('hdpDetails') or []:
+                    out['hdp'].append({
+                        'co': str(r.get('companyName') or ''),
+                        'b_cap': str(r.get('hdpBeginCap') or ''), 'b_h': r.get('hdpBeginHomeOdds'), 'b_a': r.get('hdpBeginAwayOdds'),
+                        'e_cap': str(r.get('hdpEndCap') or ''), 'e_h': r.get('hdpEndHomeOdds'), 'e_a': r.get('hdpEndAwayOdds'),
+                    })
+            except Exception:
+                pass
+    # --- 入球大小 / 主客和：網站 API ---
+    for mk in ('hilo', 'had'):
+        try:
+            t2 = _tipsme_get(f"https://tipsme.hk/api/match-odds/{match_id}/{mk}?locale=zh-HK")
+            if not t2:
+                continue
+            d2 = json.loads(t2)
+            if not isinstance(d2, dict):
+                continue
+            out['updated'] = out['updated'] or str(d2.get('lastUpdatedTime') or '')
+            for r in d2.get('details') or []:
+                if mk == 'hilo':
+                    out['hilo'].append({
+                        'co': str(r.get('companyName') or ''),
+                        'b_cap': str(r.get('hiloBeginCap') or ''), 'b_h': r.get('hiloBeginBigOdds'), 'b_a': r.get('hiloBeginSmallOdds'),
+                        'e_cap': str(r.get('hiloEndCap') or ''), 'e_h': r.get('hiloEndBigOdds'), 'e_a': r.get('hiloEndSmallOdds'),
+                    })
+                else:
+                    out['had'].append({
+                        'co': str(r.get('companyName') or ''),
+                        'b_h': r.get('hadBeginHomeOdds'), 'b_d': r.get('hadBeginDrawOdds'), 'b_a': r.get('hadBeginAwayOdds'),
+                        'e_h': r.get('hadEndHomeOdds'), 'e_d': r.get('hadEndDrawOdds'), 'e_a': r.get('hadEndAwayOdds'),
+                    })
+        except Exception:
+            continue
+    if not (out['hdp'] or out['hilo'] or out['had']):
+        return None
+    return out
 
 def tipsme_fetch_hkjc_odds(match_id):
     """讀取馬會全部玩法賠率變化 (Score/odds/hkjc API)"""
@@ -4857,8 +4993,9 @@ def _tipsme_market_records(api_odds, key):
         return recs
     return list(v)
 
-def _tipsme_add_market(rows_out, btype, recs, line_fn, up_fn, lw_fn):
-    """把一個玩法的紀錄轉為 (時間, 類型, 盤口線, 上賠率, 下賠率) 並按時間排序、連續重複去重"""
+def _tipsme_add_market(rows_out, btype, recs, line_fn, up_fn, lw_fn, max_tail=0):
+    """把一個玩法的紀錄轉為 (時間, 類型, 盤口線, 上賠率, 下賠率) 並按時間排序、連續重複去重。
+    max_tail > 0 時只保留最新 max_tail 筆 (用於其他玩法，控制 JSON 大小)"""
     rows = []
     for r in recs or []:
         t = _tipsme_iso_time(r.get('create_time'))
@@ -4877,7 +5014,14 @@ def _tipsme_add_market(rows_out, btype, recs, line_fn, up_fn, lw_fn):
             dedup[-1] = (t, bt, line, up, lw)  # 同價位時間不同：保留最新時間
             continue
         dedup.append((t, bt, line, up, lw))
+    if max_tail and len(dedup) > max_tail:
+        dedup = dedup[-max_tail:]
     rows_out.extend(dedup)
+
+def _tipsme_pool_recs(api_odds, key, pool):
+    """取出球隊入球/角球玩法中指定 pool (HLH/HLA/FLH/FLA/CHH/CHA/CFH/CFA) 的紀錄"""
+    v = _tipsme_market_records(api_odds, key) or []
+    return [r for r in v if str(r.get('pool_type', '')).strip() == pool]
 
 def tipsme_build_odds_history(api_odds):
     """把馬會賠率變化轉換成系統 Odds_History 格式。
@@ -4897,19 +5041,32 @@ def tipsme_build_odds_history(api_odds):
                        lambda r: r.get('big_odds'), lambda r: r.get('small_odds'))
     _tipsme_add_market(extra, '角球讓球', _tipsme_market_records(api_odds, 'chiloHdpOdds'),
                        lambda r: _tipsme_cap_value(r.get('home_cap')),
-                       lambda r: r.get('home_win_odds'), lambda r: r.get('away_win_odds'))
+                       lambda r: r.get('home_win_odds'), lambda r: r.get('away_win_odds'), max_tail=8)
     _tipsme_add_market(extra, '半場讓球', _tipsme_market_records(api_odds, 'fhdpOdds'),
                        lambda r: _tipsme_cap_value(r.get('home_cap')),
-                       lambda r: r.get('home_win_odds'), lambda r: r.get('away_win_odds'))
+                       lambda r: r.get('home_win_odds'), lambda r: r.get('away_win_odds'), max_tail=8)
     _tipsme_add_market(extra, '半場入球大小', _tipsme_market_records(api_odds, 'fhloOdds'),
                        lambda r: _tipsme_cap_value(r.get('number_of_goals')),
-                       lambda r: r.get('big_odds'), lambda r: r.get('small_odds'))
+                       lambda r: r.get('big_odds'), lambda r: r.get('small_odds'), max_tail=8)
     _tipsme_add_market(extra, '半場角球大小', _tipsme_market_records(api_odds, 'fchloOdds'),
                        lambda r: _tipsme_cap_value(r.get('number_of_corners')),
-                       lambda r: r.get('big_odds'), lambda r: r.get('small_odds'))
+                       lambda r: r.get('big_odds'), lambda r: r.get('small_odds'), max_tail=8)
+    _tipsme_add_market(extra, '半場角球讓球', _tipsme_market_records(api_odds, 'fchdpOdds'),
+                       lambda r: _tipsme_cap_value(r.get('home_cap')),
+                       lambda r: r.get('home_win_odds'), lambda r: r.get('away_win_odds'), max_tail=8)
     _tipsme_add_market(extra, '入球單雙', _tipsme_market_records(api_odds, 'ooeOdds'),
                        lambda r: 0.0,
-                       lambda r: r.get('odd_odds'), lambda r: r.get('even_odds'))
+                       lambda r: r.get('odd_odds'), lambda r: r.get('even_odds'), max_tail=8)
+    for pool, label in (('HLH', '主隊入球大小'), ('HLA', '客隊入球大小'),
+                        ('FLH', '半場主隊入球大小'), ('FLA', '半場客隊入球大小')):
+        _tipsme_add_market(extra, label, _tipsme_pool_recs(api_odds, 'teamHiloOdds' if pool[0] == 'H' else 'teamFhloOdds', pool),
+                           lambda r: _tipsme_cap_value(r.get('number_of_goals')),
+                           lambda r: r.get('big_odds'), lambda r: r.get('small_odds'), max_tail=8)
+    for pool, label in (('CHH', '主隊角球大小'), ('CHA', '客隊角球大小'),
+                        ('CFH', '半場主隊角球大小'), ('CFA', '半場客隊角球大小')):
+        _tipsme_add_market(extra, label, _tipsme_pool_recs(api_odds, 'teamChiloOdds' if pool[:2] == 'CH' else 'teamFchloOdds', pool),
+                           lambda r: _tipsme_cap_value(r.get('number_of_corners')),
+                           lambda r: r.get('big_odds'), lambda r: r.get('small_odds'), max_tail=8)
 
     def _to_history(rows):
         out = []
@@ -4965,50 +5122,117 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams):
         else:
             st.session_state[sel_key] = "➕ 新增手動輸入..."
             st.session_state[txt_key] = name
-    # --- 5. 排名 ---
-    if info.get('home_rank'):
-        st.session_state['h_rank'] = int(info['home_rank'])
-    if info.get('away_rank'):
-        st.session_state['a_rank'] = int(info['away_rank'])
-    # --- 6. 近 5 場狀態 (h2h 頁面；讀取失敗則保留手動輸入) ---
+    # --- 5. 近況、對賽往總、聯賽積分 (h2h 頁面；讀取失敗則保留手動輸入) ---
     form_ok = False
     h2h = tipsme_fetch_h2h(mid)
+    before = info['kickoff'].date() if info['kickoff'] is not None else None
+    ctx = {}
     if h2h:
-        before = info['kickoff'].date() if info['kickoff'] is not None else None
-        hw, hd, hl, havail = tipsme_form_from_matches(h2h['home_matches'], before)
-        aw, ad, al, aavail = tipsme_form_from_matches(h2h['away_matches'], before)
+        hw, hd, hl, havail = tipsme_form_from_matches(h2h['home_matches'], before, 5)
+        aw, ad, al, aavail = tipsme_form_from_matches(h2h['away_matches'], before, 5)
         if havail >= 5 and aavail >= 5:
             st.session_state['f1'], st.session_state['f2'], st.session_state['f3'] = hw, hd, hl
             st.session_state['f4'], st.session_state['f5'], st.session_state['f6'] = aw, ad, al
             form_ok = True
         else:
             warnings.append(f"近況比賽數目不足 (主隊 {havail} 場 / 客隊 {aavail} 場)，近 5 場狀態請手動輸入。")
+        # 近 10 場彙總 + 逐場明細 (存入資料庫新欄位，供日後學習)
+        h10w, h10d, h10l, _ = tipsme_form_from_matches(h2h['home_matches'], before, 10)
+        a10w, a10d, a10l, _ = tipsme_form_from_matches(h2h['away_matches'], before, 10)
+        ctx['Home_Form10'] = f"{h10w}W{h10d}D{h10l}L"
+        ctx['Away_Form10'] = f"{a10w}W{a10d}D{a10l}L"
+        ctx['Home_Recent_Matches'] = json.dumps(tipsme_form_details(h2h['home_matches'], before, 10), ensure_ascii=False)
+        ctx['Away_Recent_Matches'] = json.dumps(tipsme_form_details(h2h['away_matches'], before, 10), ensure_ascii=False)
+        ctx['H2H_Records'] = json.dumps(_tipsme_h2h_rows(h2h['h2h']), ensure_ascii=False)
+        ctx['Home_League_Stats'] = json.dumps(_tipsme_league_stats_rows(h2h['home_league']), ensure_ascii=False)
+        ctx['Away_League_Stats'] = json.dumps(_tipsme_league_stats_rows(h2h['away_league']), ensure_ascii=False)
+        # 對賽往績頁的積分表是「比賽當天」的排名 → 優先使用 (修正舊版使用最新排名的問題)
+        h_rank_asof = _tipsme_league_rank(h2h['home_league'])
+        a_rank_asof = _tipsme_league_rank(h2h['away_league'])
+        if h_rank_asof:
+            st.session_state['h_rank'] = h_rank_asof
+        elif info.get('home_rank'):
+            st.session_state['h_rank'] = int(info['home_rank'])
+            warnings.append("主隊排名未能從比賽當天積分表取得，已改用最新排名，請核對。")
+        if a_rank_asof:
+            st.session_state['a_rank'] = a_rank_asof
+        elif info.get('away_rank'):
+            st.session_state['a_rank'] = int(info['away_rank'])
+            warnings.append("客隊排名未能從比賽當天積分表取得，已改用最新排名，請核對。")
     else:
-        warnings.append("近況資料頁面讀取失敗，近 5 場狀態請手動輸入。")
-    # --- 7. 盤口賠率 (馬會全部玩法) ---
+        # h2h 頁讀取失敗：退回最新排名
+        if info.get('home_rank'):
+            st.session_state['h_rank'] = int(info['home_rank'])
+        if info.get('away_rank'):
+            st.session_state['a_rank'] = int(info['away_rank'])
+        warnings.append("近況資料頁面讀取失敗，近 5 場狀態及比賽當天排名請手動核對輸入。")
+    # --- 6. 盤口賠率 (馬會全部玩法 + 其他莊家比較) ---
     odds_ok = False
     extra_hist = []
     api_odds = tipsme_fetch_hkjc_odds(mid)
     if api_odds:
         core_hist, extra_hist = tipsme_build_odds_history(api_odds)
         if core_hist:
-            st.session_state.odds_history = core_hist + extra_hist
+            # 核心三盤 (讓球/入球大小/角球大小) 才寫入賠率走勢表 (可投注可結算)；
+            # 其他玩法 (半場盤、角球讓球、球隊入球/角球、單雙等) 另存新欄位，避免出現空白盤口類型
+            st.session_state.odds_history = core_hist
+            st.session_state['tipsme_extra_markets'] = extra_hist
+            ctx['HKJC_Extra_Odds'] = json.dumps(extra_hist, ensure_ascii=False)
             odds_ok = True
+            # 馬會主客和 (3 選 1) 不放入賠率走勢表，另存於莊家比較欄位
+            had_recs = _tipsme_market_records(api_odds, 'hadOdds') or []
+            if had_recs:
+                bk = ctx.get('Bookmaker_Odds') if isinstance(ctx.get('Bookmaker_Odds'), dict) else None
+                bk = bk or {'updated': '', 'hdp': [], 'hilo': [], 'had': []}
+                bk['hkjc_had'] = [{'time': str(r.get('create_time') or ''),
+                                   'h': r.get('home_win_odds'), 'd': r.get('draw_win_odds'), 'a': r.get('away_win_odds')}
+                                  for r in had_recs[-8:]]
+                ctx['Bookmaker_Odds'] = bk
         else:
             warnings.append("馬會賠率紀錄讀取成功但沒有有效盤口 (可能尚未開盤)。")
     else:
         warnings.append("馬會賠率紀錄讀取失敗，請手動貼上或輸入盤口賠率。")
+    # --- 7. 其他莊家盤口比較 (讓球/入球大小/主客和，初盤與終盤) ---
+    bk_ok = False
+    bk = tipsme_fetch_bookmaker_odds(mid)
+    if bk:
+        if isinstance(ctx.get('Bookmaker_Odds'), dict):
+            cur = ctx['Bookmaker_Odds']
+            cur['updated'] = cur.get('updated') or bk.get('updated') or ''
+            for k in ('hdp', 'hilo', 'had'):
+                if bk.get(k):
+                    cur[k] = bk[k]
+            bk = cur
+        ctx['Bookmaker_Odds'] = bk
+        bk_ok = True
+    else:
+        warnings.append("其他莊家盤口比較讀取失敗 (只影響記錄，不影響投注欄位)。")
     # 清空舊的貼上區，避免舊貼文覆蓋自動填充結果
     for _pk in ('pre_paste_hd', 'pre_paste_ou', 'pre_paste_cr'):
         st.session_state[_pk] = ''
     st.session_state['pre_last_paste_sig'] = '||'
 
-    fill_data = {'info': info, 'form_ok': form_ok, 'odds_ok': odds_ok,
-                 'extra_hist': extra_hist, 'warnings': warnings,
-                 'core_count': len(st.session_state.odds_history) - len(extra_hist)}
+    fill_data = {'info': info, 'form_ok': form_ok, 'odds_ok': odds_ok, 'bk_ok': bk_ok,
+                 'extra_hist': extra_hist, 'warnings': warnings, 'ctx': ctx,
+                 'core_count': len(st.session_state.odds_history) if odds_ok else 0}
     st.session_state['tipsme_fill_data'] = fill_data
     st.session_state['tipsme_fill_mid'] = mid
     return True, "已讀取並自動填充，請核對以下資料。", fill_data
+
+def _tipsme_context_fields(home_team, away_team):
+    """由自動填充結果取出新增的學習欄位 (近10場、逐場近況、對賽往績、積分統計、莊家比較、馬會其他玩法)。
+    只有當提交的球隊與自動填充的球隊相同時才填入，避免張冠李戴；回傳 dict (可為空)"""
+    fd = st.session_state.get('tipsme_fill_data')
+    if not fd:
+        return {}
+    info = fd.get('info') or {}
+    def _norm(s):
+        return re.sub(r'[\s\-_·•]', '', str(s or ''))
+    if not home_team or not away_team:
+        return {}
+    if _norm(info.get('home')) != _norm(home_team) or _norm(info.get('away')) != _norm(away_team):
+        return {}
+    return {k: v for k, v in (fd.get('ctx') or {}).items() if v}
 
 def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
     """賽前頁：貼上鏈結自動填充區 (填充後顯示資料預覽供核對，所有欄位仍可手動修改)"""
@@ -5026,9 +5250,10 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
             else:
                 st.error(msg)
         with c_note:
-            st.caption("💡 系統會自動讀取：賽事名稱及分類、比賽日期、主客隊、聯賽排名、近 5 場勝和負、"
-                       "馬會讓球 / 入球大小 / 角球大小全部賠率變化，以及其他玩法 (角球讓球、半場盤等) 的紀錄。"
-                       "填充後請核對各欄位，可直接修改。連結只會低頻率讀取 1~2 次。")
+            st.caption("💡 系統會自動讀取：賽事名稱及分類、比賽日期、主客隊、比賽當天聯賽排名、近 5 場及近 10 場近況、"
+                       "對賽往績、聯賽積分統計 (總/主/客/近6)、馬會讓球 / 入球大小 / 角球大小全部賠率變化、"
+                       "其他玩法紀錄 (半場盤、角球讓球、球隊入球/角球等)，以及其他莊家 (約 20 間) 讓球 / 入球大小 / 主客和的初盤終盤比較。"
+                       "填充後請核對各欄位，可直接修改。連結只會低頻率讀取數次。")
 
         fd = st.session_state.get('tipsme_fill_data')
         if fd:
@@ -5036,19 +5261,104 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
             st.success(f"✅ 已自動填充：**{info['home']} vs {info['away']}** ({info['league']})"
                        f"{(' | 比賽時間 ' + info['kickoff'].strftime('%Y-%m-%d %H:%M')) if info['kickoff'] else ''}")
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("主隊排名", info.get('home_rank') or '-')
-            m2.metric("客隊排名", info.get('away_rank') or '-')
+            m1.metric("主隊排名 (比賽當天)", info.get('home_rank') or '-')
+            m2.metric("客隊排名 (比賽當天)", info.get('away_rank') or '-')
             m3.metric("近5場狀態", "已填充" if fd['form_ok'] else "請手動輸入")
             m4.metric("盤口紀錄數", f"{fd['core_count']} 筆")
+            st.caption("ℹ️ 排名已改為使用「比賽當天」的聯賽積分表排名 (對賽往績頁)，而非最新排名，輸入兩個月前的比賽也會正確。")
             if fd['odds_ok']:
                 st.caption("✅ 馬會讓球 / 入球大小 / 角球大小賠率變化已填入下方「賽前盤口與賠率走勢紀錄」，請核對。")
+            ctx = fd.get('ctx') or {}
+            # --- 近 10 場近況摘要 + 逐場明細 ---
+            if ctx.get('Home_Recent_Matches') or ctx.get('Away_Recent_Matches'):
+                with st.expander("📋 近 10 場近況 (勝/和/負 + 逐場明細，已存入注單新欄位)", expanded=False):
+                    c_h10, c_a10 = st.columns(2)
+                    with c_h10:
+                        st.markdown(f"**主隊 {info['home']}**")
+                        st.metric("近 10 場", ctx.get('Home_Form10', '-'))
+                        try:
+                            df_rm = pd.DataFrame(json.loads(ctx['Home_Recent_Matches']))
+                            st.dataframe(df_rm, use_container_width=True, hide_index=True)
+                        except Exception:
+                            pass
+                    with c_a10:
+                        st.markdown(f"**客隊 {info['away']}**")
+                        st.metric("近 10 場", ctx.get('Away_Form10', '-'))
+                        try:
+                            df_rm = pd.DataFrame(json.loads(ctx['Away_Recent_Matches']))
+                            st.dataframe(df_rm, use_container_width=True, hide_index=True)
+                        except Exception:
+                            pass
+                    st.caption("近況包含所有賽事 (聯賽/盃賽/友誼賽) 並附賽事名稱，日後分析可按賽事類型加權；"
+                               "每場含日期、賽事、比分、半場、讓球盤及結果、大小結果、角球、紅牌。")
+            # --- 對賽往績 ---
+            if ctx.get('H2H_Records'):
+                try:
+                    _h2h_n = len(json.loads(ctx['H2H_Records']))
+                except Exception:
+                    _h2h_n = 0
+                with st.expander(f"⚔️ 對賽往績 ({_h2h_n} 場，已存入注單新欄位)", expanded=False):
+                    try:
+                        df_h2h = pd.DataFrame(json.loads(ctx['H2H_Records']))
+                        st.dataframe(df_h2h, use_container_width=True, hide_index=True)
+                        st.caption("包含日期、賽事、主客、比分、角球、讓球盤及賠率、主客和賠率及結果。")
+                    except Exception:
+                        pass
+            # --- 聯賽積分統計 ---
+            if ctx.get('Home_League_Stats') or ctx.get('Away_League_Stats'):
+                with st.expander("🏆 聯賽積分統計 (總/主場/客場/近6，比賽當天數據，已存入注單新欄位)", expanded=False):
+                    c_hlg, c_alg = st.columns(2)
+                    with c_hlg:
+                        st.markdown(f"**主隊 {info['home']}**")
+                        try:
+                            st.dataframe(pd.DataFrame(json.loads(ctx['Home_League_Stats'])), use_container_width=True, hide_index=True)
+                        except Exception:
+                            pass
+                    with c_alg:
+                        st.markdown(f"**客隊 {info['away']}**")
+                        try:
+                            st.dataframe(pd.DataFrame(json.loads(ctx['Away_League_Stats'])), use_container_width=True, hide_index=True)
+                        except Exception:
+                            pass
+            # --- 其他莊家盤口比較 ---
+            if fd.get('bk_ok'):
+                with st.expander("🏦 其他莊家盤口比較 (讓球/入球大小/主客和 · 初盤→終盤，已存入注單新欄位)", expanded=False):
+                    try:
+                        bk = json.loads(ctx['Bookmaker_Odds']) if isinstance(ctx.get('Bookmaker_Odds'), str) else ctx.get('Bookmaker_Odds')
+                    except Exception:
+                        bk = None
+                    if isinstance(bk, dict):
+                        tabs_bk = st.tabs(["讓球", "入球大小", "主客和"])
+                        if bk.get('hdp'):
+                            df_bk = pd.DataFrame(bk['hdp'])
+                            df_bk.columns = ['莊家', '初盤', '初盤主', '初盤客', '終盤', '終盤主', '終盤客']
+                            tabs_bk[0].dataframe(df_bk, use_container_width=True, hide_index=True)
+                        if bk.get('hilo'):
+                            df_bk = pd.DataFrame(bk['hilo'])
+                            df_bk.columns = ['莊家', '初盤', '初盤大', '初盤小', '終盤', '終盤大', '終盤小']
+                            tabs_bk[1].dataframe(df_bk, use_container_width=True, hide_index=True)
+                        if bk.get('had'):
+                            df_bk = pd.DataFrame(bk['had'])
+                            df_bk.columns = ['莊家', '初盤主', '初盤和', '初盤客', '終盤主', '終盤和', '終盤客']
+                            tabs_bk[2].dataframe(df_bk, use_container_width=True, hide_index=True)
+                        if bk.get('hkjc_had'):
+                            df_bk = pd.DataFrame(bk['hkjc_had'])
+                            df_bk.columns = ['時間', '主', '和', '客']
+                            tabs_bk[2].markdown("**馬會主客和賠率變化：**")
+                            tabs_bk[2].dataframe(df_bk, use_container_width=True, hide_index=True)
+                        if bk.get('updated'):
+                            st.caption(f"莊家報價最後更新：{str(bk['updated'])[:19]} (香港時間)")
+                        st.caption("包含約 20 間莊家 (澳*、Crow*、36*、香港馬* 等) 的初盤與終盤比較，"
+                                   "莊家之間的分歧及盤口走向是重要的市場情緒特徵。")
+            # --- 馬會其他玩法 ---
             if fd['extra_hist']:
-                with st.expander(f"📎 其他玩法紀錄 ({len(fd['extra_hist'])} 筆，只作記錄供學習，暫不支援投注與結算)", expanded=False):
+                with st.expander(f"📎 馬會其他玩法紀錄 ({len(fd['extra_hist'])} 筆，只作記錄供學習，暫不支援投注與結算)", expanded=False):
                     df_ex = pd.DataFrame(fd['extra_hist'])
                     df_ex = df_ex[['record_time', 'type', 'line', 'upper', 'lower']]
                     df_ex.columns = ['📅日期及時間', '玩法', '盤口線', '主隊/大賠率', '客隊/小賠率']
                     st.dataframe(df_ex, use_container_width=True, hide_index=True)
-                    st.caption("其他玩法會一併存入注單的賠率紀錄 (JSON)，供日後樣本累積足夠時學習分析；"
+                    st.caption("其他玩法 (角球讓球、半場盤、球隊入球/角球大小、入球單雙、馬會主客和等) 已清楚標示玩法名稱，"
+                               "會存入注單的「HKJC_Extra_Odds」欄位供日後樣本累積足夠時學習分析；"
                                "現時分析與投注引擎只使用讓球 / 入球大小 / 角球大小。")
             for w in fd['warnings']:
                 st.warning(w)
@@ -6595,6 +6905,7 @@ def main():
                                 'System_Stake': s_stk, 'User_Stake': u_stk,
                                 'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False)
                             })
+                            new_record.update(_tipsme_context_fields(home_team, away_team))
                         else:
                             new_record = {
                                 'ID': new_id, 'Date': get_hkt_now().strftime('%Y-%m-%d %H:%M'), 'Status': 'Open',
@@ -6603,7 +6914,8 @@ def main():
                                 'Home_Rating': 'NA' if no_rank else int(home_rank), 'Away_Rating': 'NA' if no_rank else int(away_rank), 'League_Size': int(league_size), 'Home_Form': home_form, 'Away_Form': away_form,
                                 'Bet_Type': cand['bet_type'], 'Selection': cand['selection'], 'Initial_Line': cand['line'], 'Initial_Odds': cand['odds'], 
                                 'System_Stake': s_stk, 'User_Stake': u_stk,
-                                'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False)
+                                'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False),
+                                **_tipsme_context_fields(home_team, away_team)
                             }
                         new_records.append(new_record)
                     if _dup_skipped:
@@ -7060,6 +7372,7 @@ def main():
                                     'Home_Goal_Conversion': round(h_conversion, 2), 'Away_Goal_Conversion': round(a_conversion, 2),
                                     'Home_Firepower': round(h_firepower, 2), 'Away_Firepower': round(a_firepower, 2),
                                     'Home_Corner_Eff': round(h_corner_eff, 2), 'Away_Corner_Eff': round(a_corner_eff, 2),
+                                    **_tipsme_context_fields(ip_res['h_team'], ip_res['a_team'])
                                 }
                                 ip_new_records.append(new_record)
 
