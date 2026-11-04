@@ -331,6 +331,95 @@ def calculate_settlement(bet_type, selection, line, odds, sys_stake, user_stake,
         unit_profit, res_label, diff
     )
 
+# ==========================================================
+# V13.1 數據庫自動修復 (Self-Repair)
+# 背景：2026-11-04 結算分頁「讀取賽果」後輸入欄未更新 (Streamlit widget 狀態
+# 持久化 bug)，令 18 筆注單以全 0 賽果結算；另有 3 筆奧格斯堡注單 (10-31)
+# 儲存了錯誤比分。以下真實賽果已於 2026-11-04 經 Tipsme API 逐場核實，
+# 並以用家正確輸入的里昂 (2-0/4-3) 及馬賽 (2-0/4-3) 記錄交叉驗證 API 可靠性。
+# 修復為一次性：賽果已正確的注單不會被觸碰；修復後值等於真實賽果，不會重複執行。
+# ==========================================================
+DB_SELF_REPAIR_RESULTS = {
+    # ID: (主隊, 客隊, 主入球, 客入球, 半場, 主角球, 客角球, 主紅, 客紅, 主黃, 客黃)
+    'B202611011730180': ('奧格斯堡', '弗賴堡', 1, 2, '1-0', 1, 2, 0, 0, 0, 3),  # 2026-10-31
+    'B202611011730181': ('奧格斯堡', '弗賴堡', 1, 2, '1-0', 1, 2, 0, 0, 0, 3),  # 2026-10-31
+    'B202611011730182': ('奧格斯堡', '弗賴堡', 1, 2, '1-0', 1, 2, 0, 0, 0, 3),  # 2026-10-31
+    'B202611041241340': ('拉素', '卡利亞里', 2, 1, '1-1', 2, 2, 0, 1, 1, 2),  # 2026-11-01
+    'B202611041241341': ('拉素', '卡利亞里', 2, 1, '1-1', 2, 2, 0, 1, 1, 2),  # 2026-11-01
+    'B202611041241342': ('拉素', '卡利亞里', 2, 1, '1-1', 2, 2, 0, 1, 1, 2),  # 2026-11-01
+    'B202611041246560': ('費辛隆尼', '拖連奴', 2, 0, '0-0', 7, 7, 0, 0, 1, 3),  # 2026-11-01
+    'B202611041246561': ('費辛隆尼', '拖連奴', 2, 0, '0-0', 7, 7, 0, 0, 1, 3),  # 2026-11-01
+    'B202611041246562': ('費辛隆尼', '拖連奴', 2, 0, '0-0', 7, 7, 0, 0, 1, 3),  # 2026-11-01
+    'B202611041249420': ('萊切', '熱拿亞', 1, 2, '1-2', 6, 3, 0, 0, 2, 1),  # 2026-11-02
+    'B202611041249421': ('萊切', '熱拿亞', 1, 2, '1-2', 6, 3, 0, 0, 2, 1),  # 2026-11-02
+    'B202611041249422': ('萊切', '熱拿亞', 1, 2, '1-2', 6, 3, 0, 0, 2, 1),  # 2026-11-02
+    'B202611041251520': ('祖雲達斯', '拿玻里', 2, 0, '0-0', 13, 4, 0, 1, 3, 1),  # 2026-11-02
+    'B202611041251521': ('祖雲達斯', '拿玻里', 2, 0, '0-0', 13, 4, 0, 1, 3, 1),  # 2026-11-02
+    'B202611041251522': ('祖雲達斯', '拿玻里', 2, 0, '0-0', 13, 4, 0, 1, 3, 1),  # 2026-11-02
+    'B202611041253430': ('薩斯索羅', '費倫天拿', 2, 4, '1-1', 5, 3, 0, 0, 2, 3),  # 2026-11-03
+    'B202611041253431': ('薩斯索羅', '費倫天拿', 2, 4, '1-1', 5, 3, 0, 0, 2, 3),  # 2026-11-03
+    'B202611041253432': ('薩斯索羅', '費倫天拿', 2, 4, '1-1', 5, 3, 0, 0, 2, 3),  # 2026-11-03
+    'B202611041255380': ('阿特蘭大', '帕爾馬', 0, 3, '0-1', 8, 4, 0, 0, 0, 0),  # 2026-11-03
+    'B202611041255381': ('阿特蘭大', '帕爾馬', 0, 3, '0-1', 8, 4, 0, 0, 0, 0),  # 2026-11-03
+    'B202611041255382': ('阿特蘭大', '帕爾馬', 0, 3, '0-1', 8, 4, 0, 0, 0, 0),  # 2026-11-03
+}
+
+def apply_db_self_repair(df):
+    """V13.1：偵測並修復被全 0 賽果污染的注單 (含重新結算)。
+    只會改動 DB_SELF_REPAIR_RESULTS 內列明的注單；賽果已正確者不受影響。
+    回傳 (df, 修復筆數)。"""
+    if df is None or df.empty or 'ID' not in df.columns:
+        return df, 0
+    df = df.copy()
+    fixed_ids = []
+    for idx, row in df.iterrows():
+        rid = str(row.get('ID'))
+        if rid not in DB_SELF_REPAIR_RESULTS:
+            continue
+        h, a, hg, ag, half, hc, ac, hred, ared, hyel, ayel = DB_SELF_REPAIR_RESULTS[rid]
+        # 防呆：球隊名必須相符，避免誤改同名注單
+        if str(row.get('Home_Team')).strip() != h or str(row.get('Away_Team')).strip() != a:
+            continue
+        # 冪等：賽果已正確 (入球、角球、盈虧標籤全部相符) 則略過
+        try:
+            _cur_ok = (pd.notna(row.get('Home_Goal')) and float(row.get('Home_Goal')) == hg and
+                       pd.notna(row.get('Away_Goal')) and float(row.get('Away_Goal')) == ag and
+                       pd.notna(row.get('Home_Corner')) and float(row.get('Home_Corner')) == hc and
+                       pd.notna(row.get('Away_Corner')) and float(row.get('Away_Corner')) == ac and
+                       str(row.get('Result_Label', '')).strip() not in ('', 'nan', 'None'))
+            if _cur_ok:
+                continue
+        except (TypeError, ValueError):
+            pass
+        # 寫入真實賽果
+        if 'Half_Score' in df.columns and df['Half_Score'].dtype != 'object':
+            df['Half_Score'] = df['Half_Score'].astype('object')
+        df.at[idx, 'Home_Goal'] = hg
+        df.at[idx, 'Away_Goal'] = ag
+        df.at[idx, 'Home_Corner'] = hc
+        df.at[idx, 'Away_Corner'] = ac
+        df.at[idx, 'Home_Red'] = hred
+        df.at[idx, 'Away_Red'] = ared
+        df.at[idx, 'Home_Yellow'] = hyel
+        df.at[idx, 'Away_Yellow'] = ayel
+        df.at[idx, 'Half_Score'] = half
+        # 重新結算 (與結算分頁完全相同的邏輯)
+        try:
+            sp, up, spay, upay, unit, lab, _ = calculate_settlement(
+                row.get('Bet_Type'), row.get('Selection'), row.get('Initial_Line'),
+                row.get('Initial_Odds'), row.get('System_Stake'), row.get('User_Stake'),
+                hg, ag, hc, ac)
+            df.at[idx, 'Result_Label'] = lab
+            df.at[idx, 'System_Profit'] = sp
+            df.at[idx, 'User_Profit'] = up
+            df.at[idx, 'System_Payout'] = spay
+            df.at[idx, 'User_Payout'] = upay
+            df.at[idx, 'Unit_Profit'] = unit
+        except (TypeError, ValueError):
+            pass
+        fixed_ids.append(rid)
+    return df, len(fixed_ids)
+
 def display_cumulative_metrics(df):
     sys_profit = pd.to_numeric(df['System_Profit'], errors='coerce').sum()
     user_profit = pd.to_numeric(df['User_Profit'], errors='coerce').sum()
@@ -6225,6 +6314,17 @@ def main():
         st.session_state.df_db = load_db(db_file, DB_COLUMNS, db_table)
     else:
         st.session_state.df_db = enforce_columns(st.session_state.df_db, DB_COLUMNS)
+
+    # --- V13.1 數據庫自動修復：偵測被全 0 賽果污染的注單並即時修復 + 雲端同步 ---
+    # (2026-11-04 結算輸入欄 bug 產生的錯誤數據；修復一次後不會再觸發)
+    _rep_df, _rep_n = apply_db_self_repair(st.session_state.df_db)
+    if _rep_n > 0:
+        st.session_state.df_db = _rep_df
+        save_db(_rep_df, db_file, db_table)
+        st.success(f"🔧 V13.1 已自動修復 {_rep_n} 筆被全 0 賽果污染的注單 (真實賽果經 Tipsme 核實)，"
+                   f"並已同步至雲端資料庫。下載的 Excel 報表亦會自動反映正確數據。")
+        st.toast(f"🔧 已自動修復 {_rep_n} 筆錯誤賽果注單", icon="✅")
+
     if 'df_cap' not in st.session_state:
         st.session_state.df_cap = load_db(capital_file, CAPITAL_COLUMNS, cap_table)
 
