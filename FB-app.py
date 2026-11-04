@@ -4826,7 +4826,7 @@ def tipsme_form_from_matches(matches, before_date, n=5):
         r = str(m.get('matchResult', '')).strip()
         if r == '勝':
             w += 1
-        elif r == '和':
+        elif r in ('和', '平'):  # Tipsme 對部份賽事 (如友誼賽) 的和局會標示「平」
             d_ += 1
         elif r == '負':
             l += 1
@@ -4852,7 +4852,7 @@ def tipsme_form_details(matches, before_date, n=10):
             'away': str(m.get('awayTeam') or ''),
             'score': str(m.get('score') or ''),
             'half': str(m.get('halfScore') or ''),
-            'result': str(m.get('matchResult') or ''),
+            'result': str(m.get('matchResult') or '').replace('平', '和'),
             'cap': str(m.get('hdpCap') or ''),
             'hdp': str(m.get('hdpResult') or ''),
             'hilo': str(m.get('hiloResult') or ''),
@@ -4999,6 +4999,8 @@ def _tipsme_add_market(rows_out, btype, recs, line_fn, up_fn, lw_fn, max_tail=0)
     rows = []
     for r in recs or []:
         t = _tipsme_iso_time(r.get('create_time'))
+        if t is not None:
+            t = t + timedelta(hours=8)  # API 為 UTC，轉香港時間顯示 (與 Tipsme 網站一致)
         line = line_fn(r)
         try:
             up, lw = float(up_fn(r)), float(lw_fn(r))
@@ -5124,6 +5126,7 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams):
             st.session_state[txt_key] = name
     # --- 5. 近況、對賽往總、聯賽積分 (h2h 頁面；讀取失敗則保留手動輸入) ---
     form_ok = False
+    rank_source = {'h': None, 'a': None}
     h2h = tipsme_fetch_h2h(mid)
     before = info['kickoff'].date() if info['kickoff'] is not None else None
     ctx = {}
@@ -5151,20 +5154,26 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams):
         a_rank_asof = _tipsme_league_rank(h2h['away_league'])
         if h_rank_asof:
             st.session_state['h_rank'] = h_rank_asof
+            rank_source['h'] = 'asof'
         elif info.get('home_rank'):
             st.session_state['h_rank'] = int(info['home_rank'])
+            rank_source['h'] = 'current'
             warnings.append("主隊排名未能從比賽當天積分表取得，已改用最新排名，請核對。")
         if a_rank_asof:
             st.session_state['a_rank'] = a_rank_asof
+            rank_source['a'] = 'asof'
         elif info.get('away_rank'):
             st.session_state['a_rank'] = int(info['away_rank'])
+            rank_source['a'] = 'current'
             warnings.append("客隊排名未能從比賽當天積分表取得，已改用最新排名，請核對。")
     else:
         # h2h 頁讀取失敗：退回最新排名
         if info.get('home_rank'):
             st.session_state['h_rank'] = int(info['home_rank'])
+            rank_source['h'] = 'current'
         if info.get('away_rank'):
             st.session_state['a_rank'] = int(info['away_rank'])
+            rank_source['a'] = 'current'
         warnings.append("近況資料頁面讀取失敗，近 5 場狀態及比賽當天排名請手動核對輸入。")
     # --- 6. 盤口賠率 (馬會全部玩法 + 其他莊家比較) ---
     odds_ok = False
@@ -5184,9 +5193,12 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams):
             if had_recs:
                 bk = ctx.get('Bookmaker_Odds') if isinstance(ctx.get('Bookmaker_Odds'), dict) else None
                 bk = bk or {'updated': '', 'hdp': [], 'hilo': [], 'had': []}
-                bk['hkjc_had'] = [{'time': str(r.get('create_time') or ''),
-                                   'h': r.get('home_win_odds'), 'd': r.get('draw_win_odds'), 'a': r.get('away_win_odds')}
-                                  for r in had_recs[-8:]]
+                bk['hkjc_had'] = []
+                for r in had_recs[-8:]:
+                    t = _tipsme_iso_time(r.get('create_time'))
+                    ts = (t + timedelta(hours=8)).strftime('%m-%d %H:%M') if t is not None else str(r.get('create_time') or '')
+                    bk['hkjc_had'].append({'time': ts,
+                                           'h': r.get('home_win_odds'), 'd': r.get('draw_win_odds'), 'a': r.get('away_win_odds')})
                 ctx['Bookmaker_Odds'] = bk
         else:
             warnings.append("馬會賠率紀錄讀取成功但沒有有效盤口 (可能尚未開盤)。")
@@ -5214,6 +5226,8 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams):
 
     fill_data = {'info': info, 'form_ok': form_ok, 'odds_ok': odds_ok, 'bk_ok': bk_ok,
                  'extra_hist': extra_hist, 'warnings': warnings, 'ctx': ctx,
+                 'h_rank': st.session_state.get('h_rank'), 'a_rank': st.session_state.get('a_rank'),
+                 'rank_source': rank_source,
                  'core_count': len(st.session_state.odds_history) if odds_ok else 0}
     st.session_state['tipsme_fill_data'] = fill_data
     st.session_state['tipsme_fill_mid'] = mid
@@ -5261,11 +5275,17 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
             st.success(f"✅ 已自動填充：**{info['home']} vs {info['away']}** ({info['league']})"
                        f"{(' | 比賽時間 ' + info['kickoff'].strftime('%Y-%m-%d %H:%M')) if info['kickoff'] else ''}")
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("主隊排名 (比賽當天)", info.get('home_rank') or '-')
-            m2.metric("客隊排名 (比賽當天)", info.get('away_rank') or '-')
+            _rs = fd.get('rank_source') or {}
+            _h_lab = "主隊排名（比賽當天）" if _rs.get('h') == 'asof' else "主隊排名（最新）"
+            _a_lab = "客隊排名（比賽當天）" if _rs.get('a') == 'asof' else "客隊排名（最新）"
+            m1.metric(_h_lab, fd.get('h_rank') or info.get('home_rank') or '-')
+            m2.metric(_a_lab, fd.get('a_rank') or info.get('away_rank') or '-')
             m3.metric("近5場狀態", "已填充" if fd['form_ok'] else "請手動輸入")
             m4.metric("盤口紀錄數", f"{fd['core_count']} 筆")
-            st.caption("ℹ️ 排名已改為使用「比賽當天」的聯賽積分表排名 (對賽往績頁)，而非最新排名，輸入兩個月前的比賽也會正確。")
+            if _rs.get('h') == 'asof' or _rs.get('a') == 'asof':
+                st.caption("ℹ️ 排名已使用「比賽當天」的聯賽積分表排名 (對賽往績頁)，而非最新排名，輸入兩個月前的比賽也會正確。")
+            elif _rs.get('h') == 'current' or _rs.get('a') == 'current':
+                st.caption("⚠️ 未能取得比賽當天積分表，排名使用最新排名，請核對上方表格數字是否正確。")
             if fd['odds_ok']:
                 st.caption("✅ 馬會讓球 / 入球大小 / 角球大小賠率變化已填入下方「賽前盤口與賠率走勢紀錄」，請核對。")
             ctx = fd.get('ctx') or {}
