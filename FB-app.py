@@ -7439,6 +7439,10 @@ def main():
                             _sinfo = tipsme_fetch_match_info(_mid_s)
                             if _sinfo and _sinfo.get('finished') and _sinfo.get('score'):
                                 st.session_state['tipsme_settle_data'] = _sinfo
+                                # 標記「剛讀取」：下一次渲染時把賽果直接寫入輸入欄位
+                                # (Streamlit widget 一旦建立，改 value= 預設值不會更新顯示，
+                                #  必須直接寫入 st.session_state[widget_key]，否則輸入欄會停留在 0)
+                                st.session_state['tipsme_settle_apply'] = True
                                 st.toast("✅ 已讀取賽果，請核對下方數值。", icon="🔗")
                                 st.rerun()
                             else:
@@ -7458,9 +7462,10 @@ def main():
                 # V12：若自動讀取的賽果屬於這場比賽，以它作預設值 (核對後可直接結算)
                 _ts_auto = st.session_state.get('tipsme_settle_data')
                 _ts_use = None
+                _apply_now = False  # V13.1：剛讀取賽果後的第一次渲染 (輸入欄不帶 value=，避免 Streamlit 警告)
                 if _ts_auto and ' vs ' in str(sel_match):
                     _ts_home, _ts_away = str(sel_match).split(' vs ', 1)
-                    if str(_ts_auto.get('home')) == _ts_home and str(_ts_auto.get('away')) == _ts_away:
+                    if str(_ts_auto.get('home')).strip() == _ts_home.strip() and str(_ts_auto.get('away')).strip() == _ts_away.strip():
                         _ts_use = _ts_auto
                 _def_hred, _def_ared = 0, 0
                 _def_hyel, _def_ayel = 0, 0
@@ -7477,7 +7482,25 @@ def main():
                     _def_hyel = int(_ts_use.get('home_yellow') or 0)
                     _def_ayel = int(_ts_use.get('away_yellow') or 0)
                     _def_half = str(_ts_use.get('half_score') or '')
+                    # V13.1 修正：Streamlit widget 一旦建立，只改 value= 預設值不會更新輸入欄顯示，
+                    # 導致「讀取賽果」後輸入欄仍停留在 0、結算時寫入全 0 的嚴重數據錯誤。
+                    # 修正：剛讀取賽果後的第一次渲染，直接把數值寫入各輸入欄的 session_state，
+                    # 令輸入欄即時顯示自動讀取的賽果 (只寫一次，不會覆蓋用家其後的手動修改)。
+                    if st.session_state.get('tipsme_settle_apply'):
+                        st.session_state.pop('tipsme_settle_apply', None)
+                        _apply_now = True
+                        _wk = lambda s: f"{s}_{sel_tourn}_{sel_match}_{sel_md}"
+                        if _t_hg is not None: st.session_state[_wk('shg')] = int(_t_hg)
+                        if _t_ag is not None: st.session_state[_wk('sag')] = int(_t_ag)
+                        if _t_hc is not None: st.session_state[_wk('shc')] = int(_t_hc)
+                        if _t_ac is not None: st.session_state[_wk('sac')] = int(_t_ac)
+                        st.session_state[_wk('shred')] = _def_hred
+                        st.session_state[_wk('sared')] = _def_ared
+                        st.session_state[_wk('syel')] = _def_hyel
+                        st.session_state[_wk('sayel')] = _def_ayel
+                        st.session_state[_wk('shalf')] = _def_half
                 else:
+                    st.session_state.pop('tipsme_settle_apply', None)
                     _r = pd.to_numeric(target_bets['Home_Red'], errors='coerce').max()
                     _def_hred = 0 if pd.isna(_r) else int(_r)
                     _r = pd.to_numeric(target_bets['Away_Red'], errors='coerce').max()
@@ -7492,18 +7515,27 @@ def main():
                             _def_half = str(_hs.iloc[-1])
                 
                 c_sg1, c_sg2, c_sc1, c_sc2 = st.columns(4)
-                settle_hg = c_sg1.number_input("結算: 主隊入球", 0, 50, s_hg_val, key=f"shg_{sel_tourn}_{sel_match}_{sel_md}")
-                settle_ag = c_sg2.number_input("結算: 客隊入球", 0, 50, s_ag_val, key=f"sag_{sel_tourn}_{sel_match}_{sel_md}")
-                settle_hc = c_sc1.number_input("結算: 主隊角球", 0, 50, s_hc_val, key=f"shc_{sel_tourn}_{sel_match}_{sel_md}")
-                settle_ac = c_sc2.number_input("結算: 客隊角球", 0, 50, s_ac_val, key=f"sac_{sel_tourn}_{sel_match}_{sel_md}")
+                # V13.1：剛讀取賽果的第一次渲染不帶 value= (session_state 已直接寫入數值；
+                # 若同時帶 value= 會觸發 Streamlit「預設值與 Session State 衝突」警告)
+                def _sn(_col, _label, _mx, _dflt, _key):
+                    if _apply_now:
+                        return _col.number_input(_label, 0, _mx, key=_key)
+                    return _col.number_input(_label, 0, _mx, _dflt, key=_key)
+                settle_hg = _sn(c_sg1, "結算: 主隊入球", 50, s_hg_val, f"shg_{sel_tourn}_{sel_match}_{sel_md}")
+                settle_ag = _sn(c_sg2, "結算: 客隊入球", 50, s_ag_val, f"sag_{sel_tourn}_{sel_match}_{sel_md}")
+                settle_hc = _sn(c_sc1, "結算: 主隊角球", 50, s_hc_val, f"shc_{sel_tourn}_{sel_match}_{sel_md}")
+                settle_ac = _sn(c_sc2, "結算: 客隊角球", 50, s_ac_val, f"sac_{sel_tourn}_{sel_match}_{sel_md}")
                 
                 # V12：紅黃牌及半場比分 (自動讀取或手動輸入；結算時一併寫入注單紀錄)
                 c_sr1, c_sr2, c_sy1, c_sy2 = st.columns(4)
-                settle_hred = c_sr1.number_input("結算: 主隊紅牌", 0, 10, _def_hred, key=f"shred_{sel_tourn}_{sel_match}_{sel_md}")
-                settle_ared = c_sr2.number_input("結算: 客隊紅牌", 0, 10, _def_ared, key=f"sared_{sel_tourn}_{sel_match}_{sel_md}")
-                settle_hyel = c_sy1.number_input("結算: 主隊黃牌", 0, 20, _def_hyel, key=f"syel_{sel_tourn}_{sel_match}_{sel_md}")
-                settle_ayel = c_sy2.number_input("結算: 客隊黃牌", 0, 20, _def_ayel, key=f"sayel_{sel_tourn}_{sel_match}_{sel_md}")
-                settle_half = st.text_input("結算: 半場比分 (例如 1-1，選填)", value=_def_half, key=f"shalf_{sel_tourn}_{sel_match}_{sel_md}")
+                settle_hred = _sn(c_sr1, "結算: 主隊紅牌", 10, _def_hred, f"shred_{sel_tourn}_{sel_match}_{sel_md}")
+                settle_ared = _sn(c_sr2, "結算: 客隊紅牌", 10, _def_ared, f"sared_{sel_tourn}_{sel_match}_{sel_md}")
+                settle_hyel = _sn(c_sy1, "結算: 主隊黃牌", 20, _def_hyel, f"syel_{sel_tourn}_{sel_match}_{sel_md}")
+                settle_ayel = _sn(c_sy2, "結算: 客隊黃牌", 20, _def_ayel, f"sayel_{sel_tourn}_{sel_match}_{sel_md}")
+                if _apply_now:
+                    settle_half = st.text_input("結算: 半場比分 (例如 1-1，選填)", key=f"shalf_{sel_tourn}_{sel_match}_{sel_md}")
+                else:
+                    settle_half = st.text_input("結算: 半場比分 (例如 1-1，選填)", value=_def_half, key=f"shalf_{sel_tourn}_{sel_match}_{sel_md}")
                 
                 if _ts_use:
                     st.info(f"🔗 已由 Tipsme 自動填入賽果：全場 {_ts_use.get('score')}、半場 {_ts_use.get('half_score') or '-'}、"
@@ -7511,6 +7543,14 @@ def main():
                             f"黃牌 {_ts_use.get('home_yellow') or 0}-{_ts_use.get('away_yellow') or 0}。請核對後按結算。")
                 
                 if st.button("⚖️ 確定結算此賽事所有注單", type="primary", use_container_width=True):
+                    # V13.1 防呆：若已自動讀取賽果但輸入欄全部為 0 (讀取失敗或未核對)，
+                    # 阻止結算，避免全 0 賽果污染數據庫
+                    if _ts_use and settle_hg == 0 and settle_ag == 0 and settle_hc == 0 and settle_ac == 0:
+                        _fh, _fa = _tipsme_score_pair(_ts_use.get('score'))
+                        if _fh is not None and (int(_fh) + int(_fa)) > 0:
+                            st.error(f"⚠️ 輸入的全場入球及角球全部為 0，但已讀取的 Tipsme 賽果為 {_ts_use.get('score')} "
+                                     f"(角球 {_ts_use.get('corner')})。請核對上方輸入欄數值後再結算。")
+                            st.stop()
                     mask = v10_match_mask(st.session_state.df_db, sel_tourn, sel_match, sel_md) & (st.session_state.df_db['Status'] == 'Open')
                     idx_to_settle = st.session_state.df_db[mask].index
                     
