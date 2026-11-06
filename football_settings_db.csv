@@ -1,5 +1,5 @@
 Key,Value
-v9_min_ev,0.0
+v9_min_ev,0.5
 v9_kelly,0.1
 v9_max_pct,0.5
 v9_max_picks,1
@@ -7,9 +7,9 @@ v9_hd_min200,False
 v9_override_gate,False
 v10_mode,🛡 自動 (只用已驗證策略)
 v11_new_league_paper,True
-v11_league_breaker,False
+v11_league_breaker,True
 v11_migrated,True
-v11_auto_sys,False
+v11_auto_sys,True
 LS|亞冠二級聯賽,32
 LS|日本聯賽盃,40
 LS|南韓職業聯賽,12
