@@ -1546,8 +1546,10 @@ def v9_build_match_table(df_settled):
     return mt.sort_values('date').reset_index(drop=True)
 
 
+@st.cache_data(max_entries=4, show_spinner=False)
 def v9_find_duplicate_matches(df_db):
-    """找出同一對賽在不同日期、但賽果完全相同的比賽 (可能是舊版即場更新把兩場比賽一起覆蓋所致)，供資料檢查"""
+    """找出同一對賽在不同日期、但賽果完全相同的比賽 (可能是舊版即場更新把兩場比賽一起覆蓋所致)，供資料檢查
+    (V13.1 效能修正：此掃描每次重新渲染都會執行，改為快取)"""
     try:
         d = df_db[df_db['Status'] == 'Settled'].copy()
         if d.empty:
@@ -1883,22 +1885,52 @@ def v9_train_engine(df_settled):
         if run_ctx is not None:
             run_ctx.__enter__()
         # --- 1) 特徵組合搜尋 (市場賠率為必選錨點 + 其餘群組任意組合，LR 快速評估) ---
+        # V13.1 效能修正：舊版逐一測試全部 2^8-1 = 255 個群組組合 (指數級，數據越多越慢)，
+        # 改為貪婪前進式選擇：由「市場賠率」出發，每輪只評估「現有組合 + 每個未用群組」，
+        # 加入最能降低樣本外 Log-Loss 的群組後重複，無法改善即停止 (≤36 次評估，速度提升約 85%)。
+        # 每輪評估的組合全部記錄，結果與舊版原則一致 (簡約優先)。
         other = [g for g in V9_FEATURE_GROUPS if g != '市場賠率']
         valid_mask = None
         combos = []
-        for k in range(0, len(other) + 1):
-            for comb in itertools.combinations(other, k):
-                if '因素交互' in comb and len(comb) == 1:
-                    continue
-                groups = ['市場賠率'] + list(comb)
-                cols = [c for g in groups for c in V9_FEATURE_GROUPS[g]]
-                p = v9_walk_forward(ts, cols, 'LR', folds)
-                if valid_mask is None:
-                    valid_mask = p.notna()
-                m = valid_mask & p.notna()
-                if m.sum() < 50:
-                    continue
-                combos.append({'groups': groups, 'cols': cols, 'll': v9_soft_logloss(p[m], ts.loc[m, 'e']), 'n': int(m.sum())})
+        _eval_state = {'vm': None}
+
+        def _eval_groups(groups):
+            cols = [c for g in groups for c in V9_FEATURE_GROUPS[g]]
+            p = v9_walk_forward(ts, cols, 'LR', folds)
+            vm = _eval_state['vm']
+            if vm is None:
+                vm = p.notna()
+                _eval_state['vm'] = vm
+            m = vm & p.notna()
+            if m.sum() < 50:
+                return None
+            return {'groups': list(groups), 'cols': cols, 'll': v9_soft_logloss(p[m], ts.loc[m, 'e']), 'n': int(m.sum())}
+
+        cur_groups = ['市場賠率']
+        base = _eval_groups(cur_groups)
+        if base is None:
+            out['msg'] = '前進式驗證樣本不足。'
+            return out
+        combos.append(base)
+        remaining = list(other)
+        while remaining:
+            cands = []
+            for g in remaining:
+                r = _eval_groups(cur_groups + [g])
+                if r is not None:
+                    cands.append(r)
+                    combos.append(r)
+            if not cands:
+                break
+            best = min(cands, key=lambda c: c['ll'])
+            cur_ll = [c for c in combos if c['groups'] == cur_groups]
+            cur_ll = cur_ll[-1]['ll'] if cur_ll else 1e9
+            if best['ll'] < cur_ll - 1e-9:
+                cur_groups = best['groups']
+                remaining = [g for g in remaining if g not in cur_groups]
+            else:
+                break
+        valid_mask = _eval_state['vm']
         if not combos or valid_mask is None or valid_mask.sum() < 50:
             out['msg'] = '前進式驗證樣本不足。'
             return out
@@ -1969,6 +2001,13 @@ def v9_train_engine(df_settled):
             bt_type.setdefault(bt, {})['all'] = {'n': int(len(sub)), 'roi': float(sub['ret'].mean()) if len(sub) else 0.0}
         out['bt_table'] = bt_rows
         out['bt_type'] = bt_type
+        # V13.1 診斷資訊：樣本外最高 EV — 解釋為何 EV 門檻篩選不到注單
+        out['max_ev'] = float(oof['ev'].max()) if len(oof) else None
+        out['mean_ev'] = float(oof['ev'].mean()) if len(oof) else None
+        if all(r['回測注數'] == 0 for r in bt_rows) and out['max_ev'] is not None:
+            out['_zero_diag'] = (f" 回測診斷：樣本外最高 EV 僅 {out['max_ev']*100:.1f}% (平均 {out['mean_ev']*100:.1f}%)，"
+                                 f"低於最低門檻 {V9_BT_THRESHOLDS[1]*100:.0f}%，所以 EV 篩選不到注單 — "
+                                 f"模型的邊際優勢尚未足以克服莊家水位，屬正常保護行為 (建議少注)，並非運算錯誤。")
         # --- 5) 以全部數據擬合最終模型 ---
         models = {}
         if best_w > 0:
@@ -1990,6 +2029,8 @@ def v9_train_engine(df_settled):
             out['msg'] = f"模型 ({best_kind}) 樣本外表現優於市場，市場錨定權重 w = {best_w:.1f}。"
         else:
             out['msg'] = "目前所有特徵組合的樣本外表現均未能穩定勝過市場賠率 → 系統以市場公平機率為準 (w = 0)，EV 會偏負，系統將建議少注或不注，以保護本金。"
+        if out.get('_zero_diag'):
+            out['msg'] += out.pop('_zero_diag')
         return out
     finally:
         if run_ctx is not None:
@@ -2034,7 +2075,7 @@ def v9_type_gate(engine, bt, thr, allow_override=False):
     return True, ''
 
 
-def v9_engine_input(df_settled):
+def _v9_engine_input_impl(df_settled):
     cols = ['ID', 'Date', 'Match', 'Match_Date', 'Tournament_Name', 'Tournament_Category', 'Home_Team', 'Away_Team', 'Home_Rating', 'Away_Rating', 'League_Size',
             'Home_Form', 'Away_Form', 'Bet_Type', 'Odds_History', 'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner',
             'Home_SoT', 'Away_SoT', 'Home_SoFF', 'Away_SoFF', 'Home_DA', 'Away_DA']
@@ -2054,6 +2095,17 @@ def v9_engine_input(df_settled):
     _fill = d['Tournament_Name'].map(lambda t: V11_DEFAULT_LEAGUE_SIZES.get(t) if t is not None else None)
     d['League_Size'] = _ls.where(_ls.notna(), pd.to_numeric(_fill, errors='coerce'))
     return d.reset_index(drop=True)
+
+
+@st.cache_data(max_entries=4, show_spinner=False)
+def _v9_engine_input_cached(df_settled):
+    """V13.1 效能修正：資料量增加後，此轉換在每次重新渲染都會被 V9/V10/擂台三處重複執行，改為快取"""
+    return _v9_engine_input_impl(df_settled)
+
+
+def v9_engine_input(df_settled):
+    # 回傳副本，避免快取物件被下游修改污染
+    return _v9_engine_input_cached(df_settled).copy()
 
 
 @st.cache_data(max_entries=8, show_spinner="🧠 V9 引擎訓練中：重建全盤口樣本、特徵組合搜尋、前進式回測 (首次較慢，完成後自動快取)...")
@@ -3883,7 +3935,8 @@ def render_v11_arena_panel():
         return
     st.markdown("##### 🏟 整體比較 (同一測試期、完全樣本外：每一折只用之前日期訓練，再預測之後日期)")
     st.dataframe(pd.DataFrame(ar['summary']), use_container_width=True, hide_index=True)
-    st.caption("95% 誤差範圍：例如 ROI −2% ±8% 代表真實回報可能在 −10% 至 +6% 之間，數百注的結果仍有很大運氣成分。"
+    st.caption("V9 市場錨定機器學習若顯示 0 注：代表模型樣本外最高 EV 未達門檻 (模型優勢未足以克服莊家水位)，屬正常保護行為，詳情請看「🤖 全局模型 → 📉 V9 前進式回測」的診斷說明。"
+               "95% 誤差範圍：例如 ROI −2% ±8% 代表真實回報可能在 −10% 至 +6% 之間，數百注的結果仍有很大運氣成分。"
                "「前半段 / 後半段」把測試期分成兩半，真正有效的策略兩段都應該賺錢。")
     st.markdown("##### 🎯 各盤口類型 (✅ = 通過驗證，自動模式會實際落注)")
     st.dataframe(pd.DataFrame(ar['by_type']), use_container_width=True, hide_index=True)
@@ -6276,6 +6329,21 @@ def render_dl_ml_analysis_section(df_settled):
 # ==========================================
 def main():
     st.title("⚽ Actuarial and fund management system by Dr. EdwinPro")
+    
+    # V13.1：凍結主分頁列 (sticky tabs) — 捲動到最底時分頁永遠顯示在頁面頂部，方便快速切換
+    # (已於 Streamlit 1.66 實測：頂部工具列高 60px，分頁列固定在其下方；巢狀分頁不凍結以免互相重疊)
+    st.markdown("""<style>
+[data-testid="stTabs"] > div > div:not([data-testid="stTabPanel"]) {
+    position: sticky !important;
+    top: 60px !important;
+    z-index: 999;
+    background-color: var(--background-color);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+}
+[data-testid="stTabPanel"] [data-testid="stTabs"] > div > div:not([data-testid="stTabPanel"]) {
+    position: static !important;
+}
+</style>""", unsafe_allow_html=True)
     
     if 'undo_stack' not in st.session_state:
         st.session_state.undo_stack = []
