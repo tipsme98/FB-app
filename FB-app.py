@@ -505,6 +505,139 @@ def compute_bet_clv(r):
         return None
 
 
+def merge_odds_history_snapshots(existing_json, new_snaps):
+    """把新的賠率快照合併入既有 Odds_History (只增不刪，依時間重排)。
+    回傳 (新 JSON 字串, 新增數目)；完全相同 (類型/盤口線/時間/賠率) 的快照會被略過，
+    因此重複貼上鏈結不會產生重複快照 ( 冪等 )。"""
+    try:
+        raw = str(existing_json) if pd.notna(existing_json) else ''
+    except Exception:
+        raw = ''
+    try:
+        oh = json.loads(raw) if raw.strip() else []
+        if not isinstance(oh, list):
+            oh = []
+    except Exception:
+        oh = []
+    def _key(h):
+        return (str(h.get('type', '')), round(float(h.get('line', 0.0)), 3),
+                str(h.get('record_time', '')), round(float(h.get('upper', 0.0)), 2),
+                round(float(h.get('lower', 0.0)), 2))
+    have = set()
+    for h in oh:
+        try:
+            have.add(_key(h))
+        except (TypeError, ValueError):
+            continue
+    added = 0
+    for s in new_snaps:
+        try:
+            k = _key(s)
+        except (TypeError, ValueError):
+            continue
+        if k in have:
+            continue
+        oh.append(dict(s))
+        have.add(k)
+        added += 1
+    # 依時間重排 (無時間的排最前)，確保「最後一個快照」= 最新收盤價
+    order = list(range(len(oh)))
+    oh_sorted = [x for _, x in sorted(zip(order, oh), key=lambda p: (_oh_sort_ts(p[1], p[0]), p[0]))]
+    for i, h in enumerate(oh_sorted):
+        h['id'] = i
+    return json.dumps(oh_sorted, ensure_ascii=False), added
+
+def clv_apply_closing_odds(df, core_hist, home, away, kickoff=None):
+    """把 core_hist 的賽前快照合併到 df 中同一場比賽的賽前注單 (只增不刪、冪等)。
+    回傳 (更新注單 list of (ID, 盤口類型, 方向, 新增數), 新增快照總數)。直接修改 df。"""
+    def _norm(s):
+        return re.sub(r'[\s\-_·•]', '', str(s or ''))
+    h_n, a_n = _norm(home), _norm(away)
+    ko_date = None
+    if kickoff is not None:
+        try:
+            ko_date = pd.Timestamp(kickoff).date()
+        except Exception:
+            ko_date = None
+    updated_rows, total_added = [], 0
+    for idx, r in df.iterrows():
+        if str(r.get('ID', '')).startswith('TOTAL'):
+            continue
+        if '即場' in str(r.get('Bet_Type', '')):
+            continue
+        if _norm(r.get('Home_Team')) != h_n or _norm(r.get('Away_Team')) != a_n:
+            continue
+        # 有齊雙方日期時才核對：比賽日期與開賽日期相差超過 1 天即視為另一場
+        if ko_date is not None and not is_missing_match_date(r.get('Match_Date')):
+            try:
+                md = pd.Timestamp(r.get('Match_Date')).date()
+                if abs((md - ko_date).days) > 1:
+                    continue
+            except Exception:
+                pass
+        new_json, added = merge_odds_history_snapshots(r.get('Odds_History'), core_hist)
+        if added > 0:
+            df.at[idx, 'Odds_History'] = new_json
+            updated_rows.append((str(r.get('ID', '')), str(r.get('Bet_Type', '')),
+                                 str(r.get('Selection', '')), added))
+            total_added += added
+    return updated_rows, total_added
+
+def render_clv_closing_updater(db_file, db_table):
+    """更新收盤價工具：貼上 Tipsme 鏈結 → 讀取馬會最新盤口賠率 → 自動合併到
+    同一場比賽賽前注單的 Odds_History (只增不刪)，以最後一個快照作為收盤價計算 CLV。"""
+    st.markdown("#### 🔄 更新收盤價 (貼上 Tipsme 鏈結)")
+    st.caption("下注後、開賽前貼上該場比賽的 Tipsme 鏈結，系統會自動讀取馬會最新的盤口及賠率變化，"
+               "合併到資料庫中同一場比賽的賽前注單 (只增不刪，不會動其他欄位)，"
+               "並以最後一個快照作為收盤價計算 CLV。可於開賽前不同時間重複貼上，"
+               "系統會累積多個快照，收盤價取最後一個；重複貼上不會產生重複紀錄。")
+    link = st.text_input("Tipsme 比賽鏈結", key="clv_close_link",
+                         placeholder="例如 https://tipsme.hk/zh-HK/match/114973/h2h")
+    if not st.button("🔄 讀取並更新收盤價", key="clv_close_btn", type="primary", use_container_width=True):
+        return
+    if not link.strip():
+        st.warning("請先貼上 Tipsme 比賽鏈結。")
+        return
+    mid = tipsme_match_id_from_url(link)
+    if not mid:
+        st.error("無法辨認鏈結：請貼上 tipsme.hk 的比賽鏈結 (例如 https://tipsme.hk/zh-HK/match/114973/h2h)。")
+        return
+    info = tipsme_fetch_match_info(mid)
+    if not info:
+        st.error("讀取比賽資料失敗 (網絡或網站問題)，請稍後再試。")
+        return
+    api_odds = tipsme_fetch_hkjc_odds(mid)
+    if not api_odds:
+        st.error("馬會賠率紀錄讀取失敗 (網絡問題)，請稍後再試。")
+        return
+    core_hist, _extra = tipsme_build_odds_history(api_odds)
+    if not core_hist:
+        st.error("這場比賽沒有可用的馬會盤口紀錄 (可能尚未開盤)。")
+        return
+    # --- 找出同一場比賽的賽前注單並合併快照 (共用結算流程同一邏輯) ---
+    df = st.session_state.df_db
+    updated_rows, total_added = clv_apply_closing_odds(
+        df, core_hist, info.get('home'), info.get('away'), info.get('kickoff'))
+    if not updated_rows:
+        st.warning(f"資料庫中找不到這場比賽 ({info.get('home')} vs {info.get('away')}) 的賽前注單，"
+                   "或注單已記錄全部快照。請確認注單已儲存，或先在「📝 賽前建檔與投注」建立注單。")
+        return
+    save_db(df, db_file, db_table)
+    st.success(f"✅ 已更新 {len(updated_rows)} 張注單，共新增 {total_added} 個賽前快照，並已同步雲端數據庫。"
+               "最新快照將作為收盤價，CLV 追蹤面板 (見下方) 會即時反映。")
+    disp = pd.DataFrame(updated_rows, columns=['注單 ID', '盤口類型', '方向', '新增快照'])
+    st.dataframe(disp, use_container_width=True, hide_index=True)
+    # 顯示各核心盤口的最新快照 (= 收盤價)
+    latest = {}
+    for s in core_hist:
+        latest[str(s.get('type'))] = s
+    rows = [{'盤口類型': bt, '盤口線': s.get('line'), '主/大賠率': s.get('upper'),
+             '客/小賠率': s.get('lower'), '快照時間': s.get('record_time')}
+            for bt, s in latest.items()]
+    if rows:
+        st.markdown("**最新快照 (將作為收盤價)**")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
 def render_clv_section(df_settled):
     """CLV (收盤線價值) 追蹤面板：以數據庫既有欄位即時計算，不改動資料庫 Schema"""
     st.markdown("#### 🎯 CLV (收盤線價值) 追蹤")
@@ -7596,7 +7729,8 @@ def main():
                 st.dataframe(target_bets[['ID', 'Date', 'Match_Date', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 'System_Stake', 'User_Stake']], use_container_width=True)
                 
                 # V12：貼上 Tipsme 鏈結自動讀取賽果 (全場比數 / 半場比分 / 角球 / 紅黃牌)
-                with st.expander("🔗 貼上 Tipsme 鏈結自動讀取賽果 (比數 / 半場 / 角球 / 紅黃牌)", expanded=False):
+                # V13.2：同一時間自動讀取最新盤口賠率並合併到該場注單 (收盤價)，CLV 即時可計算
+                with st.expander("🔗 貼上 Tipsme 鏈結自動讀取賽果 (比數 / 半場 / 角球 / 紅黃牌 / 收盤價)", expanded=False):
                     settle_link = st.text_input("Tipsme 比賽鏈結", key="tipsme_settle_link",
                                                  placeholder="https://tipsme.hk/zh-HK/match/114973/h2h")
                     if st.button("🔗 讀取賽果並填入", key="tipsme_settle_btn", use_container_width=True):
@@ -7607,6 +7741,20 @@ def main():
                             _sinfo = tipsme_fetch_match_info(_mid_s)
                             if _sinfo and _sinfo.get('finished') and _sinfo.get('score'):
                                 st.session_state['tipsme_settle_data'] = _sinfo
+                                # V13.2：讀取賽果同時自動更新收盤價 (合併該場最新盤口賠率到注單的賠率走勢表；
+                                # 只增不刪、冪等，失敗不影響賽果讀取)
+                                try:
+                                    _api_odds_s = tipsme_fetch_hkjc_odds(_mid_s)
+                                    _core_s, _ = tipsme_build_odds_history(_api_odds_s) if _api_odds_s else ([], [])
+                                    if _core_s:
+                                        _upd_s, _add_s = clv_apply_closing_odds(
+                                            st.session_state.df_db, _core_s,
+                                            _sinfo.get('home'), _sinfo.get('away'), _sinfo.get('kickoff'))
+                                        if _add_s > 0:
+                                            save_db(st.session_state.df_db, db_file, db_table)
+                                            st.toast(f"🎯 已同時更新收盤價：{len(_upd_s)} 張注單共新增 {_add_s} 個快照", icon="🎯")
+                                except Exception:
+                                    pass
                                 # 標記「剛讀取」：下一次渲染時把賽果直接寫入輸入欄位
                                 # (Streamlit widget 一旦建立，改 value= 預設值不會更新顯示，
                                 #  必須直接寫入 st.session_state[widget_key]，否則輸入欄會停留在 0)
@@ -7765,6 +7913,8 @@ def main():
                    "蒙地卡羅本金模擬：以歷史注單回報分布模擬未來本金路徑，評估注碼策略能否捱過波動。"
                    "兩者皆只讀取現有數據即時計算，不會改動資料庫結構。")
         _df_all_clv = st.session_state.df_db
+        render_clv_closing_updater(db_file, db_table)
+        st.divider()
         _df_settled_clv = _df_all_clv[_df_all_clv['Status'] == 'Settled'].copy() if not _df_all_clv.empty else _df_all_clv.copy()
         try:
             render_clv_section(_df_settled_clv)
