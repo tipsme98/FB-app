@@ -9,6 +9,30 @@ import requests
 import itertools
 from datetime import datetime, timedelta, timezone
 
+# ==============================================================================
+# V14 注碼與風控修正 (基於 V13 完整程式碼)
+#
+# 問題 (V13)：
+#   1. 「最低建議注碼」所有盤口共用一個數值，令入球/角球的 Kelly 注碼 (例如 $20)
+#      被強制湊大到 $200 — 與「根據預測勝率及本金精準下注」的原則矛盾。
+#   2. 舊版「讓球最低 $200」規則把 EV 偏低的讓球注強制升至 $200，放大邊緣投注虧損。
+#   3. 未通過樣本外驗證的盤口一律 $0 模擬注，正 ROI 的盤口也無法實注。
+#
+# V14 修正：
+#   A. 馬會最低注額改為「分盤口下限過濾」：讓球 $200、其他盤口 $10 (可於側邊欄調整)。
+#      Kelly 注碼 ≥ 下限 → 按精準 Kelly 注碼實注；< 下限 → $0 模擬注，絕不強制湊大。
+#      (強制把 $140 的讓球注湊到 $200 = 用 1.43 倍風險賭同一個優勢，長期必然放大虧損。)
+#   B. 新增「試注層 (半注 Kelly)」：策略未完全通過驗證 (≥50 注、ROI ≥ +2%、前後兩段皆賺)，
+#      但已有初步正回報 (≥30 注、ROI ≥ +1%、前後兩段未同時虧損) 時，以半注 Kelly 實注，
+#      狀態顯示「✅ 試注」。門檻全部可在側邊欄調整。
+#   C. 注碼 $0 時顯示具體原因 (Kelly 注碼低於馬會最低注額 / 策略未驗證)，方便判斷
+#      是「本金不足」還是「無優勢」。
+#
+# 所需本金參考 (Kelly 0.25、讓球 EV 4-5% @ 賠率 ~1.9)：
+#   Kelly 注碼 = 本金 × 0.25 × EV/(賠率−1) ≥ $200 → 本金 ≥ 約 $14,400 (EV 5%) ~ $18,000 (EV 4%)。
+#   建議系統本金 ≥ $20,000，讓球盤的合格建議才能自然達到 $200；入球/角球 $10 起，本金 $1,000 已足夠。
+# ==============================================================================
+
 # ==========================================
 # 0. 嘗試載入依賴套件 (AI與雲端資料庫) & 全局時區設定
 # ==========================================
@@ -2424,8 +2448,28 @@ def v9_inplay_lambdas(lam_h, lam_a, lam_c, minute, h_red, a_red, h_shots, a_shot
     return lam_h * rem * ih * rh, lam_a * rem * ia * ra, lam_c * rem * ic, (ih, ia, ic)
 
 
+# V14：馬會各盤口最低注額 — 只作「下限過濾」，絕不強制湊大注碼
+# 馬會規定：讓球 (單場及過關) 最低投注 $200；其他玩法 (入球大小 / 角球大小 等) 最低 $10
+HKJC_MIN_STAKE = {'讓球': 200.0}
+HKJC_MIN_STAKE_DEFAULT = 10.0
+
+
+def v9_bet_floor(bet_type, settings):
+    """該盤口的馬會最低注額 (讓球 $200、其他 $10)，可於側邊欄調整"""
+    bt = v9_clean_bt(str(bet_type))
+    if '讓球' in bt:
+        return float(settings.get('min_hd', HKJC_MIN_STAKE['讓球']) or 0.0)
+    return float(settings.get('min_other', HKJC_MIN_STAKE_DEFAULT) or 0.0)
+
+
 def v9_calc_stake(cand, bankroll, max_stake, settings):
-    """分數 Kelly：注碼 = 本金 × Kelly 分數 × (EV / (賠率−1))，上限為本金 max_pct 及系統單注上限，四捨五入至 $10"""
+    """V14 分數 Kelly 注碼：
+    注碼 = 本金 × Kelly 分數 × (EV / (賠率−1)) × 置信度係數 (試注層 ×0.5)，
+    上限為本金 max_pct 及系統單注上限，四捨五入至 $10。
+    馬會最低注額只作「下限過濾」：Kelly 注碼低於該盤口最低注額 (讓球 $200 / 其他 $10) 時，
+    代表值博率不足以支持該注額 → 建議 $0 模擬注，絕不強制湊大。
+    (強制把 $140 的讓球注湊到 $200 = 用 1.43 倍的風險去賭同一個優勢，長期必然放大虧損。)"""
+    cand['stake_note'] = ''
     if not cand.get('gate_ok', True) or bankroll <= 0:
         return 0.0, 0.0
     ev = float(cand.get('ev', 0.0))
@@ -2433,13 +2477,21 @@ def v9_calc_stake(cand, bankroll, max_stake, settings):
     if ev < settings['min_ev'] or o <= 1.0:
         return 0.0, 0.0
     f = max(0.0, ev / (o - 1.0))
-    raw = bankroll * settings['kelly'] * f
+    # V14 置信度分層：tier 1 = 完全通過樣本外驗證 (全 Kelly)；tier 2 = 試注層 (半 Kelly)
+    _tier = int(cand.get('tier', 1) or 1)
+    _tier_mult = 0.5 if _tier == 2 else 1.0
+    raw = bankroll * settings['kelly'] * f * _tier_mult
     cap = min(float(max_stake) if max_stake > 0 else raw, bankroll * settings['max_pct'])
     stake = float(round(min(raw, cap) / 10.0) * 10.0)
+    _floor = v9_bet_floor(cand.get('bet_type', ''), settings)
+    if _floor > 0 and stake < _floor:
+        cand['stake_note'] = (f"Kelly 注碼 ${stake:.0f} 低於馬會『{v9_clean_bt(str(cand.get('bet_type', '')))}』最低注額 "
+                              f"${_floor:.0f}：值博率不足以支持該注額，不建議落注 (強制湊大 = 超出優勢對應風險)，記錄為 $0 模擬注")
+        return 0.0, raw
     if stake < 10.0:
-        stake = 0.0
-    if settings.get('hd_min200') and '讓球' in str(cand.get('bet_type', '')) and 0 < stake < 200:
-        stake = 200.0 if (ev >= 0.05 and bankroll * settings['max_pct'] >= 200) else 0.0
+        return 0.0, raw
+    if _tier == 2:
+        cand['stake_note'] = '試注層 (策略未完全通過樣本外驗證，已具初步正回報)：注碼自動減半'
     return stake, raw
 
 
@@ -3117,13 +3169,43 @@ def v10_apply_to_candidates(cands, kp_map, mode, settings, kp_engine, arena=None
                 c['strategy'], c['ev'] = chosen
                 c['engine_used'] = V11_STRAT_NAMES[chosen[0]]
                 c['gate_ok'], c['gate_msg'] = True, ''
+                c['tier'] = 1
             else:
-                opts = [(sk, e) for sk, e in (('kp', c['ev_kp']), ('v9', c['ev_v9'])) if e is not None]
-                sk, e = max(opts, key=lambda t: t[1]) if opts else ('v9', c['ev_v9'])
-                c['strategy'], c['ev'] = sk, float(e)
-                c['engine_used'] = '模擬'
-                c['paper'] = True
-                c['gate_ok'], c['gate_msg'] = False, '策略未通過樣本外驗證'
+                # V14 試注層：策略未完全通過驗證，但該『策略 × 盤口類型』樣本外已有
+                # 初步正回報 (注數 ≥ 試注下限、ROI ≥ 試注 ROI 下限、前後兩段未同時虧損)。
+                # 這類建議以「半注 Kelly」實注，狀態顯示 ✅ 試注；注碼低於馬會最低注額時仍為 $0。
+                t2 = None
+                if settings.get('trial', True):
+                    for sk in ('kz', 'kp', 'v9'):
+                        ev_s = {'kz': c['ev_kz'], 'kp': c['ev_kp'], 'v9': c['ev_v9']}[sk]
+                        if ev_s is None or ev_s < max(thr, V11_STRAT_THR[sk]):
+                            continue
+                        ts = (arena.get('type_stats') or {}).get(sk, {}).get(bt) or {}
+                        if not ts:
+                            continue
+                        h1, h2 = ts.get('h1') or {}, ts.get('h2') or {}
+                        if int(ts.get('n', 0)) < int(settings.get('trial_min_n', 30)):
+                            continue
+                        if float(ts.get('roi', 0.0)) < float(settings.get('trial_roi', 0.01)):
+                            continue
+                        if (int(h1.get('n', 0)) >= 10 and int(h2.get('n', 0)) >= 10
+                                and float(h1.get('roi', 0.0)) <= 0 and float(h2.get('roi', 0.0)) <= 0):
+                            continue  # 前後兩段都明確虧損 → 不試注
+                        if t2 is None or ev_s > t2[1]:
+                            t2 = (sk, ev_s)
+                if t2:
+                    c['strategy'], c['ev'] = t2
+                    c['engine_used'] = V11_STRAT_NAMES[t2[0]] + ' (試注)'
+                    c['gate_ok'], c['gate_msg'] = True, ''
+                    c['tier'] = 2
+                else:
+                    opts = [(sk, e) for sk, e in (('kp', c['ev_kp']), ('v9', c['ev_v9'])) if e is not None]
+                    sk, e = max(opts, key=lambda t: t[1]) if opts else ('v9', c['ev_v9'])
+                    c['strategy'], c['ev'] = sk, float(e)
+                    c['engine_used'] = '模擬'
+                    c['paper'] = True
+                    c['gate_ok'], c['gate_msg'] = False, '策略未通過樣本外驗證'
+                    c['tier'] = 0
             c['prob'] = (c['ev'] + 1.0) / float(c['odds'])
         elif mode == V11_MODE_STRICT:
             if c['ev_kz'] is not None:
@@ -3153,6 +3235,8 @@ def v10_apply_to_candidates(cands, kp_map, mode, settings, kp_engine, arena=None
             c['status'] = '➖ 非收盤主盤 / 無看盤訊號'
         elif not c.get('gate_ok', True):
             c['status'] = f"⛔ 熔斷 ({c.get('gate_msg', '')})"
+        elif c.get('tier') == 2 and c['ev'] >= thr:
+            c['status'] = '✅ 試注 (半注 Kelly)'
         elif c['ev'] >= thr:
             c['status'] = '✅ 建議'
         elif c['ev'] > 0:
@@ -3194,9 +3278,10 @@ V11_MODE_AUTO = '🛡 自動 (只用已驗證策略)'
 V11_MODE_STRICT = '看盤嚴格規則 (z≥1.5)'
 V10_SETTING_DEFAULTS = {
     'v9_min_ev': 3.0, 'v9_kelly': 0.25, 'v9_max_pct': 3.0, 'v9_max_picks': 1,
-    'v9_hd_min200': False, 'v9_override_gate': False, 'v10_mode': V11_MODE_AUTO,
+    'v9_min_hd': 200.0, 'v9_min_other': 10.0, 'v9_override_gate': False, 'v10_mode': V11_MODE_AUTO,
     'v11_new_league_paper': True, 'v11_league_breaker': True, 'v11_migrated': True,
-    'v11_auto_sys': True,
+    'v11_auto_sys': True, 'v11_trial': True,
+    'v11_act_min_n': 50, 'v11_act_roi': 2.0, 'v11_trial_min_n': 30, 'v11_trial_roi': 1.0,
 }
 V10_MODE_OPTIONS = [V11_MODE_AUTO, '看盤規則', V11_MODE_STRICT, '看盤規則 + V9', '只用 V9 模型']
 V11_LS_PREFIX = 'LS|'
@@ -4035,7 +4120,8 @@ def v11_arena(df_input):
     n_act = sum(v for d_ in out['active'].values() for v in d_.values())
     out['msg'] = (f"模型擂台：{len(mt)} 場比賽，測試期由 {out['t0']} 開始 (之前的比賽只用作訓練)。"
                   + (f"目前有 {n_act} 個『策略 × 盤口類型』通過驗證，可以實際落注。" if n_act else
-                     "目前沒有任何策略通過驗證 (樣本外 ≥ 50 注、ROI ≥ +2%、前後兩段都賺錢)，自動模式只會提供模擬注。"))
+                     "目前沒有任何策略完全通過驗證 (樣本外 ≥ 50 注、ROI ≥ +2%、前後兩段都賺錢)；"
+                     "已具初步正回報 (≥ 30 注、ROI ≥ +1%) 的策略會以「✅ 試注 (半注 Kelly)」實注，其餘只作 $0 模擬注。"))
     return out
 
 
@@ -4115,13 +4201,20 @@ def v9_get_settings():
         'min_ev': float(st.session_state.get('v9_min_ev', V10_SETTING_DEFAULTS['v9_min_ev'])) / 100.0,
         'kelly': float(st.session_state.get('v9_kelly', 0.25)),
         'max_pct': float(st.session_state.get('v9_max_pct', 3.0)) / 100.0,
-        'hd_min200': bool(st.session_state.get('v9_hd_min200', False)),
+        'min_hd': float(st.session_state.get('v9_min_hd', V10_SETTING_DEFAULTS['v9_min_hd'])),
+        'min_other': float(st.session_state.get('v9_min_other', V10_SETTING_DEFAULTS['v9_min_other'])),
         'override_gate': bool(st.session_state.get('v9_override_gate', False)),
         'max_picks': int(st.session_state.get('v9_max_picks', 1)),
         'mode': str(st.session_state.get('v10_mode', V11_MODE_AUTO)),
         'new_league_paper': bool(st.session_state.get('v11_new_league_paper', True)),
         'league_breaker': bool(st.session_state.get('v11_league_breaker', True)),
         'auto_sys': bool(st.session_state.get('v11_auto_sys', True)),
+        # V14 試注層與驗證門檻 (ROI 值以 % 儲存，例如 2.0 = 2%)
+        'trial': bool(st.session_state.get('v11_trial', True)),
+        'act_min_n': int(st.session_state.get('v11_act_min_n', V10_SETTING_DEFAULTS['v11_act_min_n'])),
+        'act_roi': float(st.session_state.get('v11_act_roi', V10_SETTING_DEFAULTS['v11_act_roi'])) / 100.0,
+        'trial_min_n': int(st.session_state.get('v11_trial_min_n', V10_SETTING_DEFAULTS['v11_trial_min_n'])),
+        'trial_roi': float(st.session_state.get('v11_trial_roi', V10_SETTING_DEFAULTS['v11_trial_roi'])) / 100.0,
     }
 
 
@@ -6195,6 +6288,113 @@ def render_time_dimension_pnl_tab(df_settled, sys_bankroll, sys_max_stake):
     st.divider()
     render_bet_type_comparison_chart(df_settled, bet_types, "tdp_compare")
 
+    # --- 聯賽 × 盤口績效分析 (V13.3) ---
+    st.divider()
+    render_league_bettype_pnl_section(df_settled)
+
+LBT_COMBO_OPTIONS = [
+    ('總體 (全部盤口)', None),
+    ('讓球', ('讓球',)),
+    ('入球大小', ('入球大小',)),
+    ('角球大小', ('角球大小',)),
+    ('讓球 + 角球', ('讓球', '角球大小')),
+    ('讓球 + 入球', ('讓球', '入球大小')),
+    ('角球 + 入球', ('角球大小', '入球大小')),
+]
+
+def _lbt_stats(gg):
+    """計算一組注單 (已過濾注碼>0) 的績效指標：ROI、95%誤差範圍、單位盈虧、金額盈虧、命中率、前後半段"""
+    r = gg['_profit'] / gg['_stake']
+    n = len(gg)
+    roi = float(r.mean())
+    ci = float(1.96 * r.std(ddof=1) / np.sqrt(n)) if n > 1 else 1.0
+    h = n // 2
+    r1 = float(r.iloc[:h].mean()) if h > 0 else None
+    r2 = float(r.iloc[h:].mean()) if n - h > 0 else None
+    ok = (n >= 30 and roi >= 0.02 and h >= 8 and n - h >= 8
+          and r1 is not None and r2 is not None and r1 > 0 and r2 > 0)
+    return {
+        '注數': n,
+        '投注額 ($)': round(float(gg['_stake'].sum()), 0),
+        '下注盈虧 ($)': round(float(gg['_profit'].sum()), 2),
+        'ROI': f"{roi * 100:+.1f}%",
+        '95%誤差範圍': f"±{ci * 100:.1f}%",
+        '單位盈虧 (U)': round(float(gg['_unit'].sum()), 2),
+        '命中率': f"{float((r > 0).mean()) * 100:.1f}%",
+        '前半段 ROI': f"{r1 * 100:+.1f}% ({h})" if r1 is not None else '-',
+        '後半段 ROI': f"{r2 * 100:+.1f}% ({n - h})" if r2 is not None else '-',
+        '驗證': '✅ 通過' if ok else '—'
+    }
+
+def render_league_bettype_pnl_section(df_settled):
+    """聯賽 × 盤口績效分析：可選盤口組合 (總體/讓球/入球/角球/兩兩組合)，
+    每個聯賽顯示 ROI、95%誤差範圍、單位盈虧、下注盈虧、命中率、前後半段 ROI，
+    負 ROI 的盤口不會污染其他盤口或總體的數字。"""
+    st.markdown("#### 🏆 聯賽 × 盤口績效分析")
+    st.caption("選擇盤口組合後，每個聯賽分別顯示 ROI、95%誤差範圍、單位盈虧、下注盈虧 ($)、命中率及前後半段 ROI，"
+               "方便比較哪個聯賽投注哪個項目最好。角球/入球等負 ROI 盤口不會污染讓球或總體的數字。"
+               "前半段/後半段 ROI 是把該組注單按比賽日期排序後對半切開，檢查優勢是否持續。"
+               "注意：注數少的組別誤差範圍很大，請以 95% 誤差範圍判斷可信度。")
+    if df_settled.empty:
+        st.info("目前尚無已結算的注單。")
+        return
+    basis = st.radio("盈虧計算基準", ["系統注碼 (System_Stake)", "用家注碼 (User_Stake)"],
+                     horizontal=True, key="lbt_basis")
+    combo_label = st.selectbox("盤口組合 (負 ROI 盤口不會污染其他盤口)",
+                              [c[0] for c in LBT_COMBO_OPTIONS], key="lbt_combo")
+    combo_types = dict(LBT_COMBO_OPTIONS)[combo_label]
+    stake_col = 'System_Stake' if basis.startswith("系統") else 'User_Stake'
+    profit_col = 'System_Profit' if basis.startswith("系統") else 'User_Profit'
+    d = df_settled.copy()
+    d['_bt'] = d['Bet_Type'].astype(str).str.replace(' (即場)', '', regex=False).str.strip()
+    if combo_types is not None:
+        d = d[d['_bt'].isin(combo_types)]
+    d['_stake'] = pd.to_numeric(d[stake_col], errors='coerce').fillna(0.0)
+    d['_profit'] = pd.to_numeric(d[profit_col], errors='coerce').fillna(0.0)
+    d['_unit'] = pd.to_numeric(d.get('Unit_Profit'), errors='coerce').fillna(0.0) if 'Unit_Profit' in d.columns else 0.0
+    d['_md'] = pd.to_datetime(d['Match_Date'], errors='coerce').fillna(pd.to_datetime(d['Date'], errors='coerce'))
+    dd = d[d['_stake'] > 0]
+    if dd.empty:
+        st.info("沒有可計算的注單 (需要注碼 > 0 的已結算注單)。")
+        return
+    # --- 所選組合總覽 ---
+    st.markdown(f"**「{combo_label}」總覽 (全部聯賽合計)**")
+    tot = _lbt_stats(dd.sort_values('_md'))
+    tc1, tc2, tc3, tc4, tc5 = st.columns(5)
+    tc1.metric("注數", f"{tot['注數']} 注")
+    tc2.metric("投注額", f"${tot['投注額 ($)']:,.0f}")
+    tc3.metric("下注盈虧", f"${tot['下注盈虧 ($)']:,.2f}")
+    tc4.metric("ROI", tot['ROI'])
+    tc5.metric("命中率", tot['命中率'])
+    # --- 每個聯賽 ---
+    rows = []
+    for lg, g in dd.groupby('Tournament_Name'):
+        s = _lbt_stats(g.sort_values('_md'))
+        rows.append({'聯賽': lg, **s})
+    out = pd.DataFrame(rows).sort_values('單位盈虧 (U)', ascending=False)
+    st.markdown(f"**每個聯賽的表現 (共 {len(out)} 個聯賽，按單位盈虧排序，可點欄位重新排序)**")
+    st.dataframe(out, use_container_width=True, hide_index=True, height=max(280, 38 * len(out)))
+    # --- 盤口小計 (組合內各盤口) ---
+    if combo_types is not None and len(combo_types) > 1:
+        st.markdown("**組合內各盤口小計**")
+        sub_rows = []
+        for bt, g in dd.groupby('_bt'):
+            sub_rows.append({'盤口': bt, **_lbt_stats(g.sort_values('_md'))})
+        if sub_rows:
+            st.dataframe(pd.DataFrame(sub_rows).sort_values('單位盈虧 (U)', ascending=False),
+                         use_container_width=True, hide_index=True)
+    # --- 聯賽 × 盤口明細 ---
+    if combo_types is None or len(combo_types) > 1:
+        st.markdown("**聯賽 × 盤口明細**")
+        det_rows = []
+        for (lg, bt), g in dd.groupby(['Tournament_Name', '_bt']):
+            det_rows.append({'聯賽': lg, '盤口': bt, **_lbt_stats(g.sort_values('_md'))})
+        if det_rows:
+            st.dataframe(pd.DataFrame(det_rows).sort_values('單位盈虧 (U)', ascending=False),
+                         use_container_width=True, hide_index=True, height=max(280, 38 * len(det_rows)))
+    st.caption("💡 解讀：✅ 通過 = 注數 ≥ 30、ROI ≥ +2%、前後半段各 ≥ 8 注且皆盈利 (門檻比模型擂台寬鬆，僅供快速篩選)。"
+               "「前半段賺、後半段蝕」的組合要警惕優勢消失；「前後皆賺」才是較可靠的訊號。")
+
 def render_bet_type_comparison_chart(df_settled, bet_types, key_prefix):
     """渲染盤口類型對比盈虧折線圖：可選擇 盤口類型 x 系統/用家 x 每日/每周/每季/每年"""
     if df_settled.empty:
@@ -6572,8 +6772,26 @@ def main():
         st.number_input("單注上限 (% 系統本金)", min_value=0.5, max_value=10.0, step=0.5, key="v9_max_pct", on_change=v10_save_settings)
         st.number_input("每場最多建議注數", min_value=1, max_value=3, step=1, key="v9_max_picks", on_change=v10_save_settings,
                         help="同一場比賽的多個盤口高度相關，建議每場只下 1 注。")
-        st.checkbox("啟用舊版「讓球最低 $200」規則", key="v9_hd_min200", on_change=v10_save_settings,
-                    help="舊版會把 EV 偏低的讓球注碼強制升至 $200，放大了邊緣投注的虧損，預設關閉。")
+        st.number_input("讓球最低注碼 ($) (馬會規定 $200)", min_value=10.0, max_value=5000.0, step=10.0, key="v9_min_hd",
+                        on_change=v10_save_settings,
+                        help="馬會讓球 (單場及過關) 最低投注 $200。此數值只作「下限過濾」：Kelly 注碼達到此數才建議實注，"
+                             "低於此數 = 值博率不足以支持 $200 注碼 → 建議 $0 模擬注 (絕不強制湊大)。"
+                             "若經常出現讓球 $0，代表本金不足以支撐讓球盤，應加大本金或提高 EV 門檻。")
+        st.number_input("其他盤口最低注碼 ($) (馬會規定 $10)", min_value=0.0, max_value=5000.0, step=10.0, key="v9_min_other",
+                        on_change=v10_save_settings,
+                        help="入球大小 / 角球大小等馬會最低投注 $10。同樣只作下限過濾：Kelly 注碼 (四捨五入至 $10) 達 $10 即實注，"
+                             "不足 $10 → $0 模擬注。設 0 = 停用過濾。")
+        st.checkbox("啟用試注層 (半注 Kelly)", key="v11_trial", on_change=v10_save_settings,
+                    help="策略未完全通過樣本外驗證，但該『策略 × 盤口類型』已有初步正回報 (注數及 ROI 達下方試注門檻、前後兩段未同時虧損) 時，"
+                         "以半注 Kelly 實注並顯示「✅ 試注」。讓正 ROI 的盤口能真正落注累積數據，同時用減半注碼控制風險。")
+        st.number_input("通過驗證：最少樣本外注數", min_value=10, max_value=500, step=5, key="v11_act_min_n", on_change=v10_save_settings,
+                        help="該『策略 × 盤口類型』樣本外注數達此數 (且 ROI 達標、前後兩段都賺錢) 才用全 Kelly 實注。預設 50。")
+        st.number_input("通過驗證：樣本外 ROI 下限 (%)", min_value=0.0, max_value=20.0, step=0.5, key="v11_act_roi", on_change=v10_save_settings,
+                        help="該『策略 × 盤口類型』樣本外 ROI 達此數才用全 Kelly 實注。預設 2%。")
+        st.number_input("試注層：最少樣本外注數", min_value=5, max_value=500, step=5, key="v11_trial_min_n", on_change=v10_save_settings,
+                        help="未完全通過驗證但注數達此數且 ROI 達試注下限時，以半注 Kelly 試注。預設 30。")
+        st.number_input("試注層：樣本外 ROI 下限 (%)", min_value=0.0, max_value=20.0, step=0.5, key="v11_trial_roi", on_change=v10_save_settings,
+                        help="試注層要求的樣本外 ROI 下限。預設 1%。")
         st.checkbox("解除盤口熔斷 (不建議)", key="v9_override_gate", on_change=v10_save_settings,
                     help="樣本外回測 ≥ 20 注且 ROI ≤ −3% 的盤口類型會自動暫停建議。")
         _sb1, _sb2 = st.columns(2)
@@ -6914,7 +7132,8 @@ def main():
             # 推薦：只考慮每個盤口的最新賠率；每種盤口類型最多一注，總數不超過設定上限
             picks, _used_types = [], set()
             for c in scored:
-                if not c.get('is_latest', True) or not c.get('is_offered', True) or c.get('status') != '✅ 建議':
+                # V14：✅ 建議 (完全通過驗證) 及 ✅ 試注 (半注 Kelly) 均納入實注建議
+                if not c.get('is_latest', True) or not c.get('is_offered', True) or not str(c.get('status', '')).startswith('✅'):
                     continue
                 _bt = v9_clean_bt(c['bet_type'])
                 if _bt in _used_types:
@@ -7071,11 +7290,12 @@ def main():
             mc1, mc2, mc3 = st.columns(3)
             if picks:
                 bb = picks[0]
-                mc1.metric("💡 首選推薦", f"{bb['bet_type']} - {bb['label']} @ {bb['odds']}")
+                _tier_tag = ' [試注·半注 Kelly]' if int(bb.get('tier', 1) or 1) == 2 else ''
+                mc1.metric("💡 首選推薦", f"{bb['bet_type']} - {bb['label']} @ {bb['odds']}{_tier_tag}")
                 mc2.metric("🎯 模型有效勝率 / 市場", f"{bb['prob']*100:.1f}% / {bb['p_mkt']*100:.1f}%")
                 mc3.metric("📊 EV", f"{bb.get('ev', 0):+.3f}")
                 if len(picks) > 1:
-                    st.caption("其他建議：" + "；".join(f"{p['bet_type']} {p['label']} @ {p['odds']} (EV {p['ev']:+.3f})" for p in picks[1:]))
+                    st.caption("其他建議：" + "；".join(f"{p['bet_type']} {p['label']} @ {p['odds']} (EV {p['ev']:+.3f}{'，試注' if int(p.get('tier', 1) or 1) == 2 else ''})" for p in picks[1:]))
                 for _p in picks:
                     if _p.get('kp_fired'):
                         st.caption(f"📈 {_p['bet_type']} {_p['label']} 觸發的看盤規則：" + "；".join(_p['kp_fired']))
@@ -7098,7 +7318,8 @@ def main():
 
             with col_sys:
                 st.markdown("#### 🤖 系統投注 (System)")
-                st.caption(f"供模型學習及系統資金策略驗證使用。注碼 = 分數 Kelly ({v9_set['kelly']:.2f}) × 優勢，單注上限 {v9_set['max_pct']*100:.1f}% 本金。")
+                st.caption(f"供模型學習及系統資金策略驗證使用。注碼 = 分數 Kelly ({v9_set['kelly']:.2f}) × 優勢，單注上限 {v9_set['max_pct']*100:.1f}% 本金；"
+                           f"✅ 建議 = 全 Kelly；✅ 試注 = 半 Kelly；Kelly 注碼低於馬會最低注額 (讓球 ${v9_set['min_hd']:,.0f} / 其他 ${v9_set['min_other']:,.0f}) 時為 $0，絕不強制湊大。")
                 default_sys = []
                 if is_editing and st.session_state.get('edit_sys_stake', 0) > 0:
                     eb = st.session_state.get('edit_bet_type')
@@ -7132,6 +7353,8 @@ def main():
                     sys_stakes[sel] = st.number_input(f"系統建議金額: {sel}", value=_stk_val, disabled=True, key=f"s_stk_{sel}")
                     if _stk_val <= 0:
                         st.caption(f"⚠ `{cand['bet_type']}` {cand.get('status', '')}：EV {cand.get('ev', 0):+.3f}，系統建議注碼 $0 (只作記錄供學習)")
+                        if cand.get('stake_note'):
+                            st.caption(f"ℹ {cand['stake_note']}")
 
             with col_usr:
                 st.markdown("#### 👤 用家投注 (User)")
@@ -7656,6 +7879,8 @@ def main():
                             ip_sys_stakes[sel] = st.number_input(f"系統建議金額: {sel}", value=float(sug_stk), disabled=True, key=f"ip_s_stk_{sel}")
                             if sug_stk <= 0:
                                 st.caption(f"⚠ `{cand['bet_type']}` {cand.get('status', '')}：EV {cand.get('ev', 0):+.3f}，系統建議注碼 $0")
+                                if cand.get('stake_note'):
+                                    st.caption(f"ℹ {cand['stake_note']}")
 
                     with ip_col_usr:
                         st.markdown("#### 👤 用家投注 (User)")
