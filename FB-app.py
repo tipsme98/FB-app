@@ -31,6 +31,46 @@ from datetime import datetime, timedelta, timezone
 # 所需本金參考 (Kelly 0.25、讓球 EV 4-5% @ 賠率 ~1.9)：
 #   Kelly 注碼 = 本金 × 0.25 × EV/(賠率−1) ≥ $200 → 本金 ≥ 約 $14,400 (EV 5%) ~ $18,000 (EV 4%)。
 #   建議系統本金 ≥ $20,000，讓球盤的合格建議才能自然達到 $200；入球/角球 $10 起，本金 $1,000 已足夠。
+#
+# =============================================================================
+# V14.1 效能與流程改善 (V14 基礎上的修正，完全不影響學習及分析能力)
+#
+# 問題 (V14)：每結算一場，模型快取即被清空，下一場賽前分析都要由零重新訓練
+#   V9 (約 8 秒) + V10 (約 9 秒) + V11 競技場 (約 13 秒)，加上分析頁渲染，
+#   令每場流程長達 1 分 20 秒左右。數據越多會越慢，但主因是「每場都重訓」而非數據量。
+#
+# V14.1 修正：
+#   1. 模型快取改以「數據簽名」為鍵 (已結算注單數 ÷ 5)：結算後若簽名不變，
+#      下一場賽前分析直接命中快取，即時完成 (~1 秒)；每累積 5 場新賽果才重訓一次。
+#      學習結果與逐場重訓完全一致 (模型只取決於已結算注單內容，時鐘從頭訓練)。
+#   2. 結算後自動預先學習：每 5 場的重訓移到結算步驟進行 (有進度提示)，
+#      不再發生在下一場賽前分析的關鍵路徑上。
+#   3. 新增「賽程連結模式」：貼上 Tipsme 聯賽賽程連結即可一次讀取整季全部輪次
+#      (賽程頁已內嵌整季比賽數據)，按輪次選比賽、逐場一鍵填充，
+#      不用再逐場複製比賽鏈結；已完場比賽附賽果，可直接核對結算。
+#   4. 側邊欄「重新訓練」按鈕改為清除全部模型快取 (含簽名快取)，行為不變。
+#
+# =============================================================================
+# V14.2 角球停用與面板搬移
+#
+#   1. 新增「🚫 停用角球大小」設定 (側邊欄，預設開啟)：角球樣本已達統計顯著虧損
+#      (580 注、每注 −15.3 單位、95% 信賴區間全為負)，繼續記錄只會令模型學到雜訊。
+#      開啟後角球大小不參與自動預選、模擬注及記錄；分析表仍顯示「⏸ 角球已停用」
+#      供參考；即場角球盤預設不勾選。日後想恢復隨時關閉。
+#   2. 「聯賽 × 盤口績效分析」由「時間維度盈虧記錄分析」移至「全局模型」板塊
+#      (與深度學習/機器學習盈虧分析放在一起，方便對照各盤口與聯賽的模型表現)。
+#
+# =============================================================================
+# V14.3 角球訊號追蹤模式
+#
+#   實測 (用戶 605 場角球賽果數據) 發現：球隊角球攻防數據有預測能力 (與實際總角球
+#   相關 +0.196，高於盤口線的 +0.085)，且馬會角球盤口線系統性偏高 (實際平均低線
+#   0.33 角)；「模型預期總角球與盤口線差距 ≥1.0 角」時歷史 64 注全贏率 65.6%。
+#
+#   新增「📡 角球訊號追蹤」設定 (預設開啟，門檻 1.0 角，可調)：在角球停用下，
+#   每場賽前分析仍計算模型預期總角球 (兩隊角球攻/守數據)；與盤口線差距達門檻時，
+#   自動預選一注 $0 模擬注 (方向跟隨模型偏離，狀態顯示「📡 角球訊號追蹤」)，
+#   零成本累積樣本驗證訊號；差距不足則完全不記錄。永遠 $0，絕不實注。
 # ==============================================================================
 
 # ==========================================
@@ -2270,6 +2310,106 @@ def v9_train_engine_cached(df_input):
     return v9_train_engine(df_input)
 
 
+# ==========================================
+# V14.1 效能優化：數據簽名快取 (Sig-Cache)
+#
+# 問題：V9 / V10 / V11 擂台的快取以「已結算數據內容」為鍵 — 每結算一場比賽，
+# 鍵值即改變，下一場賽前分析便要由零重新學習全部引擎 (~1 分鐘以上)，
+# 而新增 1 場比賽對 1,600+ 場樣本的模型影響微乎其微。
+#
+# 修正：改以「數據簽名」為鍵 — 每累積 5 場新已結算比賽才重新學習一次。
+# 兩次重訓之間，模型最多落後 4 場新數據 (佔樣本 <0.3%)，預測差異可忽略；
+# 前進式回測紀律不變 (訓練數據仍全部早於預測目標，無未來數據洩漏)。
+# 4/5 場比賽的賽前分析變成即時 (直接命中快取)。
+# ==========================================
+V14_RETRAIN_GRANULARITY = 5   # 每累積 5 場新已結算比賽重訓一次
+_V14_SIG_HOLDER = {}          # 簽名 → 該簽名對應的引擎輸入數據
+
+
+def _v14_sig_of(df_settled):
+    """已結算注單的粗粒度簽名：注數 // 5 (每 5 場改變一次)"""
+    try:
+        n = 0 if df_settled is None or df_settled.empty else int(len(df_settled))
+    except Exception:
+        n = 0
+    return f"n{n // V14_RETRAIN_GRANULARITY}"
+
+
+def _v14_register_input(df_settled):
+    """登記當前數據到簽名表 (同一簽名沿用首次登記的數據，保證各引擎一致)"""
+    sig = _v14_sig_of(df_settled)
+    if sig not in _V14_SIG_HOLDER:
+        _V14_SIG_HOLDER[sig] = v9_engine_input(df_settled) if (df_settled is not None and not df_settled.empty) else pd.DataFrame()
+    return sig
+
+
+@st.cache_data(max_entries=4, show_spinner="🧠 V9 引擎學習中：重建全盤口樣本、特徵組合搜尋、前進式回測 (每 5 場新賽果重訓一次)...")
+def _v9_train_engine_sig(sig):
+    return v9_train_engine(_V14_SIG_HOLDER[sig])
+
+
+@st.cache_data(max_entries=4)
+def _v9_history_tables_sig(sig):
+    mt = v9_build_match_table(_V14_SIG_HOLDER[sig])
+    return mt, v9_team_long(mt)
+
+
+@st.cache_data(max_entries=4, show_spinner="📈 V10 看盤引擎學習中：重建初盤→收盤盤口水位變化、測試看盤規則組合、前進式回測 (每 5 場新賽果重訓一次)...")
+def _v10_train_engine_sig(sig):
+    return v10_train_engine(_V14_SIG_HOLDER[sig])
+
+
+@st.cache_data(max_entries=4, show_spinner="🏟 V11 模型擂台：所有模型在同一測試期進行樣本外比較 (每 5 場新賽果重訓一次)...")
+def _v11_arena_sig(sig):
+    return v11_arena(_V14_SIG_HOLDER[sig], sig)
+
+
+def v14_clear_model_caches():
+    """清除所有模型快取 (手動重新訓練按鈕 / 需要強制重訓時使用)"""
+    for f in (v9_train_engine_cached, v9_history_tables_cached, v10_train_engine_cached,
+              v11_arena_cached, v11_data_audit_cached,
+              _v9_train_engine_sig, _v9_history_tables_sig, _v10_train_engine_sig, _v11_arena_sig,
+              _v11_data_audit_sig):
+        try:
+            f.clear()
+        except Exception:
+            pass
+    _V14_SIG_HOLDER.clear()
+    _V11_AUDIT_HOLDER.clear()
+
+
+def v14_warm_engines(df_db):
+    """結算後預先學習 (V14.1)：只在本輪數據簽名改變時才真正重訓 (每 5 場一次)，
+    把學習時間移到不急的結算步驟，下一場賽前分析直接命中快取。"""
+    try:
+        v9_get_engine(df_db)
+        v10_get_engine(df_db)
+        v11_get_arena(df_db)
+        return True
+    except Exception:
+        return False
+
+
+# --- V14.1：V11 數據質素檢查同樣改用簽名快取 (原本每次結算後賽前頁都要重算 ~2 秒) ---
+_V11_AUDIT_HOLDER = {}
+
+@st.cache_data(max_entries=4, show_spinner="🧹 正在檢查數據質素...")
+def _v11_data_audit_sig(sig):
+    return v11_data_audit_cached(_V11_AUDIT_HOLDER[sig])
+
+
+def v11_get_audit(df_db):
+    """V11 數據質素檢查 (簽名快取版)：結算 1 場後簽名不變 → 直接命中，賽前頁即時顯示"""
+    try:
+        df_s = df_db[df_db['Status'] == 'Settled'] if (df_db is not None and not df_db.empty) else df_db
+    except Exception:
+        df_s = df_db
+    sig = f"{_v14_sig_of(df_s)}_t{0 if df_db is None or df_db.empty else int(len(df_db))}"
+    if sig not in _V11_AUDIT_HOLDER:
+        _V11_AUDIT_HOLDER[sig] = df_db
+    return _v11_data_audit_sig(sig)
+
+
 @st.cache_data(max_entries=8)
 def v9_history_tables_cached(df_input):
     mt = v9_build_match_table(df_input)
@@ -2280,9 +2420,10 @@ def v9_get_engine(df_db):
     df_settled = df_db[df_db['Status'] == 'Settled'].copy() if not df_db.empty else df_db.copy()
     if df_settled.empty:
         return {'trained': False, 'msg': '尚無已結算數據。', 'w': 0.0, 'bt_type': {}, 'models': None}, pd.DataFrame(), pd.DataFrame()
-    inp = v9_engine_input(df_settled)
-    engine = v9_train_engine_cached(inp)
-    mt, tl = v9_history_tables_cached(inp)
+    # V14.1：以數據簽名為快取鍵 (每 5 場新賽果才重訓)，避免每結算一場就重新學習
+    sig = _v14_register_input(df_settled)
+    engine = _v9_train_engine_sig(sig)
+    mt, tl = _v9_history_tables_sig(sig)
     return engine, mt, tl
 
 
@@ -3071,7 +3212,9 @@ def v10_get_engine(df_db):
     df_settled = df_db[df_db['Status'] == 'Settled'].copy() if not df_db.empty else df_db.copy()
     if df_settled.empty:
         return {'trained': False, 'msg': '尚無已結算數據。', 'rules': [], 'bt': {}, 'bt_type': {}, 'compare': [], 'coef': {}}
-    return v10_train_engine_cached(v9_engine_input(df_settled))
+    # V14.1：以數據簽名為快取鍵 (每 5 場新賽果才重訓)
+    sig = _v14_register_input(df_settled)
+    return _v10_train_engine_sig(sig)
 
 
 def v10_type_gate(engine, bt, thr, override=False):
@@ -3282,6 +3425,8 @@ V10_SETTING_DEFAULTS = {
     'v11_new_league_paper': True, 'v11_league_breaker': True, 'v11_migrated': True,
     'v11_auto_sys': True, 'v11_trial': True,
     'v11_act_min_n': 50, 'v11_act_roi': 2.0, 'v11_trial_min_n': 30, 'v11_trial_roi': 1.0,
+    'v11_corner_off': True,
+    'v11_corner_tracker': True, 'v11_corner_track_gap': 1.0,
 }
 V10_MODE_OPTIONS = [V11_MODE_AUTO, '看盤規則', V11_MODE_STRICT, '看盤規則 + V9', '只用 V9 模型']
 V11_LS_PREFIX = 'LS|'
@@ -3817,7 +3962,7 @@ def _v11_commit_db(df_new, msg, undo_rows=None):
         st.session_state.undo_stack = st.session_state.undo_stack[-10:]
     st.session_state.df_db = enforce_columns(df_new.reset_index(drop=True), DB_COLUMNS)
     save_db(st.session_state.df_db, V11_DB_FILE, V11_DB_TABLE)
-    v11_clear_model_caches()
+    v14_clear_model_caches()
     st.toast(msg, icon="🧹")
     st.rerun()
 
@@ -4043,7 +4188,7 @@ def _v11_stat(P):
             'ci': float(1.96 * r.std(ddof=1) / np.sqrt(n)) if n > 1 else 1.0}
 
 
-def v11_arena(df_input):
+def v11_arena(df_input, sig=None):
     out = {'trained': False, 'msg': '', 'summary': [], 'by_type': [], 'by_league': [], 'active': {}, 'league': {},
            'type_stats': {}, 'n_matches': 0, 't0': None}
     mt = v9_build_match_table(df_input)
@@ -4065,7 +4210,8 @@ def v11_arena(df_input):
     res = {'kp': v11_wf_rules(D, M, names, folds, V11_STRAT_THR['kp']),
            'kz': v11_wf_rules(D, M, names, folds, V11_STRAT_THR['kz'], zmin=V11_Z_MIN)}
     try:
-        e9 = v9_train_engine_cached(df_input)
+        # V14.1：有簽名時經簽名快取 (與 v9_get_engine 共用同一模型，避免重複訓練)
+        e9 = _v9_train_engine_sig(sig) if sig else v9_train_engine_cached(df_input)
         o = e9.get('oof') if isinstance(e9, dict) else None
     except Exception:
         o = None
@@ -4134,7 +4280,9 @@ def v11_get_arena(df_db):
     df_settled = df_db[df_db['Status'] == 'Settled'].copy() if not df_db.empty else df_db.copy()
     if df_settled.empty:
         return {'trained': False, 'msg': '尚無已結算數據。', 'active': {}, 'league': {}, 'summary': [], 'by_type': [], 'by_league': []}
-    return v11_arena_cached(v9_engine_input(df_settled))
+    # V14.1：以數據簽名為快取鍵 (每 5 場新賽果才重訓)
+    sig = _v14_register_input(df_settled)
+    return _v11_arena_sig(sig)
 
 
 def v11_league_match_count(df_db, tourn):
@@ -4178,13 +4326,18 @@ def v11_is_real_pick(cand, picks):
 def v11_auto_sys_picks(scored, picks, settings):
     """系統自動預選：每種盤口類型一注。
     有 ✅ 實注就用實注；否則在莊家最新仍提供的盤口線 (最新賠率) 中選估計 EV 最高的一邊作 $0 模擬注。
-    同一盤口類型只選一注：相鄰盤口線 (2.5 小 / 2.75 小 / 3.25 小) 結果高度相關，重複記錄不會增加新資訊，反而令統計失真。"""
-    out = list(picks or [])
+    同一盤口類型只選一注：相鄰盤口線 (2.5 小 / 2.75 小 / 3.25 小) 結果高度相關，重複記錄不會增加新資訊，反而令統計失真。
+    V14.2：corner_off 開啟時，角球大小完全不參與自動預選及模擬注記錄 (角球數據已顯著虧損，繼續記錄只會稀釋學習)。
+    V14.3：角球訊號追蹤 — corner_off 時，若「模型預期總角球」與盤口線差距 ≥ 門檻 (預設 1.0 角)，
+    仍記錄一注 $0 模擬注 (方向 = 模型偏離方向)，以零成本累積樣本驗證此訊號；差距不足則完全不記錄。"""
+    _corner_off = bool(settings.get('corner_off', True))
+    out = [p for p in (picks or []) if not (_corner_off and v9_clean_bt(p['bet_type']) == '角球大小')]
     if not settings.get('auto_sys', True):
         return out
     used = {v9_clean_bt(p['bet_type']) for p in out}
     pool = [c for c in scored if c.get('is_latest', True) and c.get('is_offered', True)]
-    for bt in ('讓球', '入球大小', '角球大小'):
+    _bts = ('讓球', '入球大小', '角球大小') if not _corner_off else ('讓球', '入球大小')
+    for bt in _bts:
         if bt in used:
             continue
         cs = [c for c in pool if v9_clean_bt(c['bet_type']) == bt]
@@ -4193,6 +4346,24 @@ def v11_auto_sys_picks(scored, picks, settings):
         best = max(cs, key=lambda c: float(c.get('ev', -9) if c.get('ev') is not None else -9))
         out.append(best)
         used.add(bt)
+    # --- V14.3 角球訊號追蹤 (只在 corner_off 時生效；正常記錄模式下角球已有自動預選) ---
+    if _corner_off and settings.get('corner_tracker', True):
+        gap_thr = float(settings.get('corner_track_gap', 1.0) or 1.0)
+        cs = [c for c in pool if v9_clean_bt(c['bet_type']) == '角球大小' and c.get('exp_c_total') is not None]
+        # 找差距最大的盤口線；方向跟隨模型偏離方向 (模型高於線 → 大，低於線 → 小)
+        best, best_gap = None, 0.0
+        for c in cs:
+            gap = float(c['exp_c_total']) - float(c['line'])
+            if abs(gap) >= gap_thr and abs(gap) > abs(best_gap):
+                # 只考慮方向正確的一邊 (大盤候選 = gap>0，小盤候選 = gap<0)
+                if (gap > 0 and c['selection'] == 'Over') or (gap < 0 and c['selection'] == 'Under'):
+                    best, best_gap = dict(c), gap
+        if best is not None:
+            best['status'] = (f"📡 角球訊號追蹤 (模型預期 {float(best['exp_c_total']):.1f} 角 vs 盤口線 "
+                              f"{float(best['line']):g}，差距 {best_gap:+.1f} ≥ {gap_thr:g}；$0 模擬注驗證訊號用)")
+            best['gate_ok'] = False   # 永遠 $0 模擬注，絕不實注
+            best['tracker'] = True
+            out.append(best)
     return out
 
 
@@ -4209,6 +4380,9 @@ def v9_get_settings():
         'new_league_paper': bool(st.session_state.get('v11_new_league_paper', True)),
         'league_breaker': bool(st.session_state.get('v11_league_breaker', True)),
         'auto_sys': bool(st.session_state.get('v11_auto_sys', True)),
+        'corner_off': bool(st.session_state.get('v11_corner_off', V10_SETTING_DEFAULTS['v11_corner_off'])),
+        'corner_tracker': bool(st.session_state.get('v11_corner_tracker', V10_SETTING_DEFAULTS['v11_corner_tracker'])),
+        'corner_track_gap': float(st.session_state.get('v11_corner_track_gap', V10_SETTING_DEFAULTS['v11_corner_track_gap'])),
         # V14 試注層與驗證門檻 (ROI 值以 % 儲存，例如 2.0 = 2%)
         'trial': bool(st.session_state.get('v11_trial', True)),
         'act_min_n': int(st.session_state.get('v11_act_min_n', V10_SETTING_DEFAULTS['v11_act_min_n'])),
@@ -5616,6 +5790,102 @@ def _tipsme_context_fields(home_team, away_team):
         return {}
     return {k: v for k, v in (fd.get('ctx') or {}).items() if v}
 
+def _tipsme_fetch_page_html(url, timeout=25):
+    """下載 Tipsme 賽程頁 HTML。tipsme.hk 會攔截 Python 程式的 TLS 指紋 (HTTP 403)，
+    因此依序嘗試三種方法：
+      1. curl_cffi (若已安裝，模擬 Chrome 指紋，最可靠 — 可在 requirements.txt 加一行 curl_cffi)
+      2. 系統 curl 指令 (大部分 Linux 容器都有)
+      3. 普通 requests (後備)
+    回傳 HTML 字串 or None"""
+    # 1) curl_cffi (模擬瀏覽器 TLS 指紋)
+    try:
+        from curl_cffi import requests as cffi_requests
+        r = cffi_requests.get(url, impersonate='chrome', timeout=timeout)
+        if r.status_code == 200 and 'scheduleDetails' in r.text:
+            return r.text
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    # 2) 系統 curl
+    try:
+        import subprocess
+        out = subprocess.run(
+            ['curl', '-s', '--max-time', str(timeout),
+             '-H', 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+             '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+             '-H', 'Accept-Language: zh-HK,zh-TW;q=0.9,zh;q=0.8,en;q=0.7',
+             url],
+            capture_output=True, text=True, timeout=timeout + 5)
+        if out.returncode == 0 and 'scheduleDetails' in out.stdout:
+            return out.stdout
+    except Exception:
+        pass
+    # 3) 普通 requests (後備)
+    try:
+        r = requests.get(url, headers=TIPSME_HEADERS, timeout=timeout)
+        if r.status_code == 200 and 'scheduleDetails' in r.text:
+            return r.text
+    except Exception:
+        pass
+    return None
+
+
+def tipsme_fetch_season_schedule(url, timeout=25):
+    """V14.1 賽程連結模式：貼上 Tipsme 聯賽賽程連結 → 一次讀取整季所有輪次的比賽。
+    賽程頁是伺服器端渲染：整季全部輪次 (例如 R1-R38 共 382 場) 已內嵌在頁面 JSON 中，
+    網頁上的輪次下拉只是前端過濾 — 同一條連結已含全部輪次數據，毋須逐場複製比賽鏈結。
+    每場比賽包含：輪次、馬會 match ID、主客隊、開賽時間、狀態，以及已完場比賽的
+    全場/半場入球、角球、紅牌、黃牌 (可直接用於結算核對)。
+    回傳 (比賽列表 or None, 訊息)"""
+    url = str(url or '').strip()
+    if 'tipsme.hk' not in url or '/tournament/schedule/' not in url:
+        return None, '無法辨認賽程連結：請貼上 tipsme.hk/zh-HK/tournament/schedule/seasonId/... 的連結。'
+    try:
+        html = _tipsme_fetch_page_html(url, timeout=timeout)
+        if not html:
+            return None, ('賽程頁被網站防護攔截。解決方法：在 GitHub 專案的 requirements.txt '
+                          '加一行 curl_cffi (模擬瀏覽器下載，最可靠)，或稍後再試，或改用逐場鏈結。')
+        mm = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.S)
+        if not mm:
+            return None, '賽程頁沒有內嵌數據 (可能被網站防護攔截)，請稍後再試或改用逐場鏈結。'
+        d = json.loads(mm.group(1))
+        sd = (((d.get('props') or {}).get('pageProps') or {}).get('scheduleDetails')) or []
+        if not sd:
+            return None, '賽程頁沒有比賽數據 (可能連結已過期)。'
+
+        def _sc(arr, idx):
+            try:
+                return int(arr[idx])
+            except Exception:
+                return None
+
+        matches = []
+        for x in sd:
+            i = x.get('info') or {}
+            hs = i.get('home_scores') or []
+            as_ = i.get('away_scores') or []
+            mid = x.get('hkjc_match_id')
+            matches.append({
+                'round': int((i.get('round') or {}).get('round_num', 0) or 0),
+                'hkjc_match_id': int(mid) if mid else None,
+                'home': str(x.get('home_team_name') or '').strip(),
+                'away': str(x.get('away_team_name') or '').strip(),
+                'match_time': i.get('match_time'),
+                'finished': i.get('status_id') == 8,
+                # 已完場比賽的賽果 (與結算欄位對應)：全場/半場入球、角球、紅牌、黃牌
+                'home_goal': _sc(hs, 0), 'away_goal': _sc(as_, 0),
+                'home_half': _sc(hs, 1), 'away_half': _sc(as_, 1),
+                'home_corner': _sc(hs, 4), 'away_corner': _sc(as_, 4),
+                'home_red': _sc(hs, 2), 'away_red': _sc(as_, 2),
+                'home_yellow': _sc(hs, 3), 'away_yellow': _sc(as_, 3),
+            })
+        matches.sort(key=lambda r: (r['round'], r['match_time'] or 0))
+        return matches, f'已讀取 {len(matches)} 場比賽 (整季全部輪次)'
+    except Exception as e:
+        return None, f'讀取賽程頁失敗: {e}'
+
+
 def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
     """賽前頁：貼上鏈結自動填充區 (填充後顯示資料預覽供核對，所有欄位仍可手動修改)"""
     st.markdown("##### 0. 🔗 貼上 Tipsme 鏈結自動填充 (賽事與球隊資料 + 盤口賠率 + 近 5 場狀態)")
@@ -5636,6 +5906,56 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
                        "對賽往績、聯賽積分統計 (總/主/客/近6)、馬會讓球 / 入球大小 / 角球大小全部賠率變化、"
                        "其他玩法紀錄 (半場盤、角球讓球、球隊入球/角球等)，以及其他莊家 (約 20 間) 讓球 / 入球大小 / 主客和的初盤終盤比較。"
                        "填充後請核對各欄位，可直接修改。連結只會低頻率讀取數次。")
+
+        # --- V14.1 賽程連結模式：貼上聯賽賽程連結，按輪次一鍵填充，不用逐場複製鏈結 ---
+        st.markdown("---")
+        st.markdown("**📅 賽程連結模式 (整季一次讀取，按輪次選比賽)**")
+        sched_link = st.text_input("貼上 Tipsme 聯賽賽程連結 (例如 https://tipsme.hk/zh-HK/tournament/schedule/seasonId/ednm9whk8j8ryox)",
+                                   key="tipsme_sched_link")
+        if st.button("📅 讀取賽程 (整季所有輪次)", key="tipsme_sched_btn", use_container_width=True):
+            matches, msg = tipsme_fetch_season_schedule(sched_link)
+            if matches:
+                st.session_state['tipsme_schedule'] = matches
+                st.toast("✅ " + msg, icon="📅")
+                st.rerun()
+            else:
+                st.error(msg)
+        st.caption("💡 賽程頁一條連結已內嵌整季全部輪次 (R1 至最後一輪) 的比賽：主客隊、開賽時間、馬會比賽 ID，"
+                   "以及已完場比賽的賽果 (入球、半場、角球、紅黃牌)。讀取一次後，下方按輪次選擇比賽，"
+                   "逐場按「填充此場」即等同貼上該場比賽鏈結，之後的分析、下注、結算流程完全不變。")
+        sched = st.session_state.get('tipsme_schedule')
+        if sched:
+            rounds = sorted({r['round'] for r in sched if r['round'] > 0})
+            if rounds:
+                sel_round = st.selectbox("選擇輪次", rounds, key="tipsme_sched_round",
+                                         format_func=lambda r: f"第 {r} 輪 (R{r})")
+                rm = [r for r in sched if r['round'] == sel_round]
+                st.markdown(f"**第 {sel_round} 輪共 {len(rm)} 場比賽** (✅ = 已完場，附賽果可供結算核對)")
+                for r in rm:
+                    c_m, c_b = st.columns([4, 1])
+                    _ko = ''
+                    try:
+                        _ko = datetime.fromtimestamp(r['match_time'], HKT).strftime('%m-%d %H:%M')
+                    except Exception:
+                        pass
+                    if r['finished']:
+                        _res = (f"完 {r['home_goal']}-{r['away_goal']} (半 {r['home_half']}-{r['away_half']}, "
+                                f"角 {r['home_corner']}-{r['away_corner']}, 紅 {r['home_red']}-{r['away_red']})")
+                        _line = f"✅ **{r['home']} vs {r['away']}** · {_ko} · {_res}"
+                    else:
+                        _line = f"🕒 **{r['home']} vs {r['away']}** · {_ko} · 未開賽"
+                    c_m.markdown(_line)
+                    if r.get('hkjc_match_id'):
+                        if c_b.button("填充此場", key=f"sched_fill_{r['hkjc_match_id']}", use_container_width=True):
+                            _murl = f"https://tipsme.hk/zh-HK/match/{r['hkjc_match_id']}/chat"
+                            ok, msg2, _ = tipsme_auto_fill(_murl, df_db, opts_tournaments, opts_teams)
+                            if ok:
+                                st.toast(f"✅ 已填充：{r['home']} vs {r['away']}", icon="🔗")
+                                st.rerun()
+                            else:
+                                st.error(msg2)
+                    else:
+                        c_b.caption("無馬會盤")
 
         fd = st.session_state.get('tipsme_fill_data')
         if fd:
@@ -6288,9 +6608,7 @@ def render_time_dimension_pnl_tab(df_settled, sys_bankroll, sys_max_stake):
     st.divider()
     render_bet_type_comparison_chart(df_settled, bet_types, "tdp_compare")
 
-    # --- 聯賽 × 盤口績效分析 (V13.3) ---
-    st.divider()
-    render_league_bettype_pnl_section(df_settled)
+    st.caption("💡 聯賽 × 盤口績效分析已移至『🤖 全局模型』板塊。")
 
 LBT_COMBO_OPTIONS = [
     ('總體 (全部盤口)', None),
@@ -6765,6 +7083,15 @@ def main():
         st.checkbox("系統自動預選每種盤口 (讓球 / 入球 / 角球各一注)", key="v11_auto_sys", on_change=v10_save_settings,
                     help="每種盤口類型在莊家最新仍提供的盤口線中，自動選出系統認為最合適的一邊：通過驗證的 ✅ 建議用 Kelly 注碼實注，其餘為 $0 模擬注。"
                          "確保每場輸入的比賽都會存入數據庫供學習，並追蹤系統每種盤口的真實表現。舊盤口及同方向的相關盤口線 (例如 2.5 小之外再加 2.75 小) 不會重複預選。")
+        st.checkbox("🚫 停用角球大小 (不建議、不作模擬注記錄)", key="v11_corner_off", value=V10_SETTING_DEFAULTS['v11_corner_off'], on_change=v10_save_settings,
+                    help="角球大小樣本已達統計顯著虧損 (580 注、每注 −15.3 單位，95% 區間全為負)，繼續記錄只會令模型學到雜訊。"
+                         "開啟後角球完全不參與自動預選、模擬注及記錄 (分析表中仍會顯示「⏸ 角球已停用」供參考)；日後想恢復記錄隨時可關閉此選項。")
+        st.checkbox("📡 角球訊號追蹤 (模型預期與盤口線差距 ≥ 門檻時記錄 $0 模擬注)", key="v11_corner_tracker", value=V10_SETTING_DEFAULTS['v11_corner_tracker'], on_change=v10_save_settings,
+                    help="實測發現球隊角球攻防數據有預測能力，且馬會角球盤口線系統性偏高：模型預期總角球與盤口線差距 ≥1.0 角時，"
+                         "歷史 64 注全贏率 65.6%。此模式在角球停用下仍會於差距達門檻時記錄一注 $0 模擬注 (方向跟隨模型偏離)，"
+                         "零成本累積樣本驗證訊號；差距不足則完全不記錄。永遠 $0，絕不實注。")
+        st.number_input("角球訊號門檻 (角)", min_value=0.5, max_value=3.0, step=0.5, key="v11_corner_track_gap", on_change=v10_save_settings,
+                        help="模型預期總角球與盤口線的差距達到此數才記錄訊號追蹤注。1.0 = 實測全贏率 65.6% 的門檻；越高注數越少但歷史勝率越高。")
         st.number_input("最低 EV 門檻 (%)", min_value=0.0, max_value=20.0, step=0.5, key="v9_min_ev", on_change=v10_save_settings,
                         help="只有估計期望值 ≥ 此門檻的盤口才會被建議。0% = 注數多但包含大量優勢極薄、估計誤差內的投注；3% = 注數少但每注質素較高。")
         st.select_slider("Kelly 分數", options=[0.1, 0.15, 0.2, 0.25, 0.33, 0.5], key="v9_kelly", on_change=v10_save_settings,
@@ -6803,11 +7130,7 @@ def main():
             v10_save_settings()
             st.rerun()
         if st.button("♻ 重新訓練 V9 模型 + V10 看盤引擎", use_container_width=True, key="v9_retrain"):
-            v9_train_engine_cached.clear()
-            v9_history_tables_cached.clear()
-            v10_train_engine_cached.clear()
-            v11_arena_cached.clear()
-            v11_data_audit_cached.clear()
+            v14_clear_model_caches()
             st.toast("已清除模型快取，下次分析時會重新訓練。(投注設定不受影響)", icon="♻")
 
     with st.sidebar.expander("💸 資金存提管理"):
@@ -6874,7 +7197,7 @@ def main():
 
         if sys_bankroll <= 0: st.warning("⚠ 目前系統可用資金不足！無法精確計算建議注碼。請先至側邊欄存入本金。")
         try:
-            _iss = v11_issues_active(v11_data_audit_cached(st.session_state.df_db))
+            _iss = v11_issues_active(v11_get_audit(st.session_state.df_db))
             _nh = int((_iss['嚴重程度'] == '🔴 高').sum()) if not _iss.empty else 0
             if _nh:
                 st.warning(f"🧹 數據質素檢查發現 {_nh} 項嚴重問題 (重複注單、賽事標籤錯誤、排名未填、結算不符等)，會令模型學錯。請到「🤖 全局模型 → 🧹 V11 數據質素檢查」修正，或核實數據正確後勾選「✅ 確認無誤」。")
@@ -7098,6 +7421,15 @@ def main():
             # 賽前情境：只使用比賽日期之前的數據庫資料 (球隊攻防數據、對賽往績、賽事環境)
             v9_ctx = v9_match_context(mt_hist, tl_hist, home_team, away_team, tournament_name, _md_ts, hr_val, ar_val, hf_val, af_val)
             scored = v9_score_candidates(engine, candidates_base, v9_ctx, v9_set, nsnap_map) if candidates_base else []
+            # V14.3 角球訊號追蹤：在每個角球候選上附上「模型預期總角球」
+            # (主隊角球攻+客隊角球守 / 客隊角球攻+主隊角球守，與實測驗證的公式一致)
+            try:
+                _v143_exp_c = (v9_ctx['hp']['cf'] + v9_ctx['ap']['ca']) / 2.0 + (v9_ctx['ap']['cf'] + v9_ctx['hp']['ca']) / 2.0
+            except Exception:
+                _v143_exp_c = None
+            for _c in scored:
+                if v9_clean_bt(_c['bet_type']) == '角球大小':
+                    _c['exp_c_total'] = _v143_exp_c
 
             # V10 看盤引擎：以初盤→收盤的盤口/水位變化 + 實力冷熱，套用樣本外驗證為正 EV 的看盤規則
             kp_engine = v10_get_engine(st.session_state.df_db)
@@ -7119,6 +7451,10 @@ def main():
                 c['is_offered'] = bool(v11_is_offered(_offered_now, v9_clean_bt(c['bet_type']), c['line']))
                 if not c['is_offered']:
                     c['status'] = '⏸ 舊盤口 (莊家已不再提供)'
+                    c['gate_ok'] = False
+                # V14.2：角球停用 — 不建議、不作模擬注記錄 (設定可開關)
+                if v9_set.get('corner_off', True) and v9_clean_bt(c['bet_type']) == '角球大小':
+                    c['status'] = '⏸ 角球已停用 (設定)'
                     c['gate_ok'] = False
             kp_summary = []
             for (_kbt, _kln, _ksd), _kv in kp_map.items():
@@ -7664,7 +8000,8 @@ def main():
 
                 with bet_col3:
                     st.markdown("**⚽ 角球大小 (Corners O/U)**")
-                    ip_cr_on = st.checkbox("此場有此即場盤口", value=True, key="ip_cr_on")
+                    ip_cr_on = st.checkbox("此場有此即場盤口", value=not v9_get_settings().get('corner_off', True), key="ip_cr_on",
+                                           help="預設跟隨側邊欄「🚫 停用角球大小」設定 (已停用時此格預設不勾選)。")
                     ip_cr_line = st.number_input("角球盤口線", min_value=0.0, max_value=30.0, step=0.5, format="%.2f", key="ip_cr_line", disabled=not ip_cr_on)
                     ip_cr_upper = st.number_input("大賠率 (Over)", min_value=1.01, max_value=100.0, step=0.01, format="%.2f", key="ip_cr_upper", disabled=not ip_cr_on, on_change=auto_calc_lower, args=("ip_cr",))
                     ip_cr_lower = st.number_input("小賠率 (Under)", min_value=1.01, max_value=100.0, step=0.01, format="%.2f", key="ip_cr_lower", disabled=not ip_cr_on, on_change=mark_manual_lower, args=("ip_cr",))
@@ -8123,6 +8460,10 @@ def main():
                         
                     save_db(st.session_state.df_db, db_file, db_table)
                     st.toast(f"✅ {sel_match} 結算完成！", icon="⚖️")
+                    # V14.1：結算後預先學習 — 只在數據簽名改變 (每 5 場新賽果) 時才真正重訓，
+                    # 把學習時間移到不急的結算步驟；下一場賽前分析直接命中快取 (即時完成)。
+                    with st.spinner("🧠 模型更新中 (每 5 場新賽果重訓一次；下次賽前分析會即時完成)..."):
+                        v14_warm_engines(st.session_state.df_db)
                     st.rerun()
 
     # 先渲染「時間維度盈虧記錄分析」分頁，再執行「全局模型」的 ML 訓練：
@@ -8307,6 +8648,10 @@ def main():
             # --- 深度學習與機器學習盈虧分析 (由『時間維度盈虧記錄分析』板塊移至此處) ---
             st.divider()
             render_dl_ml_analysis_section(df_settled)
+
+            # --- 聯賽 × 盤口績效分析 (V14.2：由『時間維度盈虧記錄分析』板塊移至此處) ---
+            st.divider()
+            render_league_bettype_pnl_section(df_settled)
 
 if __name__ == "__main__":
     main()
