@@ -61,6 +61,31 @@ from datetime import datetime, timedelta, timezone
 #      (與深度學習/機器學習盈虧分析放在一起，方便對照各盤口與聯賽的模型表現)。
 #
 # =============================================================================
+# V14.5 賽程記錄進度顯示
+#
+#   賽程連結模式的比賽列表，每場右側新增「資料庫記錄狀態」：
+#     ✅ 賽果已結算 — 資料庫已有此場注單且全部已結算
+#     📝 已記錄 · 待結算 — 資料庫已有此場注單但尚有未結算
+#     (空白) — 未記錄，可按「填充此場」
+#   一眼可見記錄到哪一場、哪場尚未結算，避免重複記錄或漏記。
+#   狀態每次頁面渲染即時從資料庫比對 (同隊伍+同日期)，結算完成後再回到賽程頁即會更新。
+#
+# =============================================================================
+# V14.4 結算自動讀取與重複比賽警告
+#
+#   1. 新增 Tipsme_Match_ID 欄位：賽事建檔 (含賽程連結模式) 時自動記錄 Tipsme
+#      的比賽 ID。V14.4 起新建立的注單可直接用「自動讀取賽果」，毋須再貼任何鏈結。
+#   2. 結算頁新增「🤖 自動讀取賽果」：按一下即自動找出所選比賽的賽果 (全場/半場
+#      比數、角球、紅黃牌) 並填入輸入欄，同時自動更新收盤價賠率。來源順序：
+#      ① 注單內記錄的比賽 ID → ② 本工作階段載入的賽程數據 (按隊伍+日期比對) →
+#      ③ 貼上聯賽賽程連結 (一個聯賽只需貼一次，整季通用)。
+#   3. 重複比賽偵測 (防重複記錄)：
+#      - 賽事建檔「選擇填充此場」時：若資料庫已有同一聯賽、同一場比賽 (隊伍+日期)
+#        的記錄，顯示警告並列出已存在的注單，跳過本次填充。
+#      - 貼上單場比賽鏈結時：偵測到重複比賽會提出警告，可選擇繼續 (例如更新舊注單)。
+#   4. 賽果套用的隊名比對改為正規化比對 (去空格/分隔符)，兼容賽程數據來源的隊名差異。
+#
+# =============================================================================
 # V14.3 角球訊號追蹤模式
 #
 #   實測 (用戶 605 場角球賽果數據) 發現：球隊角球攻防數據有預測能力 (與實際總角球
@@ -147,8 +172,8 @@ DB_COLUMNS = [
     'Home_Rating', 'Away_Rating', 'League_Size', 'Home_Form', 'Away_Form',
     'Home_Form10', 'Away_Form10', 'Home_Recent_Matches', 'Away_Recent_Matches',
     'H2H_Records', 'Home_League_Stats', 'Away_League_Stats', 'Bookmaker_Odds', 'HKJC_Extra_Odds',
-    'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 
-    'System_Stake', 'User_Stake', 'Odds_History',
+    'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds',
+    'System_Stake', 'User_Stake', 'Odds_History', 'Tipsme_Match_ID',
     'InPlay_Minute', 'Home_DA', 'Away_DA', 'Home_SoT', 'Away_SoT', 'Home_SoFF', 'Away_SoFF',
     'Home_Red', 'Away_Red', 'Home_Yellow', 'Away_Yellow', 'Half_Score',
     'Home_Sub', 'Away_Sub', 'Home_Possession', 'Away_Possession',
@@ -226,7 +251,7 @@ def load_db(filename, columns, table_name, force_cloud=False):
         'Home_Recent_Matches', 'Away_Recent_Matches', 'H2H_Records',
         'Home_League_Stats', 'Away_League_Stats', 'Bookmaker_Odds', 'HKJC_Extra_Odds',
         'Bet_Type', 'Selection', 'Odds_History', 'Result_Label',
-        'Half_Score',
+        'Half_Score', 'Tipsme_Match_ID',
         'Type', 'Account', 'Note'
     ]
     
@@ -5634,6 +5659,29 @@ def tipsme_pick_category(league, is_cup, df_db=None):
         return "友誼賽 (Friendly)"
     return "國內聯賽 (Domestic League)"
 
+def v14_find_duplicate_match(df_db, home, away, match_date):
+    """V14.4 重複比賽偵測：資料庫是否已有同一場比賽 (同主客隊 + 同比賽日期) 的注單記錄。
+    回傳符合的注單 DataFrame (可為空)；df_db 無效時回傳 None"""
+    if df_db is None or getattr(df_db, 'empty', True) or not home or not away:
+        return None
+    try:
+        _nm = lambda s: re.sub(r'[\s\-_·•]', '', str(s or ''))
+        _m = df_db['Match'].astype(str).map(v11_clean_name) if 'Match' in df_db.columns else None
+        if _m is None:
+            return None
+        # 名稱正規化後比對 (去空格及分隔符，v11_clean_name 已先去掉首尾空格)
+        _same_teams = _m.map(lambda s: _nm(s) == f"{_nm(home)}vs{_nm(away)}")
+        if not _same_teams.any():
+            return pd.DataFrame()
+        _md = v10_md_series(df_db)
+        if match_date is not None:
+            _dstr = pd.to_datetime(match_date).strftime('%Y-%m-%d')
+            return df_db[_same_teams & (_md == _dstr)]
+        return df_db[_same_teams]
+    except Exception:
+        return None
+
+
 def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams):
     """貼上鏈結 → 讀取資料 → 寫入表單所有輸入欄位 (用家其後仍可逐項核對及修改)。
     回傳 (成功?, 訊息, 填充結果 dict)"""
@@ -5771,6 +5819,17 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams):
                  'h_rank': st.session_state.get('h_rank'), 'a_rank': st.session_state.get('a_rank'),
                  'rank_source': rank_source,
                  'core_count': len(st.session_state.odds_history) if odds_ok else 0}
+    # V14.4：記錄 Tipsme 比賽 ID 到注單 (結算時可直接自動讀取賽果，不用再貼鏈結)
+    if mid:
+        ctx['Tipsme_Match_ID'] = str(mid)
+    # V14.4：重複比賽警告 — 資料庫已有同一場比賽 (同隊伍+同日期) 的記錄時提示，避免重複記錄
+    _dup = v14_find_duplicate_match(df_db, info.get('home'), info.get('away'),
+                                    info['kickoff'].date() if info.get('kickoff') is not None else None)
+    if _dup is not None and not _dup.empty:
+        _dup_ids = ', '.join(_dup['ID'].astype(str).head(5))
+        _dup_st = '/'.join(sorted(set(_dup['Status'].astype(str)))[:3])
+        warnings.insert(0, f"⚠️ 資料庫已有此比賽的記錄 ({len(_dup)} 張注單 [{_dup_st}]，ID: {_dup_ids})。"
+                           f"如非確實要為此場加新注單，請勿重複提交。")
     st.session_state['tipsme_fill_data'] = fill_data
     st.session_state['tipsme_fill_mid'] = mid
     return True, "已讀取並自動填充，請核對以下資料。", fill_data
@@ -5930,14 +5989,26 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
                 sel_round = st.selectbox("選擇輪次", rounds, key="tipsme_sched_round",
                                          format_func=lambda r: f"第 {r} 輪 (R{r})")
                 rm = [r for r in sched if r['round'] == sel_round]
-                st.markdown(f"**第 {sel_round} 輪共 {len(rm)} 場比賽** (✅ = 已完場，附賽果可供結算核對)")
+                st.markdown(f"**第 {sel_round} 輪共 {len(rm)} 場比賽** (✅ = 已完場，附賽果可供結算核對；"
+                            f"右側狀態 = 資料庫記錄進度：✅ 賽果已結算 / 📝 已記錄待結算 / 空白 = 未記錄)")
                 for r in rm:
-                    c_m, c_b = st.columns([4, 1])
+                    c_m, c_b, c_s = st.columns([4, 1, 1])
                     _ko = ''
                     try:
                         _ko = datetime.fromtimestamp(r['match_time'], HKT).strftime('%m-%d %H:%M')
                     except Exception:
                         pass
+                    # V14.5：此場在資料庫的記錄狀態 (同隊伍+同日期的注單)
+                    _st_dt = None
+                    try:
+                        _st_dt = datetime.fromtimestamp(r['match_time'], HKT).date() if r.get('match_time') else None
+                    except Exception:
+                        pass
+                    _rec = v14_find_duplicate_match(df_db, r['home'], r['away'], _st_dt)
+                    _st_badge = ''
+                    if _rec is not None and not _rec.empty:
+                        _sts = set(_rec['Status'].astype(str))
+                        _st_badge = '✅ **賽果已結算**' if (_sts and _sts.issubset({'Settled'})) else '📝 已記錄 · 待結算'
                     if r['finished']:
                         _res = (f"完 {r['home_goal']}-{r['away_goal']} (半 {r['home_half']}-{r['away_half']}, "
                                 f"角 {r['home_corner']}-{r['away_corner']}, 紅 {r['home_red']}-{r['away_red']})")
@@ -5945,15 +6016,29 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
                     else:
                         _line = f"🕒 **{r['home']} vs {r['away']}** · {_ko} · 未開賽"
                     c_m.markdown(_line)
+                    if _st_badge:
+                        c_s.markdown(_st_badge)
                     if r.get('hkjc_match_id'):
                         if c_b.button("填充此場", key=f"sched_fill_{r['hkjc_match_id']}", use_container_width=True):
-                            _murl = f"https://tipsme.hk/zh-HK/match/{r['hkjc_match_id']}/chat"
-                            ok, msg2, _ = tipsme_auto_fill(_murl, df_db, opts_tournaments, opts_teams)
-                            if ok:
-                                st.toast(f"✅ 已填充：{r['home']} vs {r['away']}", icon="🔗")
-                                st.rerun()
+                            # V14.4：先檢查資料庫是否已有此比賽記錄，避免重複記錄
+                            _dup_dt = None
+                            try:
+                                _dup_dt = datetime.fromtimestamp(r['match_time'], HKT).date() if r.get('match_time') else None
+                            except Exception:
+                                pass
+                            _dup = v14_find_duplicate_match(df_db, r['home'], r['away'], _dup_dt)
+                            if _dup is not None and not _dup.empty:
+                                st.warning(f"⚠️ 資料庫已有此比賽的記錄 ({len(_dup)} 張注單，ID: "
+                                           f"{', '.join(_dup['ID'].astype(str).head(5))})，已略過填充以避免重複記錄。"
+                                           f"如確實要為此場加新注單，請直接貼上該場比賽鏈結。")
                             else:
-                                st.error(msg2)
+                                _murl = f"https://tipsme.hk/zh-HK/match/{r['hkjc_match_id']}/chat"
+                                ok, msg2, _ = tipsme_auto_fill(_murl, df_db, opts_tournaments, opts_teams)
+                                if ok:
+                                    st.toast(f"✅ 已填充：{r['home']} vs {r['away']}", icon="🔗")
+                                    st.rerun()
+                                else:
+                                    st.error(msg2)
                     else:
                         c_b.caption("無馬會盤")
 
@@ -8290,6 +8375,94 @@ def main():
                 st.write(f"**待結算注單列表 ({len(target_bets)} 張):**")
                 st.dataframe(target_bets[['ID', 'Date', 'Match_Date', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 'System_Stake', 'User_Stake']], use_container_width=True)
                 
+                # V14.4：自動讀取賽果 — 毋須貼鏈結
+                # 來源優先順序：1) 注單已記錄的 Tipsme 比賽 ID (V14.4 起新注單自動記錄)
+                #              2) 本工作階段已載入的賽程數據 (按隊伍 + 日期比對，已完場比賽附賽果)
+                #              3) 下方貼上聯賽賽程連結 (一個聯賽只需貼一次，整季通用)
+                with st.expander("🤖 自動讀取賽果 (毋須貼鏈結；V14.4 起新注單已自動記錄比賽 ID)", expanded=True):
+                    st.caption("選好上方比賽後按一下即可：系統會自動找出此場比賽的賽果 (全場/半場比數、角球、紅黃牌) 並填入下方輸入欄。")
+                    _sched_link2 = st.text_input("聯賽賽程連結 (只在此場注單沒有記錄比賽 ID 時才需要；一個聯賽貼一次即可)",
+                                                key="tipsme_sched_link_settle",
+                                                placeholder="https://tipsme.hk/zh-HK/tournament/schedule/seasonId/...")
+                    if st.button("🤖 自動讀取此場賽果", key="auto_settle_btn", use_container_width=True):
+                        _sinfo = None
+                        _src = ''
+                        # --- 來源 1：注單內記錄的 Tipsme 比賽 ID ---
+                        _mid_auto = None
+                        if 'Tipsme_Match_ID' in target_bets.columns:
+                            _mids = target_bets['Tipsme_Match_ID'].dropna()
+                            _mids = _mids[~_mids.astype(str).str.strip().isin(('', 'nan', 'None', '<NA>'))]
+                            _mids = _mids.map(lambda v: str(int(float(v))) if re.fullmatch(r'\d+(\.0+)?', str(v).strip()) else str(v).strip())
+                            if len(_mids):
+                                _mid_auto = str(_mids.mode().iloc[0])
+                        if _mid_auto:
+                            with st.spinner(f"讀取比賽 ID {_mid_auto} 的賽果..."):
+                                _try = tipsme_fetch_match_info(_mid_auto)
+                            if _try and _try.get('finished'):
+                                _sinfo, _src = _try, '注單記錄的比賽 ID'
+                        # --- 來源 2/3：賽程數據 (本工作階段已載入，或即時貼連結讀取) ---
+                        if _sinfo is None:
+                            _sched = st.session_state.get('tipsme_schedule')
+                            if not _sched and _sched_link2:
+                                with st.spinner("讀取賽程頁 (整季所有輪次)..."):
+                                    _sched, _smsg = tipsme_fetch_season_schedule(_sched_link2)
+                                if _sched:
+                                    st.session_state['tipsme_schedule'] = _sched
+                            if _sched:
+                                _nm = lambda s: re.sub(r'[\s\-_·•]', '', str(s or ''))
+                                _th, _ta = (str(sel_match).split(' vs ', 1) + [''])[:2] if ' vs ' in str(sel_match) else ('', '')
+                                _best, _best_dd = None, 99
+                                for _x in _sched:
+                                    if not _x.get('finished'):
+                                        continue
+                                    if _nm(_x['home']) != _nm(_th) or _nm(_x['away']) != _nm(_ta):
+                                        continue
+                                    try:
+                                        _xd = datetime.fromtimestamp(_x['match_time'], HKT).strftime('%Y-%m-%d')
+                                    except Exception:
+                                        continue
+                                    _dd = abs((pd.to_datetime(_xd) - pd.to_datetime(str(sel_md)[:10])).days) if str(sel_md)[:10] else 0
+                                    if _dd <= 1 and _dd < _best_dd:
+                                        _best, _best_dd = _x, _dd
+                                if _best is not None:
+                                    _sc2 = lambda a, b: (f"{a}-{b}" if (a is not None and b is not None) else '')
+                                    _sinfo = {
+                                        'match_id': str(_best.get('hkjc_match_id') or ''),
+                                        'home': _best['home'], 'away': _best['away'], 'league': '',
+                                        'kickoff': (datetime.fromtimestamp(_best['match_time'], HKT) if _best.get('match_time') else None),
+                                        'finished': True,
+                                        'score': _sc2(_best['home_goal'], _best['away_goal']),
+                                        'half_score': _sc2(_best['home_half'], _best['away_half']),
+                                        'corner': _sc2(_best['home_corner'], _best['away_corner']),
+                                        'home_red': int(_best['home_red'] or 0), 'away_red': int(_best['away_red'] or 0),
+                                        'home_yellow': int(_best['home_yellow'] or 0), 'away_yellow': int(_best['away_yellow'] or 0),
+                                    }
+                                    _src = '賽程數據'
+                        # --- 套用賽果 (與貼鏈結模式同一機制) ---
+                        if _sinfo and _sinfo.get('finished'):
+                            st.session_state['tipsme_settle_data'] = _sinfo
+                            # 同時更新收盤價 (有比賽 ID 時；只增不刪、冪等，失敗不影響賽果讀取)
+                            _mid_use = str(_sinfo.get('match_id') or _mid_auto or '').strip()
+                            if _mid_use:
+                                try:
+                                    _api_odds_s = tipsme_fetch_hkjc_odds(_mid_use)
+                                    _core_s, _ = tipsme_build_odds_history(_api_odds_s) if _api_odds_s else ([], [])
+                                    if _core_s:
+                                        _upd_s, _add_s = clv_apply_closing_odds(
+                                            st.session_state.df_db, _core_s,
+                                            _sinfo.get('home'), _sinfo.get('away'), _sinfo.get('kickoff'))
+                                        if _add_s > 0:
+                                            save_db(st.session_state.df_db, db_file, db_table)
+                                            st.toast(f"🎯 已同時更新收盤價：{len(_upd_s)} 張注單共新增 {_add_s} 個快照", icon="🎯")
+                                except Exception:
+                                    pass
+                            st.session_state['tipsme_settle_apply'] = True
+                            st.toast(f"✅ 已自動讀取賽果 (來源: {_src})，請核對下方數值。", icon="🤖")
+                            st.rerun()
+                        else:
+                            st.warning("未能自動讀取：此場注單沒有記錄比賽 ID，賽程數據中亦找不到已完場的此場比賽。"
+                                       "請在上方貼上該聯賽的賽程連結再按一次；或用下方「貼上比賽鏈結」/手動輸入。")
+
                 # V12：貼上 Tipsme 鏈結自動讀取賽果 (全場比數 / 半場比分 / 角球 / 紅黃牌)
                 # V13.2：同一時間自動讀取最新盤口賠率並合併到該場注單 (收盤價)，CLV 即時可計算
                 with st.expander("🔗 貼上 Tipsme 鏈結自動讀取賽果 (比數 / 半場 / 角球 / 紅黃牌 / 收盤價)", expanded=False):
@@ -8343,7 +8516,9 @@ def main():
                 _apply_now = False  # V13.1：剛讀取賽果後的第一次渲染 (輸入欄不帶 value=，避免 Streamlit 警告)
                 if _ts_auto and ' vs ' in str(sel_match):
                     _ts_home, _ts_away = str(sel_match).split(' vs ', 1)
-                    if str(_ts_auto.get('home')).strip() == _ts_home.strip() and str(_ts_auto.get('away')).strip() == _ts_away.strip():
+                    # V14.4：以正規化名稱比對 (去空格及分隔符)，兼容賽程數據來源的隊名差異
+                    _ts_nm = lambda s: re.sub(r'[\s\-_·•]', '', str(s or ''))
+                    if _ts_nm(_ts_auto.get('home')) == _ts_nm(_ts_home) and _ts_nm(_ts_auto.get('away')) == _ts_nm(_ts_away):
                         _ts_use = _ts_auto
                 _def_hred, _def_ared = 0, 0
                 _def_hyel, _def_ayel = 0, 0
