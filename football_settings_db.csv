@@ -16,6 +16,9 @@ v11_act_min_n,50
 v11_act_roi,2.0
 v11_trial_min_n,30
 v11_trial_roi,1.0
+v11_corner_off,True
+v11_corner_tracker,True
+v11_corner_track_gap,1.0
 LS|亞冠二級聯賽,32
 LS|日本聯賽盃,40
 LS|南韓職業聯賽,12
@@ -39,7 +42,7 @@ IGN|51f3e7526579,1
 IGN|5eb29c8bb1e7,1
 IGN|762ffdb9aef4,1
 IGN|7ac6ff1f7f6f,1
-IGN|7b10a3bedc6d,1
+IGN|7bc36ea873d1,1
 IGN|828a5680a467,1
 IGN|989a3112d942,1
 IGN|a9587d62bc9e,1
