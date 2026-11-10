@@ -95,6 +95,20 @@ from datetime import datetime, timedelta, timezone
 #   重複檢查、自動填充的重複警告) 均已傳入比賽 ID，狀態顯示與防重複記錄同步修正。
 #
 # =============================================================================
+# V14.8 聯賽 × 盤口績效分析納入全部注數 (含 $0 模擬注)
+#
+#   問題：舊版只計「注碼 > 0」的注單 (644 注)，$0 模擬注 (1200 注) 完全不參與
+#   ROI、命中率及驗證，樣本不到一半，驗證結論易被小樣本誤導。
+#
+#   修復：新增「計算範圍」選項 (預設 = 全部注數，含 $0 模擬注)：
+#     1. ROI、95%誤差範圍、命中率、前後半段 ROI 及驗證改以「每注 1 單位」的
+#        Unit_Profit 計算 — $0 模擬注也有單位盈虧 (+賠率−1 / −1)，因此全部注數
+#        都參與；與舊算法 (盈虧÷注碼) 在有注碼的注單上結果一致。
+#     2. 投注額、下注盈虧 ($) 仍只計實際注碼的金額，不受模擬注影響。
+#     3. 表格新增「其中$0模擬」欄，總覽下方顯示模擬注數量說明。
+#     4. 「只計有注碼的注單」選項保留舊行為，方便對照。
+#
+# =============================================================================
 # V14.4 結算自動讀取與重複比賽警告
 #
 #   1. 新增 Tipsme_Match_ID 欄位：賽事建檔 (含賽程連結模式) 時自動記錄 Tipsme
@@ -6764,8 +6778,11 @@ LBT_COMBO_OPTIONS = [
 ]
 
 def _lbt_stats(gg):
-    """計算一組注單 (已過濾注碼>0) 的績效指標：ROI、95%誤差範圍、單位盈虧、金額盈虧、命中率、前後半段"""
-    r = gg['_profit'] / gg['_stake']
+    """計算一組注單的績效指標：ROI、95%誤差範圍、單位盈虧、金額盈虧、命中率、前後半段。
+    V14.8：ROI/命中率/前後半段/驗證改以「每注 1 單位」的 Unit_Profit 計算 —
+    $0 模擬注也有單位盈虧 (+賠率−1 / −1)，因此全部注數都參與 ROI 及驗證，
+    與舊算法 (盈虧÷注碼) 在有注碼的注單上結果一致。投注額/下注盈虧 ($) 仍為實際金額。"""
+    r = gg['_unit']
     n = len(gg)
     roi = float(r.mean())
     ci = float(1.96 * r.std(ddof=1) / np.sqrt(n)) if n > 1 else 1.0
@@ -6776,11 +6793,12 @@ def _lbt_stats(gg):
           and r1 is not None and r2 is not None and r1 > 0 and r2 > 0)
     return {
         '注數': n,
+        '其中$0模擬': int((pd.to_numeric(gg['_stake'], errors='coerce').fillna(0) <= 0).sum()),
         '投注額 ($)': round(float(gg['_stake'].sum()), 0),
         '下注盈虧 ($)': round(float(gg['_profit'].sum()), 2),
         'ROI': f"{roi * 100:+.1f}%",
         '95%誤差範圍': f"±{ci * 100:.1f}%",
-        '單位盈虧 (U)': round(float(gg['_unit'].sum()), 2),
+        '單位盈虧 (U)': round(float(r.sum()), 2),
         '命中率': f"{float((r > 0).mean()) * 100:.1f}%",
         '前半段 ROI': f"{r1 * 100:+.1f}% ({h})" if r1 is not None else '-',
         '後半段 ROI': f"{r2 * 100:+.1f}% ({n - h})" if r2 is not None else '-',
@@ -6801,6 +6819,10 @@ def render_league_bettype_pnl_section(df_settled):
         return
     basis = st.radio("盈虧計算基準", ["系統注碼 (System_Stake)", "用家注碼 (User_Stake)"],
                      horizontal=True, key="lbt_basis")
+    scope = st.radio("計算範圍", ["全部注數 (含 $0 模擬注)", "只計有注碼的注單"],
+                     horizontal=True, index=0, key="lbt_scope",
+                     help="V14.8 起預設包含 $0 模擬注：ROI、命中率、前後半段及驗證以每注 1 單位的單位盈虧計算，"
+                          "全部注數都參與，樣本更大、驗證更可靠。投注額與下注盈虧 ($) 仍只計實際注碼的金額。")
     combo_label = st.selectbox("盤口組合 (負 ROI 盤口不會污染其他盤口)",
                               [c[0] for c in LBT_COMBO_OPTIONS], key="lbt_combo")
     combo_types = dict(LBT_COMBO_OPTIONS)[combo_label]
@@ -6814,9 +6836,10 @@ def render_league_bettype_pnl_section(df_settled):
     d['_profit'] = pd.to_numeric(d[profit_col], errors='coerce').fillna(0.0)
     d['_unit'] = pd.to_numeric(d.get('Unit_Profit'), errors='coerce').fillna(0.0) if 'Unit_Profit' in d.columns else 0.0
     d['_md'] = pd.to_datetime(d['Match_Date'], errors='coerce').fillna(pd.to_datetime(d['Date'], errors='coerce'))
-    dd = d[d['_stake'] > 0]
+    # V14.8：預設包含 $0 模擬注 (全部注數)；「只計有注碼」時才過濾注碼 > 0
+    dd = d if scope.startswith("全部") else d[d['_stake'] > 0]
     if dd.empty:
-        st.info("沒有可計算的注單 (需要注碼 > 0 的已結算注單)。")
+        st.info("沒有可計算的注單。")
         return
     # --- 所選組合總覽 ---
     st.markdown(f"**「{combo_label}」總覽 (全部聯賽合計)**")
@@ -6827,6 +6850,9 @@ def render_league_bettype_pnl_section(df_settled):
     tc3.metric("下注盈虧", f"${tot['下注盈虧 ($)']:,.2f}")
     tc4.metric("ROI", tot['ROI'])
     tc5.metric("命中率", tot['命中率'])
+    if tot['其中$0模擬'] > 0:
+        st.caption(f"ℹ️ 以上含 **{tot['其中$0模擬']} 注 $0 模擬注** — ROI/命中率以每注 1 單位計算，全部 {tot['注數']} 注都參與；"
+                   f"投注額與下注盈虧 ($) 只計實際注碼 ({tot['注數'] - tot['其中$0模擬']} 注)。")
     # --- 每個聯賽 ---
     rows = []
     for lg, g in dd.groupby('Tournament_Name'):
@@ -6854,7 +6880,8 @@ def render_league_bettype_pnl_section(df_settled):
             st.dataframe(pd.DataFrame(det_rows).sort_values('單位盈虧 (U)', ascending=False),
                          use_container_width=True, hide_index=True, height=max(280, 38 * len(det_rows)))
     st.caption("💡 解讀：✅ 通過 = 注數 ≥ 30、ROI ≥ +2%、前後半段各 ≥ 8 注且皆盈利 (門檻比模型擂台寬鬆，僅供快速篩選)。"
-               "「前半段賺、後半段蝕」的組合要警惕優勢消失；「前後皆賺」才是較可靠的訊號。")
+               "「前半段賺、後半段蝕」的組合要警惕優勢消失；「前後皆賺」才是較可靠的訊號。"
+               "「其中$0模擬」= 該組注數中屬 $0 模擬注的數量；ROI 與驗證以全部注數 (含模擬注) 計算。")
 
 def render_bet_type_comparison_chart(df_settled, bet_types, key_prefix):
     """渲染盤口類型對比盈虧折線圖：可選擇 盤口類型 x 系統/用家 x 每日/每周/每季/每年"""
