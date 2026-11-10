@@ -83,6 +83,18 @@ from datetime import datetime, timedelta, timezone
 #   3. 頂部說明文字同步更新為顏色圖例。
 #
 # =============================================================================
+# V14.7 記錄狀態誤報「未記錄」修復 (比賽 ID 比對)
+#
+#   問題：賽程頁與比賽頁的球隊中文譯名可能不同 (例如 Getafe 在賽程頁為「加泰」、
+#   在比賽頁為「基達菲」)。以「加泰 vs 切爾達」查詢時，資料庫記錄的
+#   「基達菲 vs 切爾達」名稱比對不到，即使已記錄並結算，右側仍誤顯示「⚠️ 未記錄」。
+#
+#   修復：v14_find_duplicate_match 新增 tipsme_id 參數 — 提供時先以 Tipsme 比賽 ID
+#   精確比對 (V14.4 起注單已自動記錄 Tipsme_Match_ID)，不受譯名差異影響；
+#   ID 無命中才退回原本的名稱+日期比對。三個調用點 (賽程列表狀態、填充此場的
+#   重複檢查、自動填充的重複警告) 均已傳入比賽 ID，狀態顯示與防重複記錄同步修正。
+#
+# =============================================================================
 # V14.4 結算自動讀取與重複比賽警告
 #
 #   1. 新增 Tipsme_Match_ID 欄位：賽事建檔 (含賽程連結模式) 時自動記錄 Tipsme
@@ -5671,12 +5683,33 @@ def tipsme_pick_category(league, is_cup, df_db=None):
         return "友誼賽 (Friendly)"
     return "國內聯賽 (Domestic League)"
 
-def v14_find_duplicate_match(df_db, home, away, match_date):
+def _v14_is_num(x):
+    """V14.7：判斷值是否為可轉整數的數字或數字字串 (供 Tipsme_Match_ID 正規化用)"""
+    try:
+        return float(str(x).strip()) == float(int(float(str(x).strip())))
+    except (TypeError, ValueError):
+        return False
+
+
+def v14_find_duplicate_match(df_db, home, away, match_date, tipsme_id=None):
     """V14.4 重複比賽偵測：資料庫是否已有同一場比賽 (同主客隊 + 同比賽日期) 的注單記錄。
-    回傳符合的注單 DataFrame (可為空)；df_db 無效時回傳 None"""
-    if df_db is None or getattr(df_db, 'empty', True) or not home or not away:
+    回傳符合的注單 DataFrame (可為空)；df_db 無效時回傳 None
+    V14.7：新增 tipsme_id 參數 — 賽程頁與比賽頁的球隊譯名可能不同 (例如「加泰」與「基達菲」
+    同為 Getafe)，名稱比對會失敗而誤報「未記錄」。提供 Tipsme 比賽 ID 時會先以 ID 精確比對
+    (V14.4 起注單已自動記錄 Tipsme_Match_ID)，不受譯名差異影響；ID 無命中才退回名稱+日期比對。"""
+    if df_db is None or getattr(df_db, 'empty', True):
         return None
     try:
+        # V14.7：先以 Tipsme 比賽 ID 精確比對 (Excel 讀入可能是 float，如 111495.0，統一轉整數字串)
+        if tipsme_id is not None and 'Tipsme_Match_ID' in df_db.columns:
+            _nid = lambda x: (str(int(float(x))) if _v14_is_num(x) else str(x or '').strip())
+            _tid = _nid(tipsme_id)
+            if _tid and _tid.lower() not in ('nan', 'none'):
+                _hit = df_db[df_db['Tipsme_Match_ID'].map(_nid) == _tid]
+                if not _hit.empty:
+                    return _hit
+        if not home or not away:
+            return pd.DataFrame()
         _nm = lambda s: re.sub(r'[\s\-_·•]', '', str(s or ''))
         _m = df_db['Match'].astype(str).map(v11_clean_name) if 'Match' in df_db.columns else None
         if _m is None:
@@ -5836,7 +5869,8 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams):
         ctx['Tipsme_Match_ID'] = str(mid)
     # V14.4：重複比賽警告 — 資料庫已有同一場比賽 (同隊伍+同日期) 的記錄時提示，避免重複記錄
     _dup = v14_find_duplicate_match(df_db, info.get('home'), info.get('away'),
-                                    info['kickoff'].date() if info.get('kickoff') is not None else None)
+                                    info['kickoff'].date() if info.get('kickoff') is not None else None,
+                                    tipsme_id=mid)
     if _dup is not None and not _dup.empty:
         _dup_ids = ', '.join(_dup['ID'].astype(str).head(5))
         _dup_st = '/'.join(sorted(set(_dup['Status'].astype(str)))[:3])
@@ -6019,7 +6053,9 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
                         _st_dt = datetime.fromtimestamp(r['match_time'], HKT).date() if r.get('match_time') else None
                     except Exception:
                         pass
-                    _rec = v14_find_duplicate_match(df_db, r['home'], r['away'], _st_dt)
+                    # V14.7：同時以 Tipsme 比賽 ID 比對 — 賽程頁譯名 (加泰) 與比賽頁譯名 (基達菲) 可能不同
+                    _rec = v14_find_duplicate_match(df_db, r['home'], r['away'], _st_dt,
+                                                    tipsme_id=r.get('hkjc_match_id'))
                     # V14.6：三種記錄狀態都明確顯示，不再以「空白」代表未記錄
                     if _rec is not None and not _rec.empty:
                         _sts = set(_rec['Status'].astype(str))
@@ -6047,7 +6083,8 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
                                 _dup_dt = datetime.fromtimestamp(r['match_time'], HKT).date() if r.get('match_time') else None
                             except Exception:
                                 pass
-                            _dup = v14_find_duplicate_match(df_db, r['home'], r['away'], _dup_dt)
+                            _dup = v14_find_duplicate_match(df_db, r['home'], r['away'], _dup_dt,
+                                                            tipsme_id=r.get('hkjc_match_id'))
                             if _dup is not None and not _dup.empty:
                                 st.warning(f"⚠️ 資料庫已有此比賽的記錄 ({len(_dup)} 張注單，ID: "
                                            f"{', '.join(_dup['ID'].astype(str).head(5))})，已略過填充以避免重複記錄。"
