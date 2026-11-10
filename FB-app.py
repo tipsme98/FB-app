@@ -95,6 +95,27 @@ from datetime import datetime, timedelta, timezone
 #   重複檢查、自動填充的重複警告) 均已傳入比賽 ID，狀態顯示與防重複記錄同步修正。
 #
 # =============================================================================
+# V14.10 賽程去重顯示
+#
+#   賽程頁 JSON 有時會把同一場比賽重複列出 (例如改期賽事同時出現在原輪次與
+#   新日期)，令輪次列表出現兩行完全相同的比賽。
+#
+#   新增 _tipsme_dedupe_schedule：以馬會比賽 ID (每場唯一) 去重；ID 相同但開賽
+#   時間不同時保留較新的時間 (改期後的)；無 ID 的記錄以 主隊+客隊+開賽時間 去重。
+#   讀取賽程時及顯示前都會去重 (涵蓋舊 session 已讀入的數據)，讀取訊息會顯示
+#   「已自動去除 N 場重複記錄」。
+#
+# =============================================================================
+# V14.9 賽程列表灰色條件收緊：已完場 + 已結算才灰色
+#
+#   V14.6 把所有已完場比賽整行灰色，但「已完場未記錄」或「已記錄待結算」的
+#   比賽仍需跟進 (填充/結算)，灰色會令它們被忽略。
+#
+#   V14.9 起灰色只適用於「已完場且賽果已結算」(毋須跟進)；已完場但未記錄
+#   (⚠️) 或待結算 (📝) 的比賽保持黑色粗體，與未開賽一樣醒目。
+#   圖例同步更新：灰色 = 已完場且已結算 (毋須跟進)；黑色 = 未開賽 / 未記錄 / 待結算 (需要跟進)。
+#
+# =============================================================================
 # V14.8 聯賽 × 盤口績效分析納入全部注數 (含 $0 模擬注)
 #
 #   問題：舊版只計「注碼 > 0」的注單 (644 注)，$0 模擬注 (1200 注) 完全不參與
@@ -5950,6 +5971,23 @@ def _tipsme_fetch_page_html(url, timeout=25):
     return None
 
 
+def _tipsme_dedupe_schedule(matches):
+    """V14.10 賽程去重：同一場比賽有時在賽程頁重複出現 (例如改期賽事同時出現在原輪次與新日期)。
+    以馬會比賽 ID (每場唯一) 去重；ID 相同但開賽時間不同時保留較新的時間 (改期後的)；
+    無 ID 的記錄以 主隊+客隊+開賽時間 去重。回傳 (去重後列表, 移除數量)"""
+    by_key, order = {}, []
+    for m in matches or []:
+        k = (('id', m.get('hkjc_match_id')) if m.get('hkjc_match_id')
+             else ('tm', str(m.get('home') or '').strip(), str(m.get('away') or '').strip(), m.get('match_time')))
+        if k not in by_key:
+            by_key[k] = m
+            order.append(k)
+        elif k[0] == 'id' and (m.get('match_time') or 0) > (by_key[k].get('match_time') or 0):
+            by_key[k] = m   # 同一場改期：保留較新的開賽時間
+    out = [by_key[k] for k in order]
+    return out, len(matches or []) - len(out)
+
+
 def tipsme_fetch_season_schedule(url, timeout=25):
     """V14.1 賽程連結模式：貼上 Tipsme 聯賽賽程連結 → 一次讀取整季所有輪次的比賽。
     賽程頁是伺服器端渲染：整季全部輪次 (例如 R1-R38 共 382 場) 已內嵌在頁面 JSON 中，
@@ -5999,8 +6037,13 @@ def tipsme_fetch_season_schedule(url, timeout=25):
                 'home_red': _sc(hs, 2), 'away_red': _sc(as_, 2),
                 'home_yellow': _sc(hs, 3), 'away_yellow': _sc(as_, 3),
             })
+        # V14.10：去重 — 賽程頁有時重複列出同一場比賽 (例如改期賽事)
+        matches, _ndup = _tipsme_dedupe_schedule(matches)
         matches.sort(key=lambda r: (r['round'], r['match_time'] or 0))
-        return matches, f'已讀取 {len(matches)} 場比賽 (整季全部輪次)'
+        _msg = f'已讀取 {len(matches)} 場比賽 (整季全部輪次)'
+        if _ndup:
+            _msg += f'，已自動去除 {_ndup} 場重複記錄'
+        return matches, _msg
     except Exception as e:
         return None, f'讀取賽程頁失敗: {e}'
 
@@ -6044,14 +6087,17 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
                    "逐場按「填充此場」即等同貼上該場比賽鏈結，之後的分析、下注、結算流程完全不變。")
         sched = st.session_state.get('tipsme_schedule')
         if sched:
+            # V14.10：顯示前同樣去重 (涵蓋去重功能推出前已讀入 session 的舊賽程數據)
+            sched, _ = _tipsme_dedupe_schedule(sched)
             rounds = sorted({r['round'] for r in sched if r['round'] > 0})
             if rounds:
                 sel_round = st.selectbox("選擇輪次", rounds, key="tipsme_sched_round",
                                          format_func=lambda r: f"第 {r} 輪 (R{r})")
                 rm = [r for r in sched if r['round'] == sel_round]
                 st.markdown(f"**第 {sel_round} 輪共 {len(rm)} 場比賽** "
-                            f"<span style='color:#8f959e'>(灰色 = 已完場，附賽果)</span> · "
-                            f"黑色 = 未開賽 · 右側狀態 = 資料庫記錄進度：✅ 賽果已結算 / 📝 已記錄待結算 / "
+                            f"<span style='color:#8f959e'>灰色 = 已完場且已結算 (毋須跟進)</span> · "
+                            f"黑色 = 未開賽 / 未記錄 / 待結算 (需要跟進) · "
+                            f"右側狀態 = 資料庫記錄進度：✅ 賽果已結算 / 📝 已記錄待結算 / "
                             f"<span style='color:#b45309'>⚠️ 未記錄</span>",
                             unsafe_allow_html=True)
                 for r in rm:
@@ -6071,20 +6117,27 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
                     _rec = v14_find_duplicate_match(df_db, r['home'], r['away'], _st_dt,
                                                     tipsme_id=r.get('hkjc_match_id'))
                     # V14.6：三種記錄狀態都明確顯示，不再以「空白」代表未記錄
+                    _settled_all = False
                     if _rec is not None and not _rec.empty:
                         _sts = set(_rec['Status'].astype(str))
-                        _st_badge = '✅ **賽果已結算**' if (_sts and _sts.issubset({'Settled'})) else '📝 已記錄 · 待結算'
+                        _settled_all = bool(_sts and _sts.issubset({'Settled'}))
+                        _st_badge = '✅ **賽果已結算**' if _settled_all else '📝 已記錄 · 待結算'
                     elif r['finished']:
                         # 已完場但資料庫未有記錄 — 最需要跟進的一種，橙色突出顯示
                         _st_badge = "<span style='color:#b45309'>⚠️ **未記錄**</span>"
                     else:
                         _st_badge = "<span style='color:#9e9e9e'>未記錄</span>"
                     if r['finished']:
-                        # V14.6：移除隊名前的 ✅；已完場整行灰色，與未開賽 (黑色) 一眼分辦
+                        # V14.9：只有「已完場且已結算」才灰色 (毋須跟進)；
+                        # 已完場但未記錄或待結算保持黑色 — 需要跟進，不會被灰色淹沒
                         _res = (f"完 {r['home_goal']}-{r['away_goal']} (半 {r['home_half']}-{r['away_half']}, "
                                 f"角 {r['home_corner']}-{r['away_corner']}, 紅 {r['home_red']}-{r['away_red']})")
-                        _line = (f"<span style='color:#8f959e'>{r['home']} vs {r['away']} · {_ko} · {_res}</span>")
-                        c_m.markdown(_line, unsafe_allow_html=True)
+                        if _settled_all:
+                            _line = (f"<span style='color:#8f959e'>{r['home']} vs {r['away']} · {_ko} · {_res}</span>")
+                            c_m.markdown(_line, unsafe_allow_html=True)
+                        else:
+                            _line = f"**{r['home']} vs {r['away']}** · {_ko} · {_res}"
+                            c_m.markdown(_line)
                     else:
                         _line = f"🕒 **{r['home']} vs {r['away']}** · {_ko} · 未開賽"
                         c_m.markdown(_line)
