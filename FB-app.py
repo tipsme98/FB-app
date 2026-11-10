@@ -71,6 +71,18 @@ from datetime import datetime, timedelta, timezone
 #   狀態每次頁面渲染即時從資料庫比對 (同隊伍+同日期)，結算完成後再回到賽程頁即會更新。
 #
 # =============================================================================
+# V14.6 賽程列表完場/未賽視覺分離
+#
+#   1. 移除球隊名稱前的 ✅ (已完場標記)，改以顏色區分：
+#        灰色整行 = 已完場 (附賽果，例：愛斯賓奴 vs 西維爾 · 09-07 03:00 · 完 1-1 (半 0-0, 角 0-4, 紅 0-1))
+#        黑色整行 = 未開賽 (🕒 前綴 + 未開賽)
+#     已完場的比賽一眼可辨，未開賽的比賽 (黑色) 更突出。
+#   2. 右側記錄狀態由「空白 = 未記錄」改為明確顯示：
+#        已完場但未記錄 → 橙色「⚠️ 未記錄」(最需要跟進：按「填充此場」)
+#        未開賽且未記錄 → 灰色「未記錄」(正常，開賽後才需記錄)
+#   3. 頂部說明文字同步更新為顏色圖例。
+#
+# =============================================================================
 # V14.4 結算自動讀取與重複比賽警告
 #
 #   1. 新增 Tipsme_Match_ID 欄位：賽事建檔 (含賽程連結模式) 時自動記錄 Tipsme
@@ -5989,8 +6001,11 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
                 sel_round = st.selectbox("選擇輪次", rounds, key="tipsme_sched_round",
                                          format_func=lambda r: f"第 {r} 輪 (R{r})")
                 rm = [r for r in sched if r['round'] == sel_round]
-                st.markdown(f"**第 {sel_round} 輪共 {len(rm)} 場比賽** (✅ = 已完場，附賽果可供結算核對；"
-                            f"右側狀態 = 資料庫記錄進度：✅ 賽果已結算 / 📝 已記錄待結算 / 空白 = 未記錄)")
+                st.markdown(f"**第 {sel_round} 輪共 {len(rm)} 場比賽** "
+                            f"<span style='color:#8f959e'>(灰色 = 已完場，附賽果)</span> · "
+                            f"黑色 = 未開賽 · 右側狀態 = 資料庫記錄進度：✅ 賽果已結算 / 📝 已記錄待結算 / "
+                            f"<span style='color:#b45309'>⚠️ 未記錄</span>",
+                            unsafe_allow_html=True)
                 for r in rm:
                     c_m, c_b, c_s = st.columns([4, 1, 1])
                     _ko = ''
@@ -6005,19 +6020,25 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
                     except Exception:
                         pass
                     _rec = v14_find_duplicate_match(df_db, r['home'], r['away'], _st_dt)
-                    _st_badge = ''
+                    # V14.6：三種記錄狀態都明確顯示，不再以「空白」代表未記錄
                     if _rec is not None and not _rec.empty:
                         _sts = set(_rec['Status'].astype(str))
                         _st_badge = '✅ **賽果已結算**' if (_sts and _sts.issubset({'Settled'})) else '📝 已記錄 · 待結算'
+                    elif r['finished']:
+                        # 已完場但資料庫未有記錄 — 最需要跟進的一種，橙色突出顯示
+                        _st_badge = "<span style='color:#b45309'>⚠️ **未記錄**</span>"
+                    else:
+                        _st_badge = "<span style='color:#9e9e9e'>未記錄</span>"
                     if r['finished']:
+                        # V14.6：移除隊名前的 ✅；已完場整行灰色，與未開賽 (黑色) 一眼分辦
                         _res = (f"完 {r['home_goal']}-{r['away_goal']} (半 {r['home_half']}-{r['away_half']}, "
                                 f"角 {r['home_corner']}-{r['away_corner']}, 紅 {r['home_red']}-{r['away_red']})")
-                        _line = f"✅ **{r['home']} vs {r['away']}** · {_ko} · {_res}"
+                        _line = (f"<span style='color:#8f959e'>{r['home']} vs {r['away']} · {_ko} · {_res}</span>")
+                        c_m.markdown(_line, unsafe_allow_html=True)
                     else:
                         _line = f"🕒 **{r['home']} vs {r['away']}** · {_ko} · 未開賽"
-                    c_m.markdown(_line)
-                    if _st_badge:
-                        c_s.markdown(_st_badge)
+                        c_m.markdown(_line)
+                    c_s.markdown(_st_badge, unsafe_allow_html=True)
                     if r.get('hkjc_match_id'):
                         if c_b.button("填充此場", key=f"sched_fill_{r['hkjc_match_id']}", use_container_width=True):
                             # V14.4：先檢查資料庫是否已有此比賽記錄，避免重複記錄
