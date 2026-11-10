@@ -95,6 +95,18 @@ from datetime import datetime, timedelta, timezone
 #   重複檢查、自動填充的重複警告) 均已傳入比賽 ID，狀態顯示與防重複記錄同步修正。
 #
 # =============================================================================
+# V14.11 同隊不同名偵測加強：同日期 + 單邊隊名吻合
+#
+#   V14.7 的比賽 ID 比對只涵蓋 V14.4 後建立、有記錄 Tipsme_Match_ID 的注單；
+#   舊注單沒有 ID，賽程頁譯名 (加泰) 與資料庫譯名 (基達菲) 不同時仍誤報「未記錄」，
+#   要按「填充此場」看到重複警告才知道已記錄。
+#
+#   V14.11 在名稱比對加入「同比賽日期 + 主隊或客隊任一邊名稱吻合」：一支球隊同一天
+#   不會有兩場比賽，單邊吻合已足以確認同一場。前綴/後綴比對包含 'vs' 分隔符，
+#   不會把「加泰」誤配到「加泰羅尼亞」等相近名稱。ID 比對 → 全名比對 → 單邊比對，
+#   三層遞進，狀態顯示與「填充此場」的重複檢查同步受惠。
+#
+# =============================================================================
 # V14.10 賽程去重顯示
 #
 #   賽程頁 JSON 有時會把同一場比賽重複列出 (例如改期賽事同時出現在原輪次與
@@ -5731,7 +5743,10 @@ def v14_find_duplicate_match(df_db, home, away, match_date, tipsme_id=None):
     回傳符合的注單 DataFrame (可為空)；df_db 無效時回傳 None
     V14.7：新增 tipsme_id 參數 — 賽程頁與比賽頁的球隊譯名可能不同 (例如「加泰」與「基達菲」
     同為 Getafe)，名稱比對會失敗而誤報「未記錄」。提供 Tipsme 比賽 ID 時會先以 ID 精確比對
-    (V14.4 起注單已自動記錄 Tipsme_Match_ID)，不受譯名差異影響；ID 無命中才退回名稱+日期比對。"""
+    (V14.4 起注單已自動記錄 Tipsme_Match_ID)，不受譯名差異影響；ID 無命中才退回名稱+日期比對。
+    V14.11：再新增「同日期 + 單邊隊名吻合」比對 — 一支球隊同一天不會有兩場比賽，因此
+    主隊或客隊任一邊名稱吻合且日期相同即視為同一場，涵蓋無 Tipsme_Match_ID 的舊注單
+    (例：賽程頁「奧沙辛拿 vs 加泰」= 資料庫「奧沙辛拿 vs 基達菲」)。"""
     if df_db is None or getattr(df_db, 'empty', True):
         return None
     try:
@@ -5750,14 +5765,19 @@ def v14_find_duplicate_match(df_db, home, away, match_date, tipsme_id=None):
         if _m is None:
             return None
         # 名稱正規化後比對 (去空格及分隔符，v11_clean_name 已先去掉首尾空格)
-        _same_teams = _m.map(lambda s: _nm(s) == f"{_nm(home)}vs{_nm(away)}")
-        if not _same_teams.any():
-            return pd.DataFrame()
+        _mn = _m.map(_nm)
+        _same_teams = _mn == f"{_nm(home)}vs{_nm(away)}"
         _md = v10_md_series(df_db)
         if match_date is not None:
             _dstr = pd.to_datetime(match_date).strftime('%Y-%m-%d')
-            return df_db[_same_teams & (_md == _dstr)]
-        return df_db[_same_teams]
+            _same_date = (_md == _dstr)
+            # V14.11：同日期 + 單邊隊名吻合 (主隊前綴或客隊後綴) — 涵蓋譯名不同的舊注單；
+            # 前綴/後綴都含 'vs' 分隔符，不會把「加泰」誤配到「加泰羅尼亞」等相近名稱
+            _hp, _ap = f"{_nm(home)}vs", f"vs{_nm(away)}"
+            _same_one_side = _mn.map(lambda s: s.startswith(_hp) or s.endswith(_ap))
+            _hit = _same_teams | (_same_one_side & _same_date)
+            return df_db[_hit] if _hit.any() else pd.DataFrame()
+        return df_db[_same_teams] if _same_teams.any() else pd.DataFrame()
     except Exception:
         return None
 
