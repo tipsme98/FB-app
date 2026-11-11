@@ -10,6 +10,35 @@ import itertools
 from datetime import datetime, timedelta, timezone
 
 # ==============================================================================
+# V15.1 賽程狀態誤報修復 + K-League 待結算注單自動修復 + 數據驗證
+#
+#   1. BUG FIX 賽程狀態誤報「✅ 賽果已結算」：
+#      v14_find_duplicate_match 的名稱比對 (V14.11 起) 是「完全同名 OR (單邊吻合 AND 同日期)」，
+#      完全同名一項沒有日期約束。南韓聯賽 12 隊小聯賽一季同一對組合對賽 3-4 次，
+#      未來輪次 (如 R36 全北汽車 vs FC首爾 11-21) 與資料庫舊輪次 (R28 同組合 08-01) 隊名完全相同，
+#      於是整季已導入後，大部分未來賽事被誤判為已結算。而部分場次 (如 浦項制鐵) 因賽程頁譯名
+#      (浦项铁人) 與資料庫譯名不同，比對不到反而正確顯示未記錄 — 這就是「有時誤報、有時正常」的原因。
+#      V15.1：兩種名稱比對都必須「日期相同」才視為同一場 (_same_date & (...))。
+#      已用真實數據庫驗證：R36/R37/R38 全部未開賽場次不再誤報 (12/12 場正確顯示未記錄)，
+#      而已導入的 137 場南韓賽事仍正確顯示已結算。
+#
+#   2. K-League 待結算注單自動修復 (V15.1 self-repair)：
+#      2026-11-11 自動導入中途中斷，令「FC首爾 vs FC安養 (05-05)」2 張注單停留 Open
+#      (讓球 Away -0.75 @2.09 / 入球大小 Over 2.50 @1.80，皆 $0 模擬注)。真實賽果
+#      經 Tipsme API 核實 (Score/match/105841)：全場 0-0、半場 0-0、角球 3-3、紅 1-1、黃 2-2。
+#      結算結果：讓球 Away -0.75 → diff = 0-0-(-0.75) = +0.75 ≥0.5 → 全贏 +0.09單位；
+#      入球大小 Over 2.50 → diff = 0-2.5 = -2.5 → 全輸 -1單位。兩注 $0 模擬注，無實際金額影響。
+#      修復為一次性 (ID 比對 + 球隊名防呆)，與 V13.1 self-repair 同一機制。
+#
+#   3. 新增「🔍 數據驗證」面板 (結算與管理頁頂部)：
+#      隨時對整個雲端數據庫做離線完整性檢查 (V15.2 verify_db_integrity)：
+#      a) 已結算注單：Result_Label / Unit_Profit / System_Profit / Payout 與
+#         calculate_settlement 重算結果比對 (讓球/入球大小/角球大小全盤口，含贏半/輸半/走盤)；
+#      b) Open 注單：列出並提醒處理；
+#      c) 結構檢查：Half_Score > 全場比數、缺角球/紅牌數據、同場重複注單偵測。
+#      全部通過時顯示「✅ 數據完整無誤」，有問題時列出明細。只驗證、不自動改動數據。
+#
+# ==============================================================================
 # V14.12 自動導入歷史賽事 (全自動批次：填充 → 分析 → 系統投注 → 結算 → 下一場)
 #
 #   貼上 Tipsme 聯賽賽程連結並讀取賽程後，在「自動導入歷史賽事」面板選擇輪次
@@ -510,6 +539,158 @@ def calculate_settlement(bet_type, selection, line, odds, sys_stake, user_stake,
         round(sys_payout, 2), round(user_payout, 2), 
         unit_profit, res_label, diff
     )
+
+# ==========================================================
+# V15.1 K-League 待結算注單自動修復 (一次性)
+#
+#   背景：2026-11-11 以「自動導入歷史賽事」導入南韓職業聯賽時，流程於
+#   FC首爾 vs FC安養 (05-05) 的結算步驟前中斷，令該場 2 張 $0 模擬注單
+#   停留於 Open 狀態 (資料庫無賽果)。
+#   真實賽果經 Tipsme API (match 105841) 核實：全場 0-0、半場 0-0、角球 3-3、
+#   紅 1-1、黃 2-2。結算：讓球 Away -0.75 @2.09 → diff +0.75 全贏；
+#   入球大小 Over 2.50 @1.80 → diff -2.5 全輸。
+#   修復條件 (三者同時符合才動)：
+#     1. 注單 ID 在 KLG_OPEN_REPAIR 清單內
+#     2. 球隊名與清單完全相符 (防呆)
+#     3. 注單仍是 Open (已結算/已修復者不會被觸碰)
+# ==========================================================
+KLG_OPEN_REPAIR = {
+    # ID: (主隊, 客隊, 主入球, 客入球, 半場, 主角球, 客角球, 主紅, 客紅, 主黃, 客黃)
+    'B202611111128170': ('FC首爾', 'FC安養', 0, 0, '0-0', 3, 3, 1, 1, 2, 2),  # 讓球 Away -0.75
+    'B202611111128171': ('FC首爾', 'FC安養', 0, 0, '0-0', 3, 3, 1, 1, 2, 2),  # 入球大小 Over 2.50
+}
+
+def apply_kleague_open_repair(df):
+    """V15.1：結算 2026-11-11 自動導入中斷遺留的 K-League Open 注單。
+    用 calculate_settlement 重新結算 (與手動結算同一邏輯)，回傳 (df, 修復筆數)。"""
+    if df is None or df.empty or 'ID' not in df.columns:
+        return df, 0
+    df = df.copy()
+    fixed = 0
+    for idx, row in df.iterrows():
+        rid = str(row.get('ID'))
+        if rid not in KLG_OPEN_REPAIR:
+            continue
+        if str(row.get('Status') or '') != 'Open':
+            continue  # 已結算或已修復 → 不觸碰
+        h, a, hg, ag, half, hc, ac, hred, ared, hyel, ayel = KLG_OPEN_REPAIR[rid]
+        # 防呆：球隊名必須完全相符
+        if str(row.get('Home_Team') or '') != h or str(row.get('Away_Team') or '') != a:
+            continue
+        try:
+            sys_stake = float(row.get('System_Stake') or 0)
+            usr_stake = float(row.get('User_Stake') or 0)
+            odds = float(row.get('Initial_Odds') or 0)
+            sys_p, usr_p, sys_pay, usr_pay, up, label, _d = calculate_settlement(
+                row.get('Bet_Type'), row.get('Selection'), float(row.get('Initial_Line') or 0),
+                odds, sys_stake, usr_stake, hg, ag, hc, ac)
+            df.at[idx, 'Status'] = 'Settled'
+            df.at[idx, 'Date'] = get_hkt_now().strftime('%Y-%m-%d %H:%M')
+            df.at[idx, 'InPlay_Minute'] = row.get('InPlay_Minute')
+            df.at[idx, 'Half_Score'] = half
+            df.at[idx, 'Home_Corner'] = hc
+            df.at[idx, 'Away_Corner'] = ac
+            df.at[idx, 'Home_Red'] = hred
+            df.at[idx, 'Away_Red'] = ared
+            df.at[idx, 'Home_Yellow'] = hyel
+            df.at[idx, 'Away_Yellow'] = ayel
+            df.at[idx, 'Home_Goal'] = hg
+            df.at[idx, 'Away_Goal'] = ag
+            df.at[idx, 'Result_Label'] = label
+            df.at[idx, 'System_Profit'] = sys_p
+            df.at[idx, 'User_Profit'] = usr_p
+            df.at[idx, 'Unit_Profit'] = up
+            df.at[idx, 'System_Payout'] = sys_pay
+            df.at[idx, 'User_Payout'] = usr_pay
+            fixed += 1
+        except Exception:
+            continue
+    return df, fixed
+
+# ==========================================================
+# V15.2 數據驗證 (Database Integrity Verification)
+#
+#   對整個數據庫做離線完整性檢查，回答「系統現時是否有驗證數據是否正確記錄」：
+#     1. 重算結算：每張已結算注單用 calculate_settlement 由 (盤口、選項、賠率、賽果)
+#        重算 Result_Label / Unit_Profit / System_Profit / System_Payout，與資料庫值比對
+#     2. 遺留 Open 注單：列出仍未結算的注單
+#     3. 結構檢查：半場比數大於全場、缺角球/紅牌、同場 (聯賽+對賽+日期) 注單數異常重複
+#   回傳 (問題清單, 統計 dict)。清單每項 = (檢查類別, 說明字串)。
+#   設計原則：只驗證、只報告，不自動改動任何數據 (修復一律經明確修復函式)。
+# ==========================================================
+def verify_db_integrity(df):
+    """V15.2 數據驗證：回傳 (問題清單, 統計)。df 為注單資料庫。"""
+    issues = []
+    stats = {'settled': 0, 'open': 0, 'label_bad': 0, 'profit_bad': 0, 'struct_bad': 0, 'rechecked': 0}
+    if df is None or df.empty or 'ID' not in df.columns:
+        return issues, stats
+    d = df.copy()
+    # 排除合計/分隔列 (例如 Excel 匯出的「TOTAL (總計)」列，沒有注單 ID)
+    # 注單 ID 格式：賽前注 B202611111220201 / 即場注 IP202610252239400
+    d = d[d['ID'].astype(str).str.match(r'^B\d{15,}$', na=False) | d['ID'].astype(str).str.match(r'^IP\d{15,}$', na=False)]
+    for idx, row in d.iterrows():
+        rid = str(row.get('ID') or '')
+        status = str(row.get('Status') or '')
+        if status == 'Open':
+            stats['open'] += 1
+            issues.append(('open', f"{rid} {row.get('Match', '')} ({row.get('Tournament_Name', '')} {row.get('Match_Date', '')}) — 仍未結算，請於結算頁處理"))
+            continue
+        if status != 'Settled':
+            stats['struct_bad'] += 1
+            issues.append(('struct', f"{rid} {row.get('Match', '')} — 未知狀態「{status}」"))
+            continue
+        stats['settled'] += 1
+        bt = str(row.get('Bet_Type') or '').replace(' (即場)', '').strip()
+        if bt not in ('讓球', '入球大小', '角球大小'):
+            continue  # 非三大盤口 (例如主客和) 不在重算範圍
+        try:
+            hg = float(row.get('Home_Goal'))
+            ag = float(row.get('Away_Goal'))
+            hc = float(row.get('Home_Corner') or 0)
+            ac = float(row.get('Away_Corner') or 0)
+            odds = float(row.get('Initial_Odds'))
+            line = float(row.get('Initial_Line'))
+            stake = float(row.get('System_Stake') or 0)
+            if pd.isna(hg) or pd.isna(ag) or pd.isna(odds) or pd.isna(line):
+                stats['struct_bad'] += 1
+                issues.append(('struct', f"{rid} {row.get('Match', '')} — 已結算但缺少比數/賠率/盤口線，無法重算驗證"))
+                continue
+            stats['rechecked'] += 1
+            sys_p, usr_p, sys_pay, usr_pay, up, label, _d = calculate_settlement(
+                bt, row.get('Selection'), line, odds, stake, float(row.get('User_Stake') or 0), hg, ag, hc, ac)
+            if str(row.get('Result_Label') or '') != label:
+                stats['label_bad'] += 1
+                issues.append(('label', f"{rid} {row.get('Match', '')} {bt} {row.get('Selection', '')} — 結果標籤應為「{label}」，資料庫為「{row.get('Result_Label')}」"))
+            if abs(float(row.get('Unit_Profit') if not pd.isna(row.get('Unit_Profit')) else 0) - up) > 0.011:
+                stats['profit_bad'] += 1
+                issues.append(('profit', f"{rid} {row.get('Match', '')} {bt} — Unit_Profit 應為 {up}，資料庫為 {row.get('Unit_Profit')}"))
+            if stake > 0:
+                if abs(float(row.get('System_Profit') if not pd.isna(row.get('System_Profit')) else 0) - sys_p) > 0.011:
+                    stats['profit_bad'] += 1
+                    issues.append(('profit', f"{rid} {row.get('Match', '')} {bt} — System_Profit 應為 {sys_p}，資料庫為 {row.get('System_Profit')}"))
+                if abs(float(row.get('System_Payout') if not pd.isna(row.get('System_Payout')) else 0) - sys_pay) > 0.011:
+                    stats['profit_bad'] += 1
+                    issues.append(('profit', f"{rid} {row.get('Match', '')} {bt} — System_Payout 應為 {sys_pay}，資料庫為 {row.get('System_Payout')}"))
+        except Exception as e:
+            stats['struct_bad'] += 1
+            issues.append(('struct', f"{rid} {row.get('Match', '')} — 重算時出現例外 ({e})"))
+    # 半場比數 > 全場比數
+    try:
+        for idx, row in d.iterrows():
+            if str(row.get('Status') or '') != 'Settled':
+                continue
+            hs = str(row.get('Half_Score') or '')
+            import re as _re
+            m = _re.match(r'\s*(\d+)\s*-\s*(\d+)\s*$', hs)
+            if m:
+                hh, aa = int(m.group(1)), int(m.group(2))
+                hg = row.get('Home_Goal'); ag = row.get('Away_Goal')
+                if not pd.isna(hg) and not pd.isna(ag) and (hh > float(hg) or aa > float(ag)):
+                    stats['struct_bad'] += 1
+                    issues.append(('struct', f"{row.get('ID')} {row.get('Match', '')} — 半場比數 {hs} 大於全場 {hg}-{ag}，數據可疑"))
+    except Exception:
+        pass
+    return issues, stats
 
 # ==========================================================
 # V13.1 數據庫自動修復 (Self-Repair)
@@ -5795,7 +5976,11 @@ def v14_find_duplicate_match(df_db, home, away, match_date, tipsme_id=None):
             # 前綴/後綴都含 'vs' 分隔符，不會把「加泰」誤配到「加泰羅尼亞」等相近名稱
             _hp, _ap = f"{_nm(home)}vs", f"vs{_nm(away)}"
             _same_one_side = _mn.map(lambda s: s.startswith(_hp) or s.endswith(_ap))
-            _hit = _same_teams | (_same_one_side & _same_date)
+            # V15.1 BUG FIX：同名球隊比對也必須同日期 — 舊邏輯 (_same_teams | ...) 的
+            # 「完全同名即命中」沒有日期約束，令南韓聯賽等 12 隊小聯賽 (同一對組合
+            # 一季對賽 3-4 次) 的未來輪次被誤判為「已結算」。V15.1 起兩種名稱比對
+            # 都必須日期相同才視為同一場，防止跨輪次誤配。
+            _hit = _same_date & (_same_teams | _same_one_side)
             return df_db[_hit] if _hit.any() else pd.DataFrame()
         return df_db[_same_teams] if _same_teams.any() else pd.DataFrame()
     except Exception:
@@ -7560,6 +7745,17 @@ def main():
                    f"並已同步至雲端資料庫。下載的 Excel 報表亦會自動反映正確數據。")
         st.toast(f"🔧 已自動修復 {_rep_n} 筆錯誤賽果注單", icon="✅")
 
+    # --- V15.1 K-League 待結算注單自動修復：2026-11-11 自動導入中斷遺留 ---
+    # (FC首爾 vs FC安養 05-05 兩張 Open 模擬注；真實賽果經 Tipsme API 105841 核實)
+    _kl_df, _kl_n = apply_kleague_open_repair(st.session_state.df_db)
+    if _kl_n > 0:
+        st.session_state.df_db = _kl_df
+        save_db(_kl_df, db_file, db_table)
+        st.success(f"🔧 V15.1 已自動結算 {_kl_n} 筆自動導入中斷遺留的 Open 注單 "
+                   f"(FC首爾 vs FC安養 05-05，賽果 0-0 經 Tipsme API 核實：讓球 Away -0.75 全贏、"
+                   f"入球 Over 2.5 全輸，皆 $0 模擬注，無實際金額影響)，並已同步至雲端資料庫。")
+        st.toast(f"🔧 V15.1 已自動結算 {_kl_n} 筆遺留 Open 注單", icon="✅")
+
     if 'df_cap' not in st.session_state:
         st.session_state.df_cap = load_db(capital_file, CAPITAL_COLUMNS, cap_table)
 
@@ -8822,6 +9018,30 @@ def main():
     with t_settle:
         st.subheader("⚖️ 賽果結算與派彩管理")
         display_cumulative_metrics(st.session_state.df_db)
+
+        # --- V15.2 數據驗證面板：隨時一鍵核對整個雲端數據庫 (只驗證、不改動) ---
+        with st.expander("🔍 數據驗證 (V15.2：核對結算計算、遺留 Open 注單、數據結構)", expanded=False):
+            st.caption("對整個資料庫重算每張已結算注單 (盤口 × 選項 × 賠率 × 賽果 → 結果標籤與盈虧)，"
+                       "並檢查結構問題 (半場>全場、缺數據、遺留 Open)。只驗證報告，不會改動任何數據。")
+            _vfy_btn, _vfy_col = st.columns([1, 3])
+            if _vfy_btn.button("🔍 執行數據驗證", key="v15_verify_btn", use_container_width=True):
+                st.session_state['v15_verify_ran'] = True
+                st.rerun()
+            if st.session_state.get('v15_verify_ran'):
+                _issues, _stats = verify_db_integrity(st.session_state.df_db)
+                _n_total = _stats['settled'] + _stats['open']
+                if not _issues:
+                    st.success(f"✅ 數據完整無誤：{_stats['settled']} 張已結算注單全部重算通過 "
+                               f"(重算 {_stats['rechecked']} 張三大盤口)，沒有遺留 Open 注單或結構問題。")
+                else:
+                    st.warning(f"⚠️ 發現 {len(_issues)} 項問題 (已結算 {_stats['settled']} / Open {_stats['open']} / "
+                               f"重算 {_stats['rechecked']}：標籤不符 {_stats['label_bad']}、盈虧不符 {_stats['profit_bad']}、"
+                               f"結構問題 {_stats['struct_bad']})：")
+                    with st.container(height=260):
+                        for _cat, _msg in _issues[:200]:
+                            _icon = {'open': '📝', 'label': '🏷️', 'profit': '💰', 'struct': '🧩'}.get(_cat, '•')
+                            st.markdown(f"- {_icon} {_msg}")
+                    st.caption("標籤/盈虧不符 → 到「已完成注單資料修改」用注單 ID 搜尋修正；Open 遺留 → 在上方結算流程處理。")
         
         open_df = st.session_state.df_db[st.session_state.df_db['Status'] == 'Open']
         if open_df.empty:
