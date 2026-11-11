@@ -2043,7 +2043,11 @@ def v9_build_match_table(df_settled):
 @st.cache_data(max_entries=4, show_spinner=False)
 def v9_find_duplicate_matches(df_db):
     """找出同一對賽在不同日期、但賽果完全相同的比賽 (可能是舊版即場更新把兩場比賽一起覆蓋所致)，供資料檢查
-    (V13.1 效能修正：此掃描每次重新渲染都會執行，改為快取)"""
+    (V13.1 效能修正：此掃描每次重新渲染都會執行，改為快取)
+    V15.3：不同日期的注單若各自記錄了「不同的 Tipsme 比賽 ID」，即證明是兩場真實存在的
+    不同比賽 (例如南韓聯賽 12 隊一季對賽 3-4 次，兩次 0-2 只是巧合)，自動視為已確認、
+    不再提示。只有「沒有比賽 ID 的舊注單」之間的同分巧合才仍會提示 (無法排除被舊版
+    即場更新覆蓋的可能)。"""
     try:
         d = df_db[df_db['Status'] == 'Settled'].copy()
         if d.empty:
@@ -2054,6 +2058,51 @@ def v9_find_duplicate_matches(df_db):
                                    客隊入球=('Away_Goal', lambda x: sorted(set(pd.to_numeric(x, errors='coerce').dropna()))),
                                    注單數=('ID', 'size'))
         g = g[(g['日期'].apply(len) > 1) & (g['比分'].apply(len) == 1) & (g['客隊入球'].apply(len) == 1)]
+        if g.empty:
+            return pd.DataFrame()
+        # V15.3：逐對賽檢查各日期的 Tipsme 比賽 ID — 各日期都有 ID 且互不相同 = 已證實是
+        # 兩場不同比賽，屬真實巧合，不再視為可疑
+        def _proven_distinct(match_name):
+            sub = d[d['Match'] == match_name]
+            ids_by_date = {}
+            for _dt in sorted(set(sub['_md'])):
+                ids = set(sub.loc[sub['_md'] == _dt, 'Tipsme_Match_ID'].dropna().astype('Int64').astype(str)) if 'Tipsme_Match_ID' in sub.columns else set()
+                ids_by_date[_dt] = ids
+            date_list = list(ids_by_date)
+            if len(date_list) < 2:
+                return False
+            # V15.3a：比賽 ID 判定 — 各日期都至少有一個非空 ID 且互不相交 → 證實不同比賽；
+            # 若某日期缺 ID (舊手動注單)，只要任一日期有 ID，且該組合「近況明細」內
+            # (Home/Away_Recent_Matches/H2H_Records 的逐場記錄) 確實載有這個日期的
+            # 該對賽記錄 (Tipsme 對賽往績頁的獨立記錄)，同樣證實兩場皆真實存在
+            if all(ids_by_date[dt] for dt in date_list):
+                for i in range(len(date_list)):
+                    for j in range(i + 1, len(date_list)):
+                        if ids_by_date[date_list[i]] & ids_by_date[date_list[j]]:
+                            return False
+                return True
+            if not any(ids_by_date[dt] for dt in date_list):
+                return False  # 完全沒有 ID 的舊注單 → 無法證實，保留提示
+            # 任一日期有 ID → 以「近況明細」逐場記錄核實每個日期是否真的有這場對賽
+            try:
+                import re as _re
+                _h_name, _a_name = str(match_name).split(' vs ')[0], str(match_name).split(' vs ')[1]
+                for _dt in date_list:
+                    _found = False
+                    # 在全庫的近況/對賽往績明細中，尋找「該日期 + 同一對賽」的獨立逐場記錄
+                    for _col in ('Home_Recent_Matches', 'Away_Recent_Matches', 'H2H_Records'):
+                        for _v in d[_col].dropna().astype(str):
+                            if f'"date": "{_dt}"' in _v and _h_name in _v and _a_name in _v:
+                                _found = True
+                                break
+                        if _found:
+                            break
+                    if not _found:
+                        return False  # 近況明細找不到該日期的獨立記錄 → 無法證實，保留提示
+                return True
+            except Exception:
+                return False
+        g = g[~g.index.map(_proven_distinct)]
         if g.empty:
             return pd.DataFrame()
         g = g.reset_index()
