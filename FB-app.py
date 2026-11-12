@@ -10,6 +10,27 @@ import itertools
 from datetime import datetime, timedelta, timezone
 
 # ==============================================================================
+# V15.2 重複注單清理 + 賽程譯名比對修復 + 驗證面板強化
+#
+#   1. 一次性清理 K-League 重複注單 (V15.2 self-repair)：
+#      2026-11-11 自動導入時，v14_find_duplicate_match 以賽程頁譯名 (浦项铁人/濟州聯SK FC)
+#      比對資料庫譯名 (浦項制鐵/濟州SK) 兩邊皆不吻合，誤判「浦項制鐵 vs 濟州SK (2026-11-01)」
+#      未記錄，於已記錄的用家注單 (B202611012256560 入球大小 Under 2.5) 之外，重複寫入
+#      系統模擬注 B202611111218360 (入球大小 Over 2.5，$0 模擬注)。本版於啟動時自動
+#      刪除該重複注單 (ID + 球隊 + 日期 + 盤口四重防呆)，並同步雲端資料庫。
+#
+#   2. BUG FIX 賽程譯名比對：v14_find_duplicate_match 新增球隊譯名別名表
+#      (_V14_NAME_ALIASES)，將賽程頁簡體/異體譯名正規化為資料庫譯名後才比對
+#      (浦项铁人→浦項制鐵、富川FC→FC富川、濟州聯SK FC→濟州SK 等)。此後自動導入
+#      不會再因譯名差異把已記錄賽事誤判為未記錄而重複寫入。
+#
+#   3. 「🔍 數據驗證」面板新增兩項檢查：
+#      a) 同場重複注單：同一比賽 (聯賽+對賽+日期+盤口+選項+盤口線) 出現兩張相同注單時列出，
+#         供用家核實是否重複入帳 (即場注及不同盤口線/不同選項的正常加注不會誤報)；
+#      b) 無 Tipsme 編號注單統計：顯示沒有 Tipsme_Match_ID 的注單數 (手動記錄)，
+#         提醒該批注單無法以比賽 ID 自動核對 (只統計，不列入問題清單)。
+#
+# ==============================================================================
 # V15.1 賽程狀態誤報修復 + K-League 待結算注單自動修復 + 數據驗證
 #
 #   1. BUG FIX 賽程狀態誤報「✅ 賽果已結算」：
@@ -608,6 +629,49 @@ def apply_kleague_open_repair(df):
     return df, fixed
 
 # ==========================================================
+# V15.2 K-League 重複注單一次性清理
+#
+#   背景：2026-11-11 自動導入時，v14_find_duplicate_match 以賽程頁譯名
+#   (浦项铁人 / 濟州聯SK FC) 比對資料庫譯名 (浦項制鐵 / 濟州SK)，兩邊
+#   隊名皆不吻合，誤判「浦項制鐵 vs 濟州SK (2026-11-01)」為未記錄，
+#   於用家已記錄的注單 (B202611012256560 入球大小 Under 2.5 @1.71) 之外
+#   重複寫入系統模擬注 B202611111218360 (入球大小 Over 2.5 @2.01，$0 模擬注)。
+#   清理條件 (四者同時符合才刪)：
+#     1. 注單 ID 在 KLG_DUP_CLEANUP 清單內
+#     2. 球隊名與清單完全相符 (防呆)
+#     3. 比賽日期與清單完全相符 (防呆)
+#     4. 盤口類型與清單完全相符 (防呆)
+# ==========================================================
+KLG_DUP_CLEANUP = {
+    # ID: (主隊, 客隊, 比賽日期, 盤口, 原因說明)
+    'B202611111218360': ('浦項制鐵', '濟州SK', '2026-11-01', '入球大小',
+                          '2026-11-11 導入重複寫入 (該場已有用家注單 B202611012256560)'),
+}
+
+def apply_kleague_dup_cleanup(df):
+    """V15.2：刪除 2026-11-11 自動導入誤寫的 K-League 重複模擬注單。
+    回傳 (df, 刪除筆數)。只刪清單內、且球隊/日期/盤口四重防呆全符的注單。"""
+    if df is None or df.empty or 'ID' not in df.columns:
+        return df, 0
+    df = df.copy()
+    removed = 0
+    for idx, row in df.iterrows():
+        rid = str(row.get('ID'))
+        if rid not in KLG_DUP_CLEANUP:
+            continue
+        h, a, md, bt, _why = KLG_DUP_CLEANUP[rid]
+        # 四重防呆：球隊、日期、盤口必須完全相符才刪
+        if str(row.get('Home_Team') or '') != h or str(row.get('Away_Team') or '') != a:
+            continue
+        if str(row.get('Match_Date') or '')[:10] != md:
+            continue
+        if str(row.get('Bet_Type') or '').replace(' (即場)', '').strip() != bt:
+            continue
+        df = df.drop(index=idx)
+        removed += 1
+    return df.reset_index(drop=True), removed
+
+# ==========================================================
 # V15.2 數據驗證 (Database Integrity Verification)
 #
 #   對整個數據庫做離線完整性檢查，回答「系統現時是否有驗證數據是否正確記錄」：
@@ -621,7 +685,8 @@ def apply_kleague_open_repair(df):
 def verify_db_integrity(df):
     """V15.2 數據驗證：回傳 (問題清單, 統計)。df 為注單資料庫。"""
     issues = []
-    stats = {'settled': 0, 'open': 0, 'label_bad': 0, 'profit_bad': 0, 'struct_bad': 0, 'rechecked': 0}
+    stats = {'settled': 0, 'open': 0, 'label_bad': 0, 'profit_bad': 0, 'struct_bad': 0,
+             'rechecked': 0, 'dup_match': 0, 'no_tipsme_id': 0}
     if df is None or df.empty or 'ID' not in df.columns:
         return issues, stats
     d = df.copy()
@@ -688,6 +753,35 @@ def verify_db_integrity(df):
                 if not pd.isna(hg) and not pd.isna(ag) and (hh > float(hg) or aa > float(ag)):
                     stats['struct_bad'] += 1
                     issues.append(('struct', f"{row.get('ID')} {row.get('Match', '')} — 半場比數 {hs} 大於全場 {hg}-{ag}，數據可疑"))
+    except Exception:
+        pass
+    # V15.2 新增：同場重複注單偵測 — 同一比賽 (聯賽+對賽+日期+盤口+選項+盤口線) 出現
+    #   兩張相同注單。同一場同一盤口同一邊同一條盤口線理論上只應有一張注單；
+    #   出現兩張即非常可能重複記錄 (例如導入重複寫入)。只報告、不自動刪除。
+    #   注意：同盤口但不同盤口線/不同選項 (例如先入 Under 2.75 後加 Over 2.5) 屬正常
+    #   加注/對冲，不會被誤報。
+    try:
+        # 即場注 (ID 以 IP 開頭) 可在不同分鐘合理地多次入同一盤口，不納入重複偵測
+        _pre = d[~d['ID'].astype(str).str.startswith('IP')]
+        _grp = _pre.groupby([_pre['Tournament_Name'].astype(str), _pre['Match'].astype(str),
+                             _pre['Match_Date'].astype(str), _pre['Bet_Type'].astype(str),
+                             _pre['Selection'].astype(str), _pre['Initial_Line'].astype(str)])
+        for _k, _g in _grp:
+            if len(_g) < 2:
+                continue
+            _ids = ', '.join(_g['ID'].astype(str).tolist())
+            stats['dup_match'] = stats.get('dup_match', 0) + 1
+            issues.append(('dup', f"{_k[2]} {_k[1]} ({_k[0]}) {_k[3]} {_k[4]} @{_k[5]} 有 {len(_g)} 張注單 [{_ids}] — "
+                                  f"同一場同一盤口同一邊不應有多張，極可能重複記錄，請核實後刪除"))
+    except Exception:
+        pass
+    # V15.2 新增：無 Tipsme 比賽編號注單統計 — 此批注單無法以比賽 ID 自動核對
+    try:
+        if 'Tipsme_Match_ID' in d.columns:
+            _noid = d[d['Tipsme_Match_ID'].isna() | d['Tipsme_Match_ID'].astype(str).str.strip().isin(['', 'nan', 'None'])]
+            if not _noid.empty:
+                # 只統計、不列入問題清單 (舊注單大量沒有編號屬正常，避免驗證面板永遠顯示警告)
+                stats['no_tipsme_id'] = len(_noid)
     except Exception:
         pass
     return issues, stats
@@ -5988,6 +6082,23 @@ def _v14_is_num(x):
         return False
 
 
+# V15.2 球隊譯名別名表：賽程頁 (簡體/異體譯名) → 資料庫慣用譯名。
+#   鍵為正規化後的隊名 (已去空格及分隔符，例如「濟州聯SK FC」→「濟州聯SKFC」)。
+#   v14_find_duplicate_match 比對前先以此表轉換，避免譯名差異令已記錄賽事被誤判未記錄
+#   (2026-11-11 自動導入即因此重複寫入「浦項制鐵 vs 濟州SK (2026-11-01)」)。
+_V14_NAME_ALIASES = {
+    '浦项铁人': '浦項制鐵',      # Pohang Steelers (賽程頁簡體)
+    '富川FC': 'FC富川',          # Bucheon FC 1995 (語序差異)
+    '濟州聯SKFC': '濟州SK',       # Jeju SK (賽程頁全名)
+    '濟州聯': '濟州SK',           # Jeju SK (無 SK 後綴時)
+    '大田HanaCitizen': '大田市民',
+}
+
+def _v14_norm_team(s):
+    """V15.2：隊名正規化 — 去空格/分隔符後套用譯名別名表。"""
+    t = re.sub(r'[\s\-_·•]', '', str(s or ''))
+    return _V14_NAME_ALIASES.get(t, t)
+
 def v14_find_duplicate_match(df_db, home, away, match_date, tipsme_id=None):
     """V14.4 重複比賽偵測：資料庫是否已有同一場比賽 (同主客隊 + 同比賽日期) 的注單記錄。
     回傳符合的注單 DataFrame (可為空)；df_db 無效時回傳 None
@@ -6010,11 +6121,13 @@ def v14_find_duplicate_match(df_db, home, away, match_date, tipsme_id=None):
                     return _hit
         if not home or not away:
             return pd.DataFrame()
-        _nm = lambda s: re.sub(r'[\s\-_·•]', '', str(s or ''))
+        # V15.2：正規化時套用譯名別名表 (_v14_norm_team)，賽程頁簡體/異體譯名
+        # (浦项铁人/富川FC/濟州聯SK FC) 也能正確比對到資料庫譯名 (浦項制鐵/FC富川/濟州SK)。
+        _nm = _v14_norm_team
         _m = df_db['Match'].astype(str).map(v11_clean_name) if 'Match' in df_db.columns else None
         if _m is None:
             return None
-        # 名稱正規化後比對 (去空格及分隔符，v11_clean_name 已先去掉首尾空格)
+        # 名稱正規化後比對 (去空格及分隔符 + 譯名別名，v11_clean_name 已先去掉首尾空格)
         _mn = _m.map(_nm)
         _same_teams = _mn == f"{_nm(home)}vs{_nm(away)}"
         _md = v10_md_series(df_db)
@@ -7805,6 +7918,18 @@ def main():
                    f"入球 Over 2.5 全輸，皆 $0 模擬注，無實際金額影響)，並已同步至雲端資料庫。")
         st.toast(f"🔧 V15.1 已自動結算 {_kl_n} 筆遺留 Open 注單", icon="✅")
 
+    # --- V15.2 K-League 重複注單一次性清理：2026-11-11 導入重複寫入 ---
+    # (浦項制鐵 vs 濟州SK 2026-11-01：用家已記錄 Under 2.5，導入再寫入 Over 2.5 $0 模擬注；
+    #  根因為賽程頁譯名 (浦项铁人/濟州聯SK FC) 與資料庫譯名不同，比對不到而誤判未記錄)
+    _dup_df, _dup_n = apply_kleague_dup_cleanup(st.session_state.df_db)
+    if _dup_n > 0:
+        st.session_state.df_db = _dup_df
+        save_db(_dup_df, db_file, db_table)
+        st.success(f"🗑️ V15.2 已自動刪除 {_dup_n} 筆 2026-11-11 導入重複寫入的注單 "
+                   f"(B202611111218360 浦項制鐵 vs 濟州SK 2026-11-01 入球大小 Over 2.5 $0 模擬注；"
+                   f"該場已有用家注單 B202611012256560 Under 2.5)，並已同步至雲端資料庫。")
+        st.toast(f"🗑️ V15.2 已刪除 {_dup_n} 筆重複注單", icon="✅")
+
     if 'df_cap' not in st.session_state:
         st.session_state.df_cap = load_db(capital_file, CAPITAL_COLUMNS, cap_table)
 
@@ -9079,18 +9204,22 @@ def main():
             if st.session_state.get('v15_verify_ran'):
                 _issues, _stats = verify_db_integrity(st.session_state.df_db)
                 _n_total = _stats['settled'] + _stats['open']
+                st.caption(f"ℹ️ 另有 {_stats.get('no_tipsme_id', 0)} 張注單沒有 Tipsme 比賽編號 (多為手動記錄)，"
+                           f"無法用比賽 ID 自動核對賽果，只能靠結算重算驗證；新注單由自動填充建立時會自動帶編號。")
                 if not _issues:
                     st.success(f"✅ 數據完整無誤：{_stats['settled']} 張已結算注單全部重算通過 "
                                f"(重算 {_stats['rechecked']} 張三大盤口)，沒有遺留 Open 注單或結構問題。")
                 else:
                     st.warning(f"⚠️ 發現 {len(_issues)} 項問題 (已結算 {_stats['settled']} / Open {_stats['open']} / "
                                f"重算 {_stats['rechecked']}：標籤不符 {_stats['label_bad']}、盈虧不符 {_stats['profit_bad']}、"
-                               f"結構問題 {_stats['struct_bad']})：")
+                               f"結構問題 {_stats['struct_bad']}、同場重複 {_stats.get('dup_match', 0)})：")
                     with st.container(height=260):
                         for _cat, _msg in _issues[:200]:
-                            _icon = {'open': '📝', 'label': '🏷️', 'profit': '💰', 'struct': '🧩'}.get(_cat, '•')
+                            _icon = {'open': '📝', 'label': '🏷️', 'profit': '💰', 'struct': '🧩',
+                                     'dup': '♻️'}.get(_cat, '•')
                             st.markdown(f"- {_icon} {_msg}")
-                    st.caption("標籤/盈虧不符 → 到「已完成注單資料修改」用注單 ID 搜尋修正；Open 遺留 → 在上方結算流程處理。")
+                    st.caption("標籤/盈虧不符 → 到「已完成注單資料修改」用注單 ID 搜尋修正；Open 遺留 → 在上方結算流程處理；"
+                               "同場重複 (♻️) → 核實是否重複記錄後刪除多餘一張。")
         
         open_df = st.session_state.df_db[st.session_state.df_db['Status'] == 'Open']
         if open_df.empty:
