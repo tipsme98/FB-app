@@ -10,6 +10,29 @@ import itertools
 from datetime import datetime, timedelta, timezone
 
 # ==============================================================================
+# V15.3 自動輸入失敗續傳 + 跨裝置進度共享
+#
+#   背景 (2026-11-13)：用家啟動挪威聯賽第 18-26 輪自動輸入 (69 場)，前三場
+#   (阿利辛特 vs 華拿倫加、薩普斯堡 vs 辛迪夫佐特、白蘭恩 vs 咸卡姆) 填充即時失敗，
+#   舊邏輯「累計 3 次失敗即停止」令整個輪次中斷。經實測 Tipsme 數據 API
+#   (tipsme-web-2...azurewebsites.net) 當時回傳 403「Web App - Unavailable」及 502，
+#   屬網站後端故障，非用家網絡問題 — 但無論原因為何，單場失敗不應令其餘數十場陪葬。
+#
+#   1. 失敗續傳 (V15.3)：填充 / 讀取賽果 / 賽果核對不符 / 結算防呆失敗時，
+#      不再整體停止 — 改為把該場列入「待手動處理」清單，自動繼續下一場，
+#      直到所選輪次全部掃完才停，最後在日誌列出所有待手動處理的比賽。
+#      安全性：任何失敗都發生在「寫入資料庫之前」；結算類失敗時該場注單
+#      保持 Open 狀態，絕不會用未核實的賽果結算，不會增加錯誤數據風險。
+#
+#   2. 跨裝置進度共享 (V15.3)：自動輸入狀態原本只存在於啟動裝置的瀏覽器
+#      session，其他裝置開啟程式完全看不到進度。現改為每當佇列推進時，
+#      把進度 (第幾場/已結算/寫入注單/待手動/最近日誌) 寫入 auto_status.csv
+#      (本地容器檔案 + GitHub 雲端)，任何裝置開啟程式都會看到即時進度橫幅
+#      (唯讀，每 10 秒自動更新)，並提示「自動輸入進行中，請勿在本裝置投注/
+#      結算/修改，以免覆蓋對方寫入」。用 Streamlit 多裝置開啟不會令電腦 A 的
+#      自動輸入停止 (各瀏覽器 session 互相獨立)，只要電腦 A 的分頁保持開啟。
+# ==============================================================================
+# ==============================================================================
 # V15.2 重複注單清理 + 賽程譯名比對修復 + 驗證面板強化
 #
 #   1. 一次性清理 K-League 重複注單 (V15.2 self-repair)：
@@ -6518,6 +6541,20 @@ def v15_settle_label(df_db, hkjc_mid, sched_home=None, sched_away=None):
     except Exception:
         return None
 
+def _v15_finish_summary(a):
+    """V15.3：全部掃描完畢的總結 — 結算/寫入統計 + 待手動處理清單，並把最終狀態
+    寫入共用檔案 (auto_status.csv)，令其他裝置也能看到完成結果與待手動清單。"""
+    _q = a.get('queue') or []
+    _failed = a.get('failed') or []
+    _v15_log(f"🏁 全部 {len(_q)} 場已掃描完畢 (已結算 {a.get('done', 0)} 場，寫入 {a.get('bets', 0)} 張注單)")
+    if _failed:
+        _v15_log(f"📋 共 {len(_failed)} 場需手動處理 (填充或結算失敗，未寫入任何錯誤數據；注單保持 Open)：")
+        for _f in _failed[:60]:
+            _v15_log(f"    第{_f.get('round')}輪 {_f.get('home')} vs {_f.get('away')} ({_f.get('stage')}失敗) — "
+                     f"請在賽程列表按「填充此場」手動補入後結算")
+    a['active'] = False
+    _v15_save_remote(a)
+
 def v15_auto_executor(df_db, opts_tournaments, opts_teams):
     """V14.12 自動導入執行器：每個 rerun 執行一步。
     FILL 步驟會實際呼叫 tipsme_auto_fill 並 rerun；ANALYZE / BET / SETTLE_* 步驟
@@ -6529,8 +6566,7 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
     q = a.get('queue') or []
     if not q or a.get('idx', 0) >= len(q):
         if q:
-            _v15_log(f"🏁 全部 {len(q)} 場已處理完畢 (已結算 {a.get('done', 0)} 場，寫入 {a.get('bets', 0)} 張注單)")
-            a['active'] = False
+            _v15_finish_summary(a)
             st.rerun()
         return
     m = q[a['idx']]
@@ -6539,6 +6575,7 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
     if a['tries'] > 8:
         _v15_log(f"⚠️ 步驟 {step} 疑似卡住 (重試 {a['tries']} 次)，已暫停自動化；檢查後可再按「開始」續傳。")
         a['active'] = False
+        _v15_save_remote(a)
         st.rerun()
         return
 
@@ -6560,20 +6597,26 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
                 _v15_log(f"⏭️ 第{m['round']}輪 {m['home']} vs {m['away']}：已記錄且已結算，跳過")
                 a['idx'] += 1
             a['tries'] = 0
+            _v15_save_remote(a)
             st.rerun()
             return
         _murl = f"https://tipsme.hk/zh-HK/match/{m['hkjc_match_id']}/chat"
         with st.spinner(f"🤖 自動填充 ({a['idx'] + 1}/{len(q)})：第{m['round']}輪 {m['home']} vs {m['away']} ..."):
             ok, msg, _ = tipsme_auto_fill(_murl, df_db, opts_tournaments, opts_teams)
         if not ok:
+            # V15.3 失敗續傳：填充失敗不再整體停止 — 該場列入待手動處理清單，
+            # 繼續下一場直到所選輪次掃完。填充失敗發生在任何寫入之前，不會污染數據。
             _v15_log(f"⚠️ 填充失敗：{m['home']} vs {m['away']} — {msg}", 'err')
             a['err'] = a.get('err', 0) + 1
-            if a['err'] >= 3:
-                _v15_log("⚠️ 累計 3 次失敗，已停止自動輸入，請檢查網絡或數據後再啟動。")
-                a['active'] = False
-            else:
-                a['idx'] += 1
+            if a['err'] == 3:
+                _v15_log("ℹ️ 已連續 3 次失敗 (網站可能故障，如 2026-11-13 Tipsme API 回傳 403/502)。"
+                         "按 V15.3 設定不會停止：繼續嘗試其餘比賽，失敗場次最後統一列出待手動處理。")
+            a.setdefault('failed', []).append(
+                {'round': m.get('round'), 'home': m.get('home'), 'away': m.get('away'),
+                 'date': str(_dt or ''), 'stage': '填充', 'msg': msg})
+            a['idx'] += 1
             a['tries'] = 0
+            _v15_save_remote(a)
             st.rerun()
             return
         a['err'] = 0
@@ -6595,6 +6638,7 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
             a['idx'] += 1
             a['step'] = 'FILL'
             a['tries'] = 0
+            _v15_save_remote(a)
             st.rerun()
             return
         # 放行：讓本 rerun 稍後的「確定投注並寫入雲端資料庫」按鈕分支自動執行
@@ -6607,11 +6651,119 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
             a['idx'] += 1
             a['step'] = 'FILL'
             a['tries'] = 0
+            _v15_save_remote(a)
             st.rerun()
             return
         st.session_state['sel_settle_match'] = _lab
         # 放行：讓本 rerun 稍後的「自動讀取賽果」/「確定結算」按鈕分支自動執行
         return
+
+# ==========================================================
+# V15.3 跨裝置進度共享：自動輸入狀態寫入共用檔案 (auto_status.csv)
+# 本地容器檔案在 Streamlit 雲端上為所有瀏覽器 session 共用；
+# 另同步 GitHub (如有設定)，令任何裝置都能唯讀看到即時進度。
+# ==========================================================
+AUTO_STATUS_FILE = 'auto_status.csv'
+
+def _v15_save_remote(a):
+    """V15.3：把自動輸入進度寫入共用狀態檔。失敗不影響自動輸入本身 (best-effort)。"""
+    try:
+        _row = {
+            'active': '1' if a.get('active') else '0',
+            'rounds': ','.join(str(r) for r in (a.get('rounds') or [])),
+            'total': len(a.get('queue') or []),
+            'idx': a.get('idx', 0),
+            'done': a.get('done', 0),
+            'bets': a.get('bets', 0),
+            'failed': len(a.get('failed') or []),
+            'updated': get_hkt_now().strftime('%Y-%m-%d %H:%M:%S'),
+            'updated_ts': int(get_hkt_now().timestamp()),
+            'log': json.dumps((a.get('log') or [])[-15:], ensure_ascii=False),
+        }
+        pd.DataFrame([_row]).to_csv(AUTO_STATUS_FILE, index=False)
+        if _has_secret('GITHUB_TOKEN') and _has_secret('GITHUB_REPO'):
+            try:
+                save_db_github(pd.DataFrame([_row]), st.secrets['GITHUB_REPO'],
+                               AUTO_STATUS_FILE, st.secrets['GITHUB_TOKEN'])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def _v15_load_remote():
+    """讀取共用狀態檔 (本地優先，GitHub 後備)；無檔案回 None。"""
+    try:
+        if os.path.exists(AUTO_STATUS_FILE):
+            _df = pd.read_csv(AUTO_STATUS_FILE)
+            if not _df.empty:
+                return _df.iloc[0].to_dict()
+        if _has_secret('GITHUB_TOKEN') and _has_secret('GITHUB_REPO'):
+            _df = load_db_github(st.secrets['GITHUB_REPO'], AUTO_STATUS_FILE, st.secrets['GITHUB_TOKEN'])
+            if _df is not None and not _df.empty:
+                return _df.iloc[0].to_dict()
+    except Exception:
+        pass
+    return None
+
+def _v15_render_remote_body():
+    """V15.3：其他裝置的即時進度橫幅 (唯讀；本 session 正在跑時不顯示，避免重複)。"""
+    try:
+        _s = _v15_load_remote()
+    except Exception:
+        _s = None
+    if not _s:
+        return
+    try:
+        _act = str(_s.get('active')) == '1'
+        _log = json.loads(str(_s.get('log') or '[]'))
+    except Exception:
+        _act, _log = False, []
+    _upd = str(_s.get('updated') or '')
+    _age = None
+    try:
+        _age = datetime.now().timestamp() - float(_s.get('updated_ts'))
+    except Exception:
+        pass
+    _stale = (_age is not None and _age > 300)
+    def _n(v):
+        try:
+            return int(float(v or 0))
+        except Exception:
+            return 0
+    if not _act:
+        # 已完結：只在最近 60 分鐘內完結時顯示結果摘要，避免永久殘留
+        _recent = (_age is not None and _age < 3600)
+        if not _recent or not _log:
+            return
+        st.info(f"🏁 另一裝置的自動輸入已於 {_upd} 完成：結算 {_n(_s.get('done'))} 場、"
+                f"寫入 {_n(_s.get('bets'))} 注、待手動 {_n(_s.get('failed'))} 場。")
+        return
+    st.info(f"📡 另一裝置正在自動輸入：第 {_n(_s.get('idx'))}/{_n(_s.get('total'))} 場 "
+            f"(已結算 {_n(_s.get('done'))}、寫入 {_n(_s.get('bets'))} 注、待手動 {_n(_s.get('failed'))} 場)，"
+            f"更新於 {_upd}。本裝置請只觀看進度，暫勿投注/結算/修改，以免覆蓋對方寫入。")
+    if _stale:
+        st.warning("⚠️ 逾 5 分鐘無更新 — 啟動裝置的分頁可能已關閉或網站故障，進度可能已中斷。")
+    if _log:
+        with st.container(height=150):
+            for _ts, _lvl, _msg in (_log or [])[-8:]:
+                if _lvl == 'err':
+                    st.markdown(f"`{_ts}` ⚠️ {_msg}")
+                else:
+                    st.markdown(f"`{_ts}` {_msg}")
+
+def v15_render_remote_status():
+    """V15.3：在頁面頂部顯示遠端進度 (本 session 沒有進行中的自動輸入時)。"""
+    _a = st.session_state.get('v15_auto') or {}
+    if _a.get('active'):
+        return
+    try:
+        _frag = st.fragment(run_every=10)   # Streamlit ≥1.33；本應用已用 st.dialog (≥1.72)
+    except Exception:
+        _frag = None
+    if _frag is not None:
+        _frag(_v15_render_remote_body)()
+    else:
+        _v15_render_remote_body()
 
 def v15_render_auto_panel(df_db):
     """V14.12 設定面板：選輪次 → 開始/停止 → 進度 + 日誌"""
@@ -6629,7 +6781,9 @@ def v15_render_auto_panel(df_db):
             st.caption("貼上聯賽賽程連結讀取後，選擇輪次 (可選一輪或多輪，例如只選第 4 輪，或選第 4 至 10 輪)，"
                        "系統即會自動處理所選輪次內所有「已完場且未記錄」的比賽：填充 → 分析 → 系統投注 (含 $0 模擬注) → "
                        "讀取賽果 (與賽程交叉核對) → 結算 → 學習 → 下一場，直到全部完成。"
-                       "過往賽事用家無法投注，因此只執行系統投注 (用家注碼 $0)。")
+                       "過往賽事用家無法投注，因此只執行系統投注 (用家注碼 $0)。"
+                       "V15.3：單場填充或結算失敗不會停止整個輪次 — 失敗場次會列入待手動處理清單，"
+                       "最後在日誌列出；其他裝置開啟程式可即時看到進度 (唯讀)。")
         c_r, c_b = st.columns([3, 1])
         sel_rounds = c_r.multiselect("要自動輸入的輪次 (可多選)",
                                      rounds, default=[r for r in st.session_state.get('v15_rounds_sel', []) if r in rounds],
@@ -6656,22 +6810,27 @@ def v15_render_auto_panel(df_db):
                     st.session_state['v15_auto'] = {
                         'active': True, 'rounds': list(sel_rounds), 'queue': q, 'idx': 0,
                         'step': 'FILL', 'log': [], 'tries': 0, 'err': 0, 'done': 0, 'bets': 0,
+                        'failed': [],
                     }
                     _rs = f"第 {min(sel_rounds)} 輪" if len(sel_rounds) == 1 else f"第 {min(sel_rounds)}-{max(sel_rounds)} 輪"
                     _v15_log(f"🚀 開始自動輸入：{_rs}共 {len(q)} 場未記錄的已完場比賽")
+                    _v15_log("ℹ️ V15.3：單場失敗不會停止整個輪次 — 失敗場次最後會列出待手動處理。")
+                    _v15_save_remote(st.session_state['v15_auto'])
                     st.rerun()
         if a.get('active'):
             if st.button("⏹️ 停止自動輸入", key="v15_stop_btn", use_container_width=True):
                 a['active'] = False
                 _v15_log("⏹️ 用家手動停止。")
+                _v15_save_remote(a)
                 st.rerun()
             q = a.get('queue') or []
             m = q[a['idx']] if a.get('idx', 0) < len(q) else None
-            c_p1, c_p2, c_p3, c_p4 = st.columns(4)
+            c_p1, c_p2, c_p3, c_p4, c_p5 = st.columns(5)
             c_p1.metric("進度", f"{min(a.get('idx', 0) + 1, len(q))}/{len(q)}")
             c_p2.metric("已結算", a.get('done', 0))
             c_p3.metric("寫入注單", a.get('bets', 0))
-            c_p4.metric("目前步驟", {'FILL': '填充', 'ANALYZE': '分析', 'BET': '投注',
+            c_p4.metric("待手動", len(a.get('failed') or []))
+            c_p5.metric("目前步驟", {'FILL': '填充', 'ANALYZE': '分析', 'BET': '投注',
                                     'SETTLE_READ': '讀取賽果', 'SETTLE_CONFIRM': '結算'}.get(a.get('step'), '-'))
             if m:
                 st.caption(f"正在處理：**第 {m['round']} 輪 — {m['home']} vs {m['away']}**"
@@ -8049,6 +8208,9 @@ def main():
     if st.sidebar.button("🗂 已完成注單資料修改 (可直接編輯任何欄位)", use_container_width=True):
         edit_settled_bets_dialog(db_file, db_table)
 
+    # V15.3：其他裝置的即時進度 (唯讀，每 10 秒自動更新；本 session 正在跑時不顯示)
+    v15_render_remote_status()
+
     t_pre, t_inplay, t_settle, t_ai, t_time_pnl, t_clv = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖ 賽果結算與管理", "🤖 全局模型", "📅 時間維度盈虧記錄分析", "🎯 CLV 與本金模擬"])
 
     with t_pre:
@@ -9341,9 +9503,20 @@ def main():
                                     if int(_sinfo.get('home_red') or 0) != int(_m15.get('home_red') or 0) or int(_sinfo.get('away_red') or 0) != int(_m15.get('away_red') or 0):
                                         _mis15.append(f"紅牌 賽程 {_m15.get('home_red')}-{_m15.get('away_red')} vs 比賽頁 {_sinfo.get('home_red')}-{_sinfo.get('away_red')}")
                                 if _mis15:
+                                    # V15.3：核對不符 → 列入待手動處理 + 繼續下一場。
+                                    # 注單保持 Open，絕不會用未核實的賽果結算 (原 V14.12 行為是整體暫停)。
                                     _v15_log(_a15, f"⚠️ 賽果核對不符：{sel_match} — " + "；".join(_mis15), 'err')
-                                    _v15_log(_a15, "已暫停自動化：請人手核對此場賽果後再結算。", 'err')
-                                    _a15['active'] = False
+                                    _v15_log(_a15, "此場注單保持待結算，請之後人手核對賽果再結算；繼續下一場。", 'err')
+                                    _m15f = (_a15.get('queue') or [{}])[min(_a15.get('idx', 0),
+                                            max(len(_a15.get('queue') or []) - 1, 0))]
+                                    _a15.setdefault('failed', []).append(
+                                        {'round': _m15f.get('round'), 'home': _m15f.get('home'),
+                                         'away': _m15f.get('away'), 'date': '', 'stage': '賽果核對',
+                                         'msg': '；'.join(_mis15)})
+                                    _a15['idx'] += 1
+                                    _a15['step'] = 'FILL'
+                                    _a15['tries'] = 0
+                                    _v15_save_remote(_a15)
                                     st.rerun()
                                 _a15['step'] = 'SETTLE_CONFIRM'
                                 _a15['tries'] = 0
@@ -9351,11 +9524,23 @@ def main():
                             st.toast(f"✅ 已自動讀取賽果 (來源: {_src})，請核對下方數值。", icon="🤖")
                             st.rerun()
                         else:
-                            # V14.12：自動模式 — 讀取失敗即暫停，避免結算錯誤數據
+                            # V15.3：讀取失敗 → 列入待手動處理 + 繼續下一場 (注單保持 Open，
+                            # 不會用錯誤賽果結算；原 V14.12 行為是整體暫停)
                             if _v15_on('SETTLE_READ'):
                                 _a15 = st.session_state['v15_auto']
-                                _v15_log(_a15, f"⚠️ 未能自動讀取 {sel_match} 的賽果，已暫停自動化 (網絡或數據問題)。", 'err')
-                                _a15['active'] = False
+                                _v15_log(_a15, f"⚠️ 未能自動讀取 {sel_match} 的賽果 (網絡或數據問題)，"
+                                               f"此場注單保持待結算，繼續下一場。", 'err')
+                                _m15f = (_a15.get('queue') or [{}])[min(_a15.get('idx', 0),
+                                        max(len(_a15.get('queue') or []) - 1, 0))]
+                                _a15.setdefault('failed', []).append(
+                                    {'round': _m15f.get('round'), 'home': _m15f.get('home'),
+                                     'away': _m15f.get('away'), 'date': '', 'stage': '結算讀取',
+                                     'msg': '未能自動讀取賽果'})
+                                _a15['idx'] += 1
+                                _a15['step'] = 'FILL'
+                                _a15['tries'] = 0
+                                _v15_save_remote(_a15)
+                                st.rerun()
                             st.warning("未能自動讀取：此場注單沒有記錄比賽 ID，賽程數據中亦找不到已完場的此場比賽。"
                                        "請在上方貼上該聯賽的賽程連結再按一次；或用下方「貼上比賽鏈結」/手動輸入。")
 
@@ -9498,11 +9683,22 @@ def main():
                     if _ts_use and settle_hg == 0 and settle_ag == 0 and settle_hc == 0 and settle_ac == 0:
                         _fh, _fa = _tipsme_score_pair(_ts_use.get('score'))
                         if _fh is not None and (int(_fh) + int(_fa)) > 0:
-                            # V14.12：自動模式 — 防呆觸發即暫停，避免無限重試
+                            # V15.3：防呆觸發 → 列入待手動處理 + 繼續下一場 (不會全 0 結算)
                             if _v15_on('SETTLE_CONFIRM'):
                                 _a15 = st.session_state['v15_auto']
-                                _v15_log(_a15, "⚠️ 賽果輸入欄全為 0 與讀取賽果不符，已暫停自動化。", 'err')
-                                _a15['active'] = False
+                                _v15_log(_a15, "⚠️ 賽果輸入欄全為 0 與讀取賽果不符，"
+                                               "此場保留待手動結算，繼續下一場。", 'err')
+                                _m15z = (_a15.get('queue') or [{}])[min(_a15.get('idx', 0),
+                                        max(len(_a15.get('queue') or []) - 1, 0))]
+                                _a15.setdefault('failed', []).append(
+                                    {'round': _m15z.get('round'), 'home': _m15z.get('home'),
+                                     'away': _m15z.get('away'), 'date': '', 'stage': '結算防呆',
+                                     'msg': '輸入欄全 0 與讀取賽果不符'})
+                                _a15['idx'] += 1
+                                _a15['step'] = 'FILL'
+                                _a15['tries'] = 0
+                                _v15_save_remote(_a15)
+                                st.rerun()
                             st.error(f"⚠️ 輸入的全場入球及角球全部為 0，但已讀取的 Tipsme 賽果為 {_ts_use.get('score')} "
                                      f"(角球 {_ts_use.get('corner')})。請核對上方輸入欄數值後再結算。")
                             st.stop()
@@ -9548,11 +9744,11 @@ def main():
                         _a15['idx'] = _a15.get('idx', 0) + 1
                         _a15['tries'] = 0
                         if _a15['idx'] >= len(_a15.get('queue') or []):
-                            _v15_log(_a15, f"🏁 全部完成：共結算 {_a15['done']} 場，寫入 {_a15.get('bets', 0)} 張注單")
-                            _a15['active'] = False
+                            _v15_finish_summary(_a15)
                         else:
                             _a15['step'] = 'FILL'
                             _v15_log(_a15, f"✅ 已結算 ({_a15['idx']}/{len(_a15['queue'])})：{sel_match}，繼續下一場")
+                            _v15_save_remote(_a15)
                     st.rerun()
 
     # 先渲染「時間維度盈虧記錄分析」分頁，再執行「全局模型」的 ML 訓練：
