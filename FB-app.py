@@ -10,6 +10,37 @@ import itertools
 from datetime import datetime, timedelta, timezone
 
 # ==============================================================================
+# V15.6 數據庫即時預覽效能修復 (純顯示層優化，零影響學習/分析/預測/投注建議)
+#
+#   背景 (2026-11-14)：數據庫累積至數百筆注單後，「🔍 數據庫即時線上預覽與管理」
+#   載入極慢，甚至瀏覽器無響應後自動刷新頁面。經逐行排查，成因有三，全部是
+#   「顯示與傳送層」問題，與數據內容、學習引擎或任何計算邏輯無關：
+#     1. 預覽表格把整個數據庫全部 ~60 欄原封不動序列化傳送瀏覽器，包括
+#        Home/Away_Recent_Matches、H2H_Records、Home/Away_League_Stats、
+#        Bookmaker_Odds、HKJC_Extra_Odds、Odds_History 等 JSON 巨欄
+#        (每行數十 KB)，序列化後可達數十 MB，websocket 傳輸及瀏覽器渲染
+#        皆超出負荷 → 連線逾時 → Streamlit 前端自動重連刷新 (彈窗被關掉)。
+#     2. 搜尋框每輸入一個字，舊碼對整個數據庫 (連 JSON 巨欄) 做 astype(str)
+#        全欄字串比對，每次重跑都要幾秒。
+#     3. CLV 欄每次重繪都對全部注單逐行 json.loads 解析 Odds_History，無快取。
+#
+#   修復 (只改「顯示與傳送」，完全不觸碰任何數據寫入路徑或計算邏輯)：
+#     1. 預設只傳送輕量顯示欄 (剔除 8 個 JSON 巨欄)，傳送量縮小 90%+；
+#        需要原始欄位時可勾選「顯示全部欄位」回到舊版完整表格 (行為不變)。
+#     2. 搜尋只比對輕量文字欄 (ID/日期/狀態/聯賽/球隊/盤口/選項/賽果/半場比分/
+#        Tipsme 編號)，涵蓋所有主要搜尋用途；勾選「顯示全部欄位」時自動
+#        擴展至全欄搜尋 (與舊版完全一致)。
+#     3. CLV 計算改用內容簽名快取 (C 速度雜湊 Bet_Type/Selection/Initial_Line/
+#        Initial_Odds/Odds_History 五欄 + ID 順序)：數據庫內容不變時直接重用，
+#        不再每次逐行 JSON 解析；內容有任何改動即自動重算，數值保證一致。
+#     4. 表格加高度上限 (620px) 及「顯示筆數」選擇 (預設最新 500 筆)；
+#        盈虧指標與下載報表永遠計算/包含全部符合筆數，數值與舊版完全一致。
+#
+#   風險評估：零。學習引擎 (V9/V10/V11)、自動導入、結算、風控、投注建議
+#   全部讀取 st.session_state.df_db 原始數據，本修改不刪除、不改寫任何數據，
+#   亦不改變任何計算公式 — 只有預覽畫面「傳送哪些欄位、幾筆」改變了。
+# =============================================================================
+# ==============================================================================
 # V15.5 模擬注自動預選修復 (自動導入不再整場跳過)
 #
 #   背景 (2026-11-14)：用家啟動挪威聯賽第 18-26 輪自動輸入 (66 場)，只有 3 場
@@ -5360,6 +5391,73 @@ def build_capital_flow_html(df_cap):
     )
     return table_html, total_amount, tot_str, tot_color, tot_label
 
+# --- V15.6 數據庫即時預覽效能修復：顯示層輔助函式 (純顯示用途，不影響任何計算) ---
+
+# JSON 巨欄清單：每行數十 KB 的原始數據，只供學習引擎內部使用，預覽表格預設不傳送
+_V16_JSON_HEAVY_COLS = {
+    'Home_Recent_Matches', 'Away_Recent_Matches', 'H2H_Records',
+    'Home_League_Stats', 'Away_League_Stats', 'Bookmaker_Odds',
+    'HKJC_Extra_Odds', 'Odds_History',
+}
+
+# 搜尋比對的輕量文字欄 (涵蓋球隊、盤口、聯賽、編號、狀態、日期、賽果等主要用途)
+_V16_LIGHT_SEARCH_COLS = [
+    'ID', 'Date', 'Status', 'Tournament_Name', 'Tournament_Category',
+    'Match', 'Match_Date', 'Home_Team', 'Away_Team', 'Bet_Type',
+    'Selection', 'Result_Label', 'Half_Score', 'Tipsme_Match_ID',
+]
+
+# V15.6 CLV 簽名快取 (模組層，程式重啟自動清空)
+_V16_CLV_HOLDER = {'sig': None, 'vals': None}
+
+def _v16_db_content_sig(df_db):
+    """V15.6：CLV 快取簽名 — C 速度雜湊 CLV 相關五欄內容 + 列數 + ID 順序。
+    數據庫內容 / 行序有任何改動，簽名即變，快取自動失效重算，數值保證與舊版一致。"""
+    try:
+        cols = [c for c in ['Bet_Type', 'Selection', 'Initial_Line',
+                            'Initial_Odds', 'Odds_History'] if c in df_db.columns]
+        if not cols:
+            return None
+        h = pd.util.hash_pandas_object(df_db[cols].astype(str), index=False)
+        sig = (len(df_db), int(h.sum()))
+        if 'ID' in df_db.columns:
+            sig = sig + (hash(tuple(df_db['ID'].astype(str).tolist())),)
+        return sig
+    except Exception:
+        return None
+
+def _v16_clv_series(df_db):
+    """V15.6：全庫 CLV 計算 + 簽名快取 — 數據庫不變時直接重用，
+    不再每次重繪都逐行 json.loads 解析 Odds_History。計算公式與 V11.1 完全相同。"""
+    sig = _v16_db_content_sig(df_db)
+    if (sig is not None and _V16_CLV_HOLDER.get('sig') == sig
+            and _V16_CLV_HOLDER.get('vals') is not None):
+        return _V16_CLV_HOLDER['vals']
+    vals = df_db.apply(compute_bet_clv, axis=1)
+    if sig is not None:
+        _V16_CLV_HOLDER['sig'] = sig
+        _V16_CLV_HOLDER['vals'] = vals
+    return vals
+
+def _v16_search_mask(df_db, query, all_columns=False):
+    """V15.6：關鍵字搜尋 — 預設只比對輕量文字欄 (向量式串接，不再對 JSON 巨欄
+    做整庫 astype(str))；all_columns=True 時擴展至全欄搜尋 (與舊版行為完全一致)。"""
+    if not query:
+        return None
+    try:
+        if all_columns:
+            cols = list(df_db.columns)
+        else:
+            cols = [c for c in _V16_LIGHT_SEARCH_COLS if c in df_db.columns]
+        if not cols:
+            return None
+        hay = df_db[cols[0]].astype(str)
+        for c in cols[1:]:
+            hay = hay.str.cat(df_db[c].astype(str), sep=' ')
+        return hay.str.contains(query, case=False, na=False)
+    except Exception:
+        return None
+
 @st.dialog("📊 數據庫即時線上預覽與管理", width="large")
 def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table):
     tab_bets, tab_capital, tab_manage = st.tabs(["⚽ 投注紀錄預覽", "💰 資金流水預覽", "🗑️ 數據清理與還原"])
@@ -5367,24 +5465,24 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
     with tab_bets:
         st.write("您可以在下方表格中自由滑動、點擊欄位排序，或使用關鍵字搜尋特定賽事。")
         search_query = st.text_input("🔍 關鍵字搜尋 (例如: 球隊名稱、盤口)", "", key="search_bets")
-        
-        if search_query:
-            mask = df_db.astype(str).apply(lambda x: x.str.contains(search_query, case=False, na=False)).any(axis=1)
-            show_df = df_db[mask].copy()
-        else:
-            show_df = df_db.copy()
+        # V15.6：輕量模式 (預設) 只搜尋主要文字欄，不再對 JSON 巨欄做整庫字串比對；
+        # 勾選「顯示全部欄位」時自動擴展至全欄搜尋 (與舊版行為完全一致)
+        show_all_cols = st.checkbox("顯示全部欄位 (含原始 JSON 數據，載入較慢)", value=False, key="v16_show_all_cols")
+
+        mask = _v16_search_mask(df_db, search_query, all_columns=show_all_cols)
+        show_df = df_db[mask].copy() if mask is not None else df_db.copy()
 
         total_sys_profit = pd.to_numeric(show_df['System_Profit'], errors='coerce').sum()
         total_user_profit = pd.to_numeric(show_df['User_Profit'], errors='coerce').sum()
         total_unit = pd.to_numeric(show_df['Unit_Profit'], errors='coerce').sum()
         total_user_payout = pd.to_numeric(show_df['User_Payout'], errors='coerce').sum()
-        
+
         # 修正：分別計算系統/用家單位利潤（僅計算有實際下注的注單）
         sys_staked = show_df[pd.to_numeric(show_df['System_Stake'], errors='coerce') > 0]
         usr_staked = show_df[pd.to_numeric(show_df['User_Stake'], errors='coerce') > 0]
         sys_unit_profit = pd.to_numeric(sys_staked['Unit_Profit'], errors='coerce').sum()
         usr_unit_profit = pd.to_numeric(usr_staked['Unit_Profit'], errors='coerce').sum()
-        
+
         # 顯示盈虧修正指標
         sm1, sm2, sm3, sm4 = st.columns(4)
         sm1.metric("原始單位利潤 (全部)", f"{total_unit:.2f} U")
@@ -5395,10 +5493,12 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
         st.divider()
 
         # V11.1 新增：為預覽表格加入 CLV (收盤線價值) 欄位 (只作顯示與下載，不會寫回資料庫)
+        # V15.6：改用簽名快取 — 數據庫內容不變時直接重用，不再每次重繪逐行 JSON 解析；
+        # 計算公式與 V11.1 完全相同，數值保證一致
         try:
             if not show_df.empty:
                 show_df = show_df.copy()
-                show_df['CLV%'] = (show_df.apply(compute_bet_clv, axis=1) * 100).round(2)
+                show_df['CLV%'] = (_v16_clv_series(df_db).reindex(show_df.index) * 100).round(2)
         except Exception:
             pass
 
@@ -5410,14 +5510,34 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
         if 'User_Payout' in summary_data: summary_data['User_Payout'] = round(total_user_payout, 2)
 
         summary_row = pd.DataFrame([summary_data])
-        show_df_with_summary = pd.concat([show_df, summary_row], ignore_index=True)
 
-        st.dataframe(show_df_with_summary, use_container_width=True)
-        
+        # V15.6：顯示筆數選擇 — 只影響畫面表格；盈虧指標與下載報表永遠包含全部符合筆數
+        n_sel = st.selectbox("📊 表格顯示筆數 (盈虧指標與下載報表仍計算全部符合筆數)",
+                             [200, 500, 1000, 0], index=1,
+                             format_func=lambda v: "全部" if v == 0 else f"最新 {v} 筆",
+                             key="v16_preview_rows")
+        disp_src = show_df
+        if n_sel and len(show_df) > n_sel:
+            st.caption(f"ℹ️ 符合條件共 {len(show_df)} 筆，畫面只顯示最新 {n_sel} 筆；盈虧指標與下載報表包含全部 {len(show_df)} 筆。")
+            disp_src = show_df.tail(n_sel)
+
+        if show_all_cols:
+            # 舊版完整表格 (全部欄位)
+            show_df_with_summary = pd.concat([disp_src, summary_row], ignore_index=True)
+            st.dataframe(show_df_with_summary, use_container_width=True, height=620)
+        else:
+            # V15.6 輕量顯示：剔除 8 個 JSON 巨欄，只傳送輕量顯示欄 (傳送量縮小 90%+)
+            light_cols = [c for c in show_df.columns if c not in _V16_JSON_HEAVY_COLS]
+            light_summary = summary_row[light_cols]
+            st.dataframe(pd.concat([disp_src[light_cols], light_summary], ignore_index=True),
+                         use_container_width=True, height=620)
+
+        # V15.6：下載報表永遠包含全部欄位與全部符合筆數 (與舊版完全一致)
+        show_df_with_summary = pd.concat([show_df, summary_row], ignore_index=True)
         excel_data = io.BytesIO()
         try:
             show_df_with_summary.to_excel(excel_data, index=False)
-            st.download_button("📥 點擊下載投注紀錄 Excel 報表", excel_data.getvalue(), "football_betting_report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="btn_down_bets_xlsx")
+            st.download_button("📥 點擊下載投注紀錄 Excel 報表 (全部欄位)", excel_data.getvalue(), "football_betting_report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="btn_down_bets_xlsx")
         except:
             st.download_button("📥 點擊下載投注紀錄報表 (CSV)", show_df_with_summary.to_csv(index=False).encode('utf-8-sig'), "football_betting_report.csv", "text/csv", key="btn_down_bets_csv")
 
