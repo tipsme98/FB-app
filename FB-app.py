@@ -10,6 +10,38 @@ import itertools
 from datetime import datetime, timedelta, timezone
 
 # ==============================================================================
+# V15.5 模擬注自動預選修復 (自動導入不再整場跳過)
+#
+#   背景 (2026-11-14)：用家啟動挪威聯賽第 18-26 輪自動輸入 (66 場)，只有 3 場
+#   記錄了 4 張注單，其餘 63 場全部顯示「分析完成：0 個實注建議 / 0 個系統注項
+#   (含模擬注) → 本場沒有可記錄的注項，跳到下一場」。但同一批比賽的分析畫面
+#   明明顯示「📝 模擬首選 (注碼 $0，只供追蹤)」— 即模型有傾向、盤口有效，
+#   卻沒有自動選入「系統投注」的預選清單。
+#
+#   根因：v11_auto_sys_picks 的「每種盤口自動預選一注 (無 ✅ 建議時選 $0 模擬注)」
+#   受側邊欄「系統自動預選每種盤口」開關 (v11_auto_sys) 控制；該開關一旦關閉
+#   會被永久儲存 (v10_save_settings)。開關關閉時 auto_sys 只餘 ✅ 實注建議 —
+#   未通過驗證的聯賽/策略 (只剩 📝 模擬注) 便整場「沒有可記錄的注項」被跳過，
+#   系統完全得不到學習數據。自動導入歷史賽事的目的正是零成本累積學習樣本，
+#   此開關不應令自動導入空手而回。
+#
+#   修復：
+#   1. (核心) 自動導入模式 (V14.12 自動輸入進行中) 強制啟用自動預選：分析結果的
+#      auto_sys 一律按「每種盤口一注 (✅ 實注或 $0 模擬注)」計算，不受側邊欄
+#      開關影響；開關關閉時會在日誌提示。手動模式行為完全不變 (仍尊重開關)。
+#   2. 自動執行器 BET 步驟及投注畫面的預選清單：auto_sys 及實注建議皆空時，
+#      以「📝 模擬首選」為後備，確保分析有產生候選就不會整場跳過。
+#   3. 日誌「分析完成」一行現在顯示「含 N 個 $0 模擬注」，讓用家清楚看到
+#      每場記錄的注項構成。
+#   4. 自動模式下「本場沒有可記錄的注項」跳過時也會同步進度到 auto_status.csv
+#      (跨裝置進度橫幅不會漏掉被跳過的場次)。
+#
+#   風險評估：模擬注注碼固定 $0 (v11_is_real_pick 以外一律 $0)，不會動用真實
+#   資金；重複注單防護 (同比賽+日期+盤口+方向+盤口線+賠率) 仍然生效，重跑
+#   自動導入不會產生重複記錄。被跳過的 63 場因沒有寫入任何注單，重跑自動
+#   導入即會全部補回。
+# ==============================================================================
+# ==============================================================================
 # V15.4 Tipsme 後備數據源 (azure API 故障期間照常運作)
 #
 #   背景 (2026-11-13/14)：Tipsme 數據 API (tipsme-web-2...azurewebsites.net)
@@ -6713,7 +6745,9 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
 
     if step == 'BET':
         res = st.session_state.get('analysis_result') or {}
-        _picks = res.get('auto_sys') or res.get('picks') or []
+        # V15.5：依次以 自動預選 → 實注建議 → 模擬首選 為可記錄注項，
+        # 確保分析有產生有效盤口候選時不會整場空手跳過。
+        _picks = res.get('auto_sys') or res.get('picks') or res.get('paper_picks') or []
         if not res.get('v9') or not _picks:
             _v15_log(f"⚠️ 第{m['round']}輪 {m['home']} vs {m['away']}：分析後沒有可記錄的注項 (無有效盤口)，跳過此場")
             a['idx'] += 1
@@ -8208,7 +8242,8 @@ def main():
         st.checkbox("聯賽熔斷 (某聯賽樣本外 ≥15 注且 ROI ≤ −15% 暫停實注)", key="v11_league_breaker", on_change=v10_save_settings)
         st.checkbox("系統自動預選每種盤口 (讓球 / 入球 / 角球各一注)", key="v11_auto_sys", on_change=v10_save_settings,
                     help="每種盤口類型在莊家最新仍提供的盤口線中，自動選出系統認為最合適的一邊：通過驗證的 ✅ 建議用 Kelly 注碼實注，其餘為 $0 模擬注。"
-                         "確保每場輸入的比賽都會存入數據庫供學習，並追蹤系統每種盤口的真實表現。舊盤口及同方向的相關盤口線 (例如 2.5 小之外再加 2.75 小) 不會重複預選。")
+                         "確保每場輸入的比賽都會存入數據庫供學習，並追蹤系統每種盤口的真實表現。舊盤口及同方向的相關盤口線 (例如 2.5 小之外再加 2.75 小) 不會重複預選。"
+                         "V15.5：自動導入歷史賽事 (V14.12 自動輸入) 時此開關一律視為開啟 — 自動導入的目的就是記錄 $0 模擬注供學習，關閉此開關只影響手動模式。")
         st.checkbox("🚫 停用角球大小 (不建議、不作模擬注記錄)", key="v11_corner_off", value=V10_SETTING_DEFAULTS['v11_corner_off'], on_change=v10_save_settings,
                     help="角球大小樣本已達統計顯著虧損 (580 注、每注 −15.3 單位，95% 區間全為負)，繼續記錄只會令模型學到雜訊。"
                          "開啟後角球完全不參與自動預選、模擬注及記錄 (分析表中仍會顯示「⏸ 角球已停用」供參考)；日後想恢復記錄隨時可關閉此選項。")
@@ -8627,6 +8662,16 @@ def main():
             except Exception:
                 _lh, _la, _lc, _lsrc = None, None, None, {}
 
+            # V15.5：自動導入模式 (V14.12 自動輸入進行中) 強制啟用「系統自動預選」。
+            # 側邊欄「系統自動預選每種盤口」開關關閉時，auto_sys 只餘 ✅ 實注建議，
+            # 沒有 ✅ 建議的比賽便整場「沒有可記錄的注項」被跳過 (2026-11-14 挪威聯賽
+            # 66 場只記錄 3 場的根因)。自動導入的目的就是零成本累積學習數據，
+            # 因此自動模式不受此開關影響，一律預選每種盤口一注 (✅ 實注或 $0 模擬注)；
+            # 手動模式完全不變 (仍尊重開關)。
+            _v15_set_autosys = dict(v9_set)
+            if (st.session_state.get('v15_auto') or {}).get('active') and not _v15_set_autosys.get('auto_sys', True):
+                _v15_set_autosys['auto_sys'] = True
+
             st.session_state.analysis_result = {
                 'v9': True,
                 'dims': [v9_dimension_stats(df_settled[df_settled['Tournament_Name'] == tournament_name], "A. 微觀 (賽事名稱)"),
@@ -8634,7 +8679,7 @@ def main():
                          v9_dimension_stats(df_settled, "C. 宏觀 (全局數據)")],
                 'engine': {k: engine.get(k) for k in ('trained', 'msg', 'w', 'kind', 'groups', 'n_matches', 'n_rows', 'll_market', 'll_model')},
                 'candidates': scored, 'picks': picks, 'paper_picks': paper_picks, 'kp_summary': kp_summary,
-                'auto_sys': v11_auto_sys_picks(scored, picks, v9_set),
+                'auto_sys': v11_auto_sys_picks(scored, picks, _v15_set_autosys),  # V15.5：自動導入時強制預選
                 'arena_msg': arena.get('msg', ''), 'league_ctx': _league_ctx, 'no_rank': bool(no_rank),
                 'kp_engine': {k: kp_engine.get(k) for k in ('trained', 'msg', 'n_matches', 'n_rows')}, 'mode': v9_set['mode'],
                 'ctx': {'h_n': v9_ctx['hp']['n'], 'a_n': v9_ctx['ap']['n'], 'h2h_n': len(v9_ctx['h2h']), 'league_n': v9_ctx['league']['n'],
@@ -8650,7 +8695,14 @@ def main():
                 _a15['step'] = 'BET'
                 _n_p = len(st.session_state.analysis_result.get('picks') or [])
                 _n_s = len(st.session_state.analysis_result.get('auto_sys') or [])
-                _v15_log(_a15, f"🧠 分析完成：{_n_p} 個實注建議 / {_n_s} 個系統注項 (含模擬注)，自動提交投注")
+                # V15.5：顯示注項構成 (幾注實注、幾注 $0 模擬注)
+                _n_sim = sum(1 for _ap in (st.session_state.analysis_result.get('auto_sys') or [])
+                             if not v11_is_real_pick(_ap, st.session_state.analysis_result.get('picks', [])))
+                _v15_log(_a15, f"🧠 分析完成：{_n_p} 個實注建議 / {_n_s} 個系統注項 (含 {_n_sim} 個 $0 模擬注)，自動提交投注")
+                if not v9_set.get('auto_sys', True) and not _a15.get('_v155_autosys_noted'):
+                    _a15['_v155_autosys_noted'] = True
+                    _v15_log(_a15, "ℹ️ 側邊欄「系統自動預選每種盤口」目前為關閉；自動導入模式下系統仍會強制預選 $0 模擬注，"
+                                   "確保每場比賽都存入數據庫供學習 (此開關只影響手動模式，本提示每輪只顯示一次)")
 
         if st.session_state.get('show_analysis', False) and not st.session_state.get('analysis_result', {}).get('v9'):
             st.session_state.show_analysis = False
@@ -8807,7 +8859,12 @@ def main():
                             default_sys.append(opt)
                             break
                 elif not is_editing:
-                    for p in (res.get('auto_sys') or picks):
+                    # V15.5：自動預選為空時，自動模式下以實注建議、模擬首選為後備預選，
+                    # 令投注畫面的預選清單與自動導入實際記錄的注項一致。
+                    _v15_sys_pool = res.get('auto_sys') or res.get('picks') or []
+                    if not _v15_sys_pool and (st.session_state.get('v15_auto') or {}).get('active'):
+                        _v15_sys_pool = res.get('paper_picks') or []
+                    for p in _v15_sys_pool:
                         for opt, c in option_map.items():
                             if c['bet_type'] == p['bet_type'] and abs(float(c['line']) - float(p['line'])) < 1e-4 and c['selection'] == p['selection'] and opt not in default_sys:
                                 default_sys.append(opt)
@@ -8872,6 +8929,7 @@ def main():
                         _a15['idx'] += 1
                         _a15['step'] = 'FILL'
                         _a15['tries'] = 0
+                        _v15_save_remote(_a15)   # V15.5：跳過時也同步跨裝置進度
                         st.rerun()
                 else:
                     target_id = st.session_state.get('editing_bet_id')
