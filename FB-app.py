@@ -10,6 +10,42 @@ import itertools
 from datetime import datetime, timedelta, timezone
 
 # ==============================================================================
+# V15.7 自動輸入可靠性修復 (超時保護 + 例外續傳 + 跨裝置一鍵接手)
+#
+#   背景 (2026-11-14/15)：挪威超級聯賽第 18-26 輪自動輸入 (66 場) 反覆「靜默中斷」—
+#   進度顯示「逾 5 分鐘無更新」，佇列後面的比賽整批沒被處理，重啟又死在別處，
+#   累積成「很多場無法自動輸入」。V15.4 (Tipsme API 容錯) 及 V15.5 (模擬注預選)
+#   已修好「填不到數據」與「空注項跳過」兩類問題；V15.7 修的是最後一類：
+#   「運行中途死亡」。三個根因與對應修復：
+#
+#   根因 1 — GitHub 雲端同步無超時：load_db_github / save_db_github 的
+#   requests.get/put 沒有 timeout，而自動模式下每個步驟 (寫注單/結算/進度同步)
+#   都會呼叫它 (每場約 4-8 次 GitHub API)。只要一次請求卡住，整個腳本無限期
+#   凍結 — 不報錯、不逾時，正是「更新到一半後完全靜默」的特徵。
+#   修復 1 — _gh_request 統一 15 秒超時 + 重試一次；仍失敗回傳 None，
+#   由既有 try/except 按原邏輯處理 (本地檔案後備 / 下次同步補上)，行為不變。
+#
+#   根因 2 — 四個關鍵步驟 (分析/投注/讀賽果/結算) 的按鈕分支無例外保護：
+#   個別比賽數據觸發未預期例外時，整個腳本崩潰，自動輸入靜默死亡；該場未寫入，
+#   重啟後仍排在佇列，每次都死在同一場 — 這些比賽永遠補不回。
+#   修復 2 — 四個分支及執行器整體包上 try/except：手動模式例外照常拋出
+#   (行為與舊版完全一致)；自動模式下錯誤寫入日誌、該場列入待手動處理清單、
+#   自動繼續下一場 (把 V15.3 的失敗續傳精神延伸到例外崩潰)。
+#   RerunException/StopException (Streamlit 內部控制流) 會先放行，不受影響。
+#
+#   根因 3 — 自動輸入只存在於啟動裝置的瀏覽器 session：分頁關閉/電腦休眠/
+#   網絡中斷/容器重啟都會令運行死亡，只能回到原裝置重按「開始」。
+#   修復 3 — 進度橫幅偵測到「active 但逾 5 分鐘無更新」時，提供一鍵
+#   「本裝置接手續傳」：按狀態檔記錄的輪次在本裝置重建佇列 (已記錄/已結算
+#   自動略過，與開始時同一套重複檢查)，從中斷處繼續。接手以 sid (session
+#   標記) 互斥：接手後原裝置偵測到狀態檔 sid 不符會自動停止，兩邊不會同時
+#   寫入；重複注單防護 (同比賽+日期+盤口+方向+盤口線+賠率) 仍然生效。
+#
+#   風險評估：零。三項修復全部在「通訊層」與「錯誤處理層」：GitHub 請求參數、
+#   例外捕捉、新按鈕。學習引擎 (V9/V10/V11)、結算、風控、投注建議的計算
+#   路徑與公式一字未改；手動模式行為與舊版完全一致。
+# =============================================================================
+# ==============================================================================
 # V15.6 數據庫即時預覽效能修復 (純顯示層優化，零影響學習/分析/預測/投注建議)
 #
 #   背景 (2026-11-14)：數據庫累積至數百筆注單後，「🔍 數據庫即時線上預覽與管理」
@@ -437,41 +473,51 @@ CAPITAL_COLUMNS = ['ID', 'Date', 'Type', 'Account', 'Amount', 'Note']
 CATEGORY_OPTIONS = ["國內聯賽 (Domestic League)", "國際聯賽 (International League)", "國際盃賽 (Cup)", "國內盃賽 (Domestic Cup)", "友誼賽 (Friendly)"]
 
 # GitHub API 讀取與寫入輔助函式 (加入時間戳記防快取)
+# V15.7：所有 GitHub 請求統一 15 秒超時 + 重試一次 — 舊版無超時，一旦請求卡住，
+# 自動輸入整個流程會無限期凍結 (2026-11-14 挪威聯賽自動輸入靜默中斷的根因之一)。
+GITHUB_TIMEOUT = 15
+
+def _gh_request(method, url, token, *, accept=None, json_body=None):
+    """V15.7：GitHub API 請求統一帶 15 秒超時，失敗重試一次，仍失敗回傳 None。
+    呼叫方按既有邏輯處理 None (load 回退本地檔案 / save 顯示同步失敗)，行為不變。"""
+    headers = {"Authorization": f"token {token}", "Cache-Control": "no-cache"}
+    if accept:
+        headers["Accept"] = accept
+    for _attempt in range(2):
+        try:
+            if method == "GET":
+                return requests.get(url, headers=headers, timeout=GITHUB_TIMEOUT)
+            return requests.put(url, headers=headers, json=json_body, timeout=GITHUB_TIMEOUT)
+        except Exception:
+            continue
+    return None
+
 def load_db_github(repo, path, token):
     timestamp = int(get_hkt_now().timestamp())
     url = f"https://api.github.com/repos/{repo}/contents/{path}?t={timestamp}"
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3.raw",
-        "Cache-Control": "no-cache"
-    }
-    res = requests.get(url, headers=headers)
-    if res.status_code == 200:
+    res = _gh_request("GET", url, token, accept="application/vnd.github.v3.raw")
+    if res is not None and res.status_code == 200:
         return pd.read_csv(io.StringIO(res.text))
     return None
 
 def save_db_github(df, repo, path, token):
     timestamp = int(get_hkt_now().timestamp())
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
-    headers = {
-        "Authorization": f"token {token}",
-        "Cache-Control": "no-cache"
-    }
-    res_get = requests.get(f"{url}?t={timestamp}", headers=headers)
-    sha = res_get.json().get("sha") if res_get.status_code == 200 else None
-    
+    res_get = _gh_request("GET", f"{url}?t={timestamp}", token)
+    sha = res_get.json().get("sha") if (res_get is not None and res_get.status_code == 200) else None
+
     csv_content = df.to_csv(index=False)
     content_b64 = base64.b64encode(csv_content.encode("utf-8")).decode("utf-8")
-    
+
     payload = {
         "message": f"Auto-update {path} via Streamlit App [{get_hkt_now().strftime('%Y-%m-%d %H:%M:%S')}]",
         "content": content_b64
     }
     if sha:
         payload["sha"] = sha
-        
-    res = requests.put(url, json=payload, headers=headers)
-    return res.status_code in [200, 201]
+
+    res = _gh_request("PUT", url, token, json_body=payload)
+    return res is not None and res.status_code in [200, 201]
 
 def process_legacy_columns(df):
     """處理舊資料庫欄位轉移防呆"""
@@ -6788,6 +6834,104 @@ def _v15_finish_summary(a):
     a['active'] = False
     _v15_save_remote(a)
 
+# --- V15.7 自動輸入可靠性：例外續傳 + 跨裝置接手 (純錯誤處理層，不改任何計算) ---
+
+def _v15_new_sid():
+    """V15.7：產生 session 標記 (sid)，寫入狀態檔用於跨裝置接手互斥。"""
+    return f"S{get_hkt_now().strftime('%Y%m%d%H%M%S')}-{id(st.session_state):x}"
+
+def _v15_is_control_exc(exc):
+    """V15.7：是否為 Streamlit 內部控制流例外 (st.rerun / st.stop) — 必須原樣放行。"""
+    return type(exc).__name__ in ('RerunException', 'StopException')
+
+def _v15_step_crash(step, exc):
+    """V15.7：自動模式例外保護 — 四個步驟按鈕分支 / 執行器發生未預期錯誤時呼叫。
+    手動模式 (本 session 沒有進行中的自動輸入) 重新拋出，行為與舊版完全一致；
+    自動模式下：錯誤寫入日誌、該場列入待手動處理清單、推進下一場 —
+    單場例外不再令整個自動輸入靜默死亡 (2026-11-14 挪威聯賽中斷的根因之二)。"""
+    a = st.session_state.get('v15_auto') or {}
+    if not a.get('active'):
+        raise exc
+    _m = {}
+    _q = a.get('queue') or []
+    if a.get('idx', 0) < len(_q):
+        _m = _q[a['idx']] or {}
+    _msg = f"{type(exc).__name__}: {exc}"
+    _v15_log(a, f"❌ 第{_m.get('round', '?')}輪 {_m.get('home', '?')} vs {_m.get('away', '?')}："
+                 f"步驟 {step} 發生未預期錯誤，此場列入待手動處理，繼續下一場 — {_msg}", 'err')
+    a.setdefault('failed', []).append({
+        'round': _m.get('round'), 'home': _m.get('home'), 'away': _m.get('away'),
+        'date': str(_v15_sched_date(_m) or ''), 'stage': f'步驟 {step} 例外', 'msg': _msg})
+    a['idx'] = a.get('idx', 0) + 1
+    a['step'] = 'FILL'
+    a['tries'] = 0
+    _v15_save_remote(a)
+    st.rerun()
+
+def _v15_taken_over(a):
+    """V15.7：狀態檔是否已被另一 session 接手 (sid 不同且對方仍在進行中)。"""
+    try:
+        _ms = str(a.get('sid') or '')
+        if not _ms:
+            return False
+        _s = _v15_load_remote()
+        if not _s:
+            return False
+        if str(_s.get('active')) != '1':
+            return False
+        _rs = str(_s.get('sid') or '')
+        return bool(_rs) and _rs != _ms
+    except Exception:
+        return False
+
+def _v15_takeover(_s):
+    """V15.7：另一裝置的自動輸入中斷逾 5 分鐘時，本裝置一鍵接手續傳。
+    佇列按狀態檔記錄的輪次、以「已完場且未記錄」重建 (與「開始自動輸入」同一套
+    重複檢查邏輯，已記錄/已結算的比賽自動略過)；接手後原裝置會因狀態檔 sid 不符
+    自動停止，兩邊不會同時寫入。需先在本裝置貼上同一聯賽的賽程連結。"""
+    sched = st.session_state.get('tipsme_schedule') or []
+    if not sched:
+        st.warning("接手前請先在「賽前建檔與投注」貼上同一聯賽的賽程連結讀取賽程 (與啟動自動輸入時相同)，再按接手。")
+        return
+    try:
+        _rounds = [int(r) for r in str(_s.get('rounds') or '').split(',') if str(r).strip()]
+    except Exception:
+        _rounds = []
+    if not _rounds:
+        st.warning("狀態檔沒有記錄輪次，無法接手；請直接在「自動導入歷史賽事」重新選輪次開始。")
+        return
+    df_db = st.session_state.get('df_db')
+    if df_db is None:
+        st.warning("數據庫尚未載入完成，請稍後再試。")
+        return
+    sched, _nd = _tipsme_dedupe_schedule(sched)
+    q = []
+    for r in sched:
+        if (r.get('round') or 0) not in _rounds or not r.get('finished') or not r.get('hkjc_match_id'):
+            continue
+        _dt = _v15_sched_date(r)
+        _dup = v14_find_duplicate_match(df_db, r['home'], r['away'], _dt, tipsme_id=r.get('hkjc_match_id'))
+        if _dup is not None and not _dup.empty:
+            if not (_dup['Status'].astype(str) == 'Open').any():
+                continue  # 已記錄且全部已結算 → 毋須處理
+        q.append(dict(r))
+    q.sort(key=lambda x: (x.get('round') or 0, x.get('match_time') or 0))
+    if not q:
+        st.toast("ℹ️ 所選輪次已全部記錄，毋須接手。", icon="✅")
+        st.rerun()
+        return
+    st.session_state['v15_auto'] = {
+        'active': True, 'rounds': _rounds, 'queue': q, 'idx': 0,
+        'step': 'FILL', 'log': [], 'tries': 0, 'err': 0, 'done': 0, 'bets': 0,
+        'failed': [], 'sid': _v15_new_sid(), 'took_over': True,
+    }
+    _rs = f"第 {min(_rounds)} 輪" if len(_rounds) == 1 else f"第 {min(_rounds)}-{max(_rounds)} 輪"
+    _v15_log(st.session_state['v15_auto'],
+             f"🤝 V15.7 本裝置接手中斷的自動輸入：{_rs}重建佇列共 {len(q)} 場未記錄比賽，"
+             f"從頭掃描續傳 (已記錄/已結算的自動略過)")
+    _v15_save_remote(st.session_state['v15_auto'])
+    st.rerun()
+
 def v15_auto_executor(df_db, opts_tournaments, opts_teams):
     """V14.12 自動導入執行器：每個 rerun 執行一步。
     FILL 步驟會實際呼叫 tipsme_auto_fill 並 rerun；ANALYZE / BET / SETTLE_* 步驟
@@ -6795,6 +6939,13 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
     (與手動點擊同一程式碼路徑)。"""
     a = st.session_state.get('v15_auto')
     if not a or not a.get('active'):
+        return
+    # V15.7：跨裝置互斥 — 狀態檔已被另一 session 接手 (sid 不符) 時自動停止本裝置，
+    # 避免兩邊同時寫入 (不寫回狀態檔，以免覆蓋接手裝置的進度)
+    if _v15_taken_over(a):
+        _v15_log(a, "🤝 偵測到另一裝置已接手自動輸入，本裝置自動停止 (避免重複寫入)。")
+        a['active'] = False
+        st.rerun()
         return
     q = a.get('queue') or []
     if not q or a.get('idx', 0) >= len(q):
@@ -6911,6 +7062,7 @@ def _v15_save_remote(a):
             'done': a.get('done', 0),
             'bets': a.get('bets', 0),
             'failed': len(a.get('failed') or []),
+            'sid': str(a.get('sid') or ''),
             'updated': get_hkt_now().strftime('%Y-%m-%d %H:%M:%S'),
             'updated_ts': int(get_hkt_now().timestamp()),
             'log': json.dumps((a.get('log') or [])[-15:], ensure_ascii=False),
@@ -6978,6 +7130,10 @@ def _v15_render_remote_body():
             f"更新於 {_upd}。本裝置請只觀看進度，暫勿投注/結算/修改，以免覆蓋對方寫入。")
     if _stale:
         st.warning("⚠️ 逾 5 分鐘無更新 — 啟動裝置的分頁可能已關閉或網站故障，進度可能已中斷。")
+        # V15.7：一鍵接手 — 在本裝置重建佇列續傳 (已記錄/已結算的比賽自動略過)；
+        # 接手後原裝置偵測到狀態檔 sid 不符會自動停止，兩邊不會同時寫入
+        if st.button("▶️ 本裝置接手續傳 (從中斷處繼續)", key="v15_takeover_btn"):
+            _v15_takeover(_s)
     if _log:
         with st.container(height=150):
             for _ts, _lvl, _msg in (_log or [])[-8:]:
@@ -7045,7 +7201,7 @@ def v15_render_auto_panel(df_db):
                     st.session_state['v15_auto'] = {
                         'active': True, 'rounds': list(sel_rounds), 'queue': q, 'idx': 0,
                         'step': 'FILL', 'log': [], 'tries': 0, 'err': 0, 'done': 0, 'bets': 0,
-                        'failed': [],
+                        'failed': [], 'sid': _v15_new_sid(),
                     }
                     _rs = f"第 {min(sel_rounds)} 輪" if len(sel_rounds) == 1 else f"第 {min(sel_rounds)}-{max(sel_rounds)} 輪"
                     _v15_log(f"🚀 開始自動輸入：{_rs}共 {len(q)} 場未記錄的已完場比賽")
@@ -8493,7 +8649,14 @@ def main():
         opts_teams = ["➕ 新增手動輸入..."] + sorted(list(set(st.session_state.df_db['Home_Team'].dropna().tolist() + st.session_state.df_db['Away_Team'].dropna().tolist())))
         
         # V14.12：自動導入歷史賽事執行器 — 必須在表單 widget 渲染前執行 (才能設定 widget 狀態)
-        v15_auto_executor(st.session_state.df_db, opts_tournaments, opts_teams)
+        # V15.7：整體例外保護 — 執行器內任何未預期錯誤都會列入待手動處理並續傳，
+        # 不會令自動輸入靜默死亡 (st.rerun/st.stop 的內部控制流例外會原樣放行)
+        try:
+            v15_auto_executor(st.session_state.df_db, opts_tournaments, opts_teams)
+        except Exception as _v15e:
+            if _v15_is_control_exc(_v15e) or not (st.session_state.get('v15_auto') or {}).get('active'):
+                raise
+            _v15_step_crash('FILL', _v15e)
         
         # V12：貼上 Tipsme 鏈結自動填充 (賽事與球隊資料 + 盤口賠率 + 近 5 場狀態)
         if not is_editing:
@@ -8648,182 +8811,187 @@ def main():
         
         # V14.12：_v15_on('ANALYZE') 令自動模式走完全相同的手動分析路徑
         if st.button("🚀 賽前數據分析執行", type="primary", use_container_width=True) or _v15_on('ANALYZE'):
-            st.session_state.show_analysis = True
-            v9_set = v9_get_settings()
-            engine, mt_hist, tl_hist = v9_get_engine(st.session_state.df_db)
-            df_settled = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
-
-            # 聯賽排名 → 實力分 (1~5，與舊字母尺度一致)；近5場 → 積分
-            hr_val = 3.0 if no_rank else rank_to_strength(home_rank, league_size)
-            ar_val = 3.0 if no_rank else rank_to_strength(away_rank, league_size)
-            _unk_now = bool(no_rank) or v11_is_intl(tournament_name, tournament_category)
-            hf_val = float(extract_form_points(home_form))
-            af_val = float(extract_form_points(away_form))
             try:
-                _md_ts = pd.Timestamp(match_date)
-            except Exception:
-                _md_ts = pd.Timestamp(get_hkt_now().strftime('%Y-%m-%d'))
+                st.session_state.show_analysis = True
+                v9_set = v9_get_settings()
+                engine, mt_hist, tl_hist = v9_get_engine(st.session_state.df_db)
+                df_settled = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
 
-            # 依時間排序每個盤口 (類型+盤口線) 的賠率序列：每個時間點只使用「截至該時間點」的賠率 (不用未來數據)
-            _mk_sorted = v9_group_markets(st.session_state.odds_history, _md_ts.to_pydatetime())
-            _pos_info = {}
-            for (_bt, _ln), _snaps in _mk_sorted.items():
-                _first = _snaps[0]
-                for _rank, _sn in enumerate(_snaps):
-                    _pos_info[_sn[1]] = {
-                        'drift_up': _sn[2] / _first[2] - 1.0 if _first[2] > 0 else 0.0,
-                        'drift_lw': _sn[3] / _first[3] - 1.0 if _first[3] > 0 else 0.0,
-                        'nsnap': _rank + 1,
-                        'is_latest': _rank == len(_snaps) - 1,
-                    }
-
-            candidates_base = []
-            nsnap_map = {}
-            for idx, r in enumerate(st.session_state.odds_history):
+                # 聯賽排名 → 實力分 (1~5，與舊字母尺度一致)；近5場 → 積分
+                hr_val = 3.0 if no_rank else rank_to_strength(home_rank, league_size)
+                ar_val = 3.0 if no_rank else rank_to_strength(away_rank, league_size)
+                _unk_now = bool(no_rank) or v11_is_intl(tournament_name, tournament_category)
+                hf_val = float(extract_form_points(home_form))
+                af_val = float(extract_form_points(away_form))
                 try:
-                    b_type, line_val = str(r['type']), float(r['line'])
-                    up_odds, lw_odds = float(r['upper']), float(r['lower'])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                # V12：其他玩法 (角球讓球、半場盤等) 只作記錄供學習，不進入投注分析
-                if v9_clean_bt(b_type) not in TIPSME_CORE_TYPES:
-                    continue
-                if up_odds <= 1.0 or lw_odds <= 1.0 or not v11_valid_pair(up_odds, lw_odds):
-                    continue
-                rec_time = r.get('record_time', '')
-                pinfo = _pos_info.get(idx, {'drift_up': 0.0, 'drift_lw': 0.0, 'nsnap': 1, 'is_latest': True})
-                nsnap_map[(v9_clean_bt(b_type), round(line_val, 3), idx)] = pinfo['nsnap']
-                line_str = f"{line_val:g}"
-                if b_type == "讓球":
-                    label_h, label_a = (f"{line_str}主隊(上盤)", f"{line_str}客隊(下盤)") if line_val <= 0 else (f"{line_str}主隊(下盤)", f"{line_str}客隊(上盤)")
-                    candidates_base.extend([
-                        {'bet_type': b_type, 'selection': 'Home', 'base_prob': 0.5, 'odds': up_odds, 'line': line_val, 'label': label_h, 'history_idx': idx, 'record_time': rec_time, 'odds_drift': pinfo['drift_up'], 'is_latest': pinfo['is_latest']},
-                        {'bet_type': b_type, 'selection': 'Away', 'base_prob': 0.5, 'odds': lw_odds, 'line': line_val, 'label': label_a, 'history_idx': idx, 'record_time': rec_time, 'odds_drift': pinfo['drift_lw'], 'is_latest': pinfo['is_latest']}
-                    ])
-                else:
-                    candidates_base.extend([
-                        {'bet_type': b_type, 'selection': 'Over', 'base_prob': 0.5, 'odds': up_odds, 'line': line_val, 'label': f"{line_str}大盤(Over)", 'history_idx': idx, 'record_time': rec_time, 'odds_drift': pinfo['drift_up'], 'is_latest': pinfo['is_latest']},
-                        {'bet_type': b_type, 'selection': 'Under', 'base_prob': 0.5, 'odds': lw_odds, 'line': line_val, 'label': f"{line_str}小盤(Under)", 'history_idx': idx, 'record_time': rec_time, 'odds_drift': pinfo['drift_lw'], 'is_latest': pinfo['is_latest']}
-                    ])
+                    _md_ts = pd.Timestamp(match_date)
+                except Exception:
+                    _md_ts = pd.Timestamp(get_hkt_now().strftime('%Y-%m-%d'))
 
-            # 賽前情境：只使用比賽日期之前的數據庫資料 (球隊攻防數據、對賽往績、賽事環境)
-            v9_ctx = v9_match_context(mt_hist, tl_hist, home_team, away_team, tournament_name, _md_ts, hr_val, ar_val, hf_val, af_val)
-            scored = v9_score_candidates(engine, candidates_base, v9_ctx, v9_set, nsnap_map) if candidates_base else []
-            # V14.3 角球訊號追蹤：在每個角球候選上附上「模型預期總角球」
-            # (主隊角球攻+客隊角球守 / 客隊角球攻+主隊角球守，與實測驗證的公式一致)
-            try:
-                _v143_exp_c = (v9_ctx['hp']['cf'] + v9_ctx['ap']['ca']) / 2.0 + (v9_ctx['ap']['cf'] + v9_ctx['hp']['ca']) / 2.0
-            except Exception:
-                _v143_exp_c = None
-            for _c in scored:
-                if v9_clean_bt(_c['bet_type']) == '角球大小':
-                    _c['exp_c_total'] = _v143_exp_c
+                # 依時間排序每個盤口 (類型+盤口線) 的賠率序列：每個時間點只使用「截至該時間點」的賠率 (不用未來數據)
+                _mk_sorted = v9_group_markets(st.session_state.odds_history, _md_ts.to_pydatetime())
+                _pos_info = {}
+                for (_bt, _ln), _snaps in _mk_sorted.items():
+                    _first = _snaps[0]
+                    for _rank, _sn in enumerate(_snaps):
+                        _pos_info[_sn[1]] = {
+                            'drift_up': _sn[2] / _first[2] - 1.0 if _first[2] > 0 else 0.0,
+                            'drift_lw': _sn[3] / _first[3] - 1.0 if _first[3] > 0 else 0.0,
+                            'nsnap': _rank + 1,
+                            'is_latest': _rank == len(_snaps) - 1,
+                        }
 
-            # V10 看盤引擎：以初盤→收盤的盤口/水位變化 + 實力冷熱，套用樣本外驗證為正 EV 的看盤規則
-            kp_engine = v10_get_engine(st.session_state.df_db)
-            try:
-                kp_map = v10_predict(kp_engine, st.session_state.odds_history, v9_ctx, hr_val, ar_val, hf_val, af_val, _md_ts, v9_set['min_ev'], _unk_now)
-            except Exception as _kp_err:
-                kp_map = {}
-                st.warning(f"看盤引擎分析失敗，已改用 V9 模型: {_kp_err}")
-            try:
-                arena = v11_get_arena(st.session_state.df_db)
-            except Exception as _ar_err:
-                arena = {'trained': False, 'msg': f'模型擂台失敗: {_ar_err}', 'active': {}, 'league': {}}
-            _league_ctx = {'tourn': tournament_name, 'n_matches': v11_league_match_count(st.session_state.df_db, tournament_name)}
-            _mode_now = v9_set['mode'] if (kp_engine.get('trained') or v9_set['mode'] == V11_MODE_AUTO) else '只用 V9 模型'
-            scored = v10_apply_to_candidates(scored, kp_map, _mode_now, v9_set, kp_engine, arena, _league_ctx)
-            # V11：莊家已不再提供的舊盤口線 (例如初盤 0 已轉為 0.25) → 不建議、不作模擬注
-            _offered_now = v11_offered_lines(st.session_state.odds_history, _md_ts)
-            for c in scored:
-                c['is_offered'] = bool(v11_is_offered(_offered_now, v9_clean_bt(c['bet_type']), c['line']))
-                if not c['is_offered']:
-                    c['status'] = '⏸ 舊盤口 (莊家已不再提供)'
-                    c['gate_ok'] = False
-                # V14.2：角球停用 — 不建議、不作模擬注記錄 (設定可開關)
-                if v9_set.get('corner_off', True) and v9_clean_bt(c['bet_type']) == '角球大小':
-                    c['status'] = '⏸ 角球已停用 (設定)'
-                    c['gate_ok'] = False
-            kp_summary = []
-            for (_kbt, _kln, _ksd), _kv in kp_map.items():
-                kp_summary.append({'盤口類型': _kbt, '方向': {'Home': '主隊', 'Away': '客隊', 'Over': '大', 'Under': '小'}.get(_ksd, _ksd),
-                                   '初盤': f"{_kv['line_o']:g} @ {_kv['odds_o']:.2f}", '收盤主盤': f"{_kln:g}",
-                                   '隱含值 初→收': f"{_kv['imp_o']:.2f} → {_kv['imp_c']:.2f}",
-                                   '盤水移動 (此方向)': f"{_kv['mv_imp']:+.2f}", '冷熱 (負=冷)': f"{_kv['resid']:+.2f}",
-                                   '最佳看盤規則': _kv['kp_rule'] or '-', '看盤估計EV': f"{_kv['ev_kp']*100:+.1f}%" if _kv['ev_kp'] is not None else '-',
-                                   '觸發規則 (前5)': '；'.join(_kv['kp_fired']) if _kv['kp_fired'] else '-'})
+                candidates_base = []
+                nsnap_map = {}
+                for idx, r in enumerate(st.session_state.odds_history):
+                    try:
+                        b_type, line_val = str(r['type']), float(r['line'])
+                        up_odds, lw_odds = float(r['upper']), float(r['lower'])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    # V12：其他玩法 (角球讓球、半場盤等) 只作記錄供學習，不進入投注分析
+                    if v9_clean_bt(b_type) not in TIPSME_CORE_TYPES:
+                        continue
+                    if up_odds <= 1.0 or lw_odds <= 1.0 or not v11_valid_pair(up_odds, lw_odds):
+                        continue
+                    rec_time = r.get('record_time', '')
+                    pinfo = _pos_info.get(idx, {'drift_up': 0.0, 'drift_lw': 0.0, 'nsnap': 1, 'is_latest': True})
+                    nsnap_map[(v9_clean_bt(b_type), round(line_val, 3), idx)] = pinfo['nsnap']
+                    line_str = f"{line_val:g}"
+                    if b_type == "讓球":
+                        label_h, label_a = (f"{line_str}主隊(上盤)", f"{line_str}客隊(下盤)") if line_val <= 0 else (f"{line_str}主隊(下盤)", f"{line_str}客隊(上盤)")
+                        candidates_base.extend([
+                            {'bet_type': b_type, 'selection': 'Home', 'base_prob': 0.5, 'odds': up_odds, 'line': line_val, 'label': label_h, 'history_idx': idx, 'record_time': rec_time, 'odds_drift': pinfo['drift_up'], 'is_latest': pinfo['is_latest']},
+                            {'bet_type': b_type, 'selection': 'Away', 'base_prob': 0.5, 'odds': lw_odds, 'line': line_val, 'label': label_a, 'history_idx': idx, 'record_time': rec_time, 'odds_drift': pinfo['drift_lw'], 'is_latest': pinfo['is_latest']}
+                        ])
+                    else:
+                        candidates_base.extend([
+                            {'bet_type': b_type, 'selection': 'Over', 'base_prob': 0.5, 'odds': up_odds, 'line': line_val, 'label': f"{line_str}大盤(Over)", 'history_idx': idx, 'record_time': rec_time, 'odds_drift': pinfo['drift_up'], 'is_latest': pinfo['is_latest']},
+                            {'bet_type': b_type, 'selection': 'Under', 'base_prob': 0.5, 'odds': lw_odds, 'line': line_val, 'label': f"{line_str}小盤(Under)", 'history_idx': idx, 'record_time': rec_time, 'odds_drift': pinfo['drift_lw'], 'is_latest': pinfo['is_latest']}
+                        ])
 
-            # 推薦：只考慮每個盤口的最新賠率；每種盤口類型最多一注，總數不超過設定上限
-            picks, _used_types = [], set()
-            for c in scored:
-                # V14：✅ 建議 (完全通過驗證) 及 ✅ 試注 (半注 Kelly) 均納入實注建議
-                if not c.get('is_latest', True) or not c.get('is_offered', True) or not str(c.get('status', '')).startswith('✅'):
-                    continue
-                _bt = v9_clean_bt(c['bet_type'])
-                if _bt in _used_types:
-                    continue
-                picks.append(c)
-                _used_types.add(_bt)
-                if len(picks) >= v9_set['max_picks']:
-                    break
-            # V11 模擬注：未通過驗證 / 新聯賽觀察期的最佳候選 (注碼 $0，只供追蹤)
-            paper_picks, _pused = [], set()
-            for c in sorted([c for c in scored if c.get('is_latest', True) and c.get('is_offered', True) and str(c.get('status', '')).startswith('📝')], key=lambda x: -x.get('ev', -9)):
-                _bt = v9_clean_bt(c['bet_type'])
-                if _bt in _pused:
-                    continue
-                paper_picks.append(c)
-                _pused.add(_bt)
-                if len(paper_picks) >= v9_set['max_picks']:
-                    break
+                # 賽前情境：只使用比賽日期之前的數據庫資料 (球隊攻防數據、對賽往績、賽事環境)
+                v9_ctx = v9_match_context(mt_hist, tl_hist, home_team, away_team, tournament_name, _md_ts, hr_val, ar_val, hf_val, af_val)
+                scored = v9_score_candidates(engine, candidates_base, v9_ctx, v9_set, nsnap_map) if candidates_base else []
+                # V14.3 角球訊號追蹤：在每個角球候選上附上「模型預期總角球」
+                # (主隊角球攻+客隊角球守 / 客隊角球攻+主隊角球守，與實測驗證的公式一致)
+                try:
+                    _v143_exp_c = (v9_ctx['hp']['cf'] + v9_ctx['ap']['ca']) / 2.0 + (v9_ctx['ap']['cf'] + v9_ctx['hp']['ca']) / 2.0
+                except Exception:
+                    _v143_exp_c = None
+                for _c in scored:
+                    if v9_clean_bt(_c['bet_type']) == '角球大小':
+                        _c['exp_c_total'] = _v143_exp_c
 
-            try:
-                _lh, _la, _lc, _lsrc = v9_prematch_lambdas(st.session_state.odds_history, v9_ctx)
-            except Exception:
-                _lh, _la, _lc, _lsrc = None, None, None, {}
+                # V10 看盤引擎：以初盤→收盤的盤口/水位變化 + 實力冷熱，套用樣本外驗證為正 EV 的看盤規則
+                kp_engine = v10_get_engine(st.session_state.df_db)
+                try:
+                    kp_map = v10_predict(kp_engine, st.session_state.odds_history, v9_ctx, hr_val, ar_val, hf_val, af_val, _md_ts, v9_set['min_ev'], _unk_now)
+                except Exception as _kp_err:
+                    kp_map = {}
+                    st.warning(f"看盤引擎分析失敗，已改用 V9 模型: {_kp_err}")
+                try:
+                    arena = v11_get_arena(st.session_state.df_db)
+                except Exception as _ar_err:
+                    arena = {'trained': False, 'msg': f'模型擂台失敗: {_ar_err}', 'active': {}, 'league': {}}
+                _league_ctx = {'tourn': tournament_name, 'n_matches': v11_league_match_count(st.session_state.df_db, tournament_name)}
+                _mode_now = v9_set['mode'] if (kp_engine.get('trained') or v9_set['mode'] == V11_MODE_AUTO) else '只用 V9 模型'
+                scored = v10_apply_to_candidates(scored, kp_map, _mode_now, v9_set, kp_engine, arena, _league_ctx)
+                # V11：莊家已不再提供的舊盤口線 (例如初盤 0 已轉為 0.25) → 不建議、不作模擬注
+                _offered_now = v11_offered_lines(st.session_state.odds_history, _md_ts)
+                for c in scored:
+                    c['is_offered'] = bool(v11_is_offered(_offered_now, v9_clean_bt(c['bet_type']), c['line']))
+                    if not c['is_offered']:
+                        c['status'] = '⏸ 舊盤口 (莊家已不再提供)'
+                        c['gate_ok'] = False
+                    # V14.2：角球停用 — 不建議、不作模擬注記錄 (設定可開關)
+                    if v9_set.get('corner_off', True) and v9_clean_bt(c['bet_type']) == '角球大小':
+                        c['status'] = '⏸ 角球已停用 (設定)'
+                        c['gate_ok'] = False
+                kp_summary = []
+                for (_kbt, _kln, _ksd), _kv in kp_map.items():
+                    kp_summary.append({'盤口類型': _kbt, '方向': {'Home': '主隊', 'Away': '客隊', 'Over': '大', 'Under': '小'}.get(_ksd, _ksd),
+                                       '初盤': f"{_kv['line_o']:g} @ {_kv['odds_o']:.2f}", '收盤主盤': f"{_kln:g}",
+                                       '隱含值 初→收': f"{_kv['imp_o']:.2f} → {_kv['imp_c']:.2f}",
+                                       '盤水移動 (此方向)': f"{_kv['mv_imp']:+.2f}", '冷熱 (負=冷)': f"{_kv['resid']:+.2f}",
+                                       '最佳看盤規則': _kv['kp_rule'] or '-', '看盤估計EV': f"{_kv['ev_kp']*100:+.1f}%" if _kv['ev_kp'] is not None else '-',
+                                       '觸發規則 (前5)': '；'.join(_kv['kp_fired']) if _kv['kp_fired'] else '-'})
 
-            # V15.5：自動導入模式 (V14.12 自動輸入進行中) 強制啟用「系統自動預選」。
-            # 側邊欄「系統自動預選每種盤口」開關關閉時，auto_sys 只餘 ✅ 實注建議，
-            # 沒有 ✅ 建議的比賽便整場「沒有可記錄的注項」被跳過 (2026-11-14 挪威聯賽
-            # 66 場只記錄 3 場的根因)。自動導入的目的就是零成本累積學習數據，
-            # 因此自動模式不受此開關影響，一律預選每種盤口一注 (✅ 實注或 $0 模擬注)；
-            # 手動模式完全不變 (仍尊重開關)。
-            _v15_set_autosys = dict(v9_set)
-            if (st.session_state.get('v15_auto') or {}).get('active') and not _v15_set_autosys.get('auto_sys', True):
-                _v15_set_autosys['auto_sys'] = True
+                # 推薦：只考慮每個盤口的最新賠率；每種盤口類型最多一注，總數不超過設定上限
+                picks, _used_types = [], set()
+                for c in scored:
+                    # V14：✅ 建議 (完全通過驗證) 及 ✅ 試注 (半注 Kelly) 均納入實注建議
+                    if not c.get('is_latest', True) or not c.get('is_offered', True) or not str(c.get('status', '')).startswith('✅'):
+                        continue
+                    _bt = v9_clean_bt(c['bet_type'])
+                    if _bt in _used_types:
+                        continue
+                    picks.append(c)
+                    _used_types.add(_bt)
+                    if len(picks) >= v9_set['max_picks']:
+                        break
+                # V11 模擬注：未通過驗證 / 新聯賽觀察期的最佳候選 (注碼 $0，只供追蹤)
+                paper_picks, _pused = [], set()
+                for c in sorted([c for c in scored if c.get('is_latest', True) and c.get('is_offered', True) and str(c.get('status', '')).startswith('📝')], key=lambda x: -x.get('ev', -9)):
+                    _bt = v9_clean_bt(c['bet_type'])
+                    if _bt in _pused:
+                        continue
+                    paper_picks.append(c)
+                    _pused.add(_bt)
+                    if len(paper_picks) >= v9_set['max_picks']:
+                        break
 
-            st.session_state.analysis_result = {
-                'v9': True,
-                'dims': [v9_dimension_stats(df_settled[df_settled['Tournament_Name'] == tournament_name], "A. 微觀 (賽事名稱)"),
-                         v9_dimension_stats(df_settled[df_settled['Tournament_Category'] == tournament_category], "B. 中觀 (賽事分類)"),
-                         v9_dimension_stats(df_settled, "C. 宏觀 (全局數據)")],
-                'engine': {k: engine.get(k) for k in ('trained', 'msg', 'w', 'kind', 'groups', 'n_matches', 'n_rows', 'll_market', 'll_model')},
-                'candidates': scored, 'picks': picks, 'paper_picks': paper_picks, 'kp_summary': kp_summary,
-                'auto_sys': v11_auto_sys_picks(scored, picks, _v15_set_autosys),  # V15.5：自動導入時強制預選
-                'arena_msg': arena.get('msg', ''), 'league_ctx': _league_ctx, 'no_rank': bool(no_rank),
-                'kp_engine': {k: kp_engine.get(k) for k in ('trained', 'msg', 'n_matches', 'n_rows')}, 'mode': v9_set['mode'],
-                'ctx': {'h_n': v9_ctx['hp']['n'], 'a_n': v9_ctx['ap']['n'], 'h2h_n': len(v9_ctx['h2h']), 'league_n': v9_ctx['league']['n'],
-                        'h_gf': v9_ctx['hp']['gf'], 'h_ga': v9_ctx['hp']['ga'], 'a_gf': v9_ctx['ap']['gf'], 'a_ga': v9_ctx['ap']['ga'],
-                        'h_cf': v9_ctx['hp']['cf'], 'a_cf': v9_ctx['ap']['cf']},
-                'lambdas': (_lh, _la, _lc, _lsrc),
-                't_name': tournament_name, 't_cat': tournament_category
-            }
-            # V14.12：自動模式 — 分析完成，自動推進至「系統投注」步驟
-            if _v15_on('ANALYZE'):
-                _a15 = st.session_state['v15_auto']
-                _a15['tries'] = 0
-                _a15['step'] = 'BET'
-                _n_p = len(st.session_state.analysis_result.get('picks') or [])
-                _n_s = len(st.session_state.analysis_result.get('auto_sys') or [])
-                # V15.5：顯示注項構成 (幾注實注、幾注 $0 模擬注)
-                _n_sim = sum(1 for _ap in (st.session_state.analysis_result.get('auto_sys') or [])
-                             if not v11_is_real_pick(_ap, st.session_state.analysis_result.get('picks', [])))
-                _v15_log(_a15, f"🧠 分析完成：{_n_p} 個實注建議 / {_n_s} 個系統注項 (含 {_n_sim} 個 $0 模擬注)，自動提交投注")
-                if not v9_set.get('auto_sys', True) and not _a15.get('_v155_autosys_noted'):
-                    _a15['_v155_autosys_noted'] = True
-                    _v15_log(_a15, "ℹ️ 側邊欄「系統自動預選每種盤口」目前為關閉；自動導入模式下系統仍會強制預選 $0 模擬注，"
-                                   "確保每場比賽都存入數據庫供學習 (此開關只影響手動模式，本提示每輪只顯示一次)")
+                try:
+                    _lh, _la, _lc, _lsrc = v9_prematch_lambdas(st.session_state.odds_history, v9_ctx)
+                except Exception:
+                    _lh, _la, _lc, _lsrc = None, None, None, {}
 
+                # V15.5：自動導入模式 (V14.12 自動輸入進行中) 強制啟用「系統自動預選」。
+                # 側邊欄「系統自動預選每種盤口」開關關閉時，auto_sys 只餘 ✅ 實注建議，
+                # 沒有 ✅ 建議的比賽便整場「沒有可記錄的注項」被跳過 (2026-11-14 挪威聯賽
+                # 66 場只記錄 3 場的根因)。自動導入的目的就是零成本累積學習數據，
+                # 因此自動模式不受此開關影響，一律預選每種盤口一注 (✅ 實注或 $0 模擬注)；
+                # 手動模式完全不變 (仍尊重開關)。
+                _v15_set_autosys = dict(v9_set)
+                if (st.session_state.get('v15_auto') or {}).get('active') and not _v15_set_autosys.get('auto_sys', True):
+                    _v15_set_autosys['auto_sys'] = True
+
+                st.session_state.analysis_result = {
+                    'v9': True,
+                    'dims': [v9_dimension_stats(df_settled[df_settled['Tournament_Name'] == tournament_name], "A. 微觀 (賽事名稱)"),
+                             v9_dimension_stats(df_settled[df_settled['Tournament_Category'] == tournament_category], "B. 中觀 (賽事分類)"),
+                             v9_dimension_stats(df_settled, "C. 宏觀 (全局數據)")],
+                    'engine': {k: engine.get(k) for k in ('trained', 'msg', 'w', 'kind', 'groups', 'n_matches', 'n_rows', 'll_market', 'll_model')},
+                    'candidates': scored, 'picks': picks, 'paper_picks': paper_picks, 'kp_summary': kp_summary,
+                    'auto_sys': v11_auto_sys_picks(scored, picks, _v15_set_autosys),  # V15.5：自動導入時強制預選
+                    'arena_msg': arena.get('msg', ''), 'league_ctx': _league_ctx, 'no_rank': bool(no_rank),
+                    'kp_engine': {k: kp_engine.get(k) for k in ('trained', 'msg', 'n_matches', 'n_rows')}, 'mode': v9_set['mode'],
+                    'ctx': {'h_n': v9_ctx['hp']['n'], 'a_n': v9_ctx['ap']['n'], 'h2h_n': len(v9_ctx['h2h']), 'league_n': v9_ctx['league']['n'],
+                            'h_gf': v9_ctx['hp']['gf'], 'h_ga': v9_ctx['hp']['ga'], 'a_gf': v9_ctx['ap']['gf'], 'a_ga': v9_ctx['ap']['ga'],
+                            'h_cf': v9_ctx['hp']['cf'], 'a_cf': v9_ctx['ap']['cf']},
+                    'lambdas': (_lh, _la, _lc, _lsrc),
+                    't_name': tournament_name, 't_cat': tournament_category
+                }
+                # V14.12：自動模式 — 分析完成，自動推進至「系統投注」步驟
+                if _v15_on('ANALYZE'):
+                    _a15 = st.session_state['v15_auto']
+                    _a15['tries'] = 0
+                    _a15['step'] = 'BET'
+                    _n_p = len(st.session_state.analysis_result.get('picks') or [])
+                    _n_s = len(st.session_state.analysis_result.get('auto_sys') or [])
+                    # V15.5：顯示注項構成 (幾注實注、幾注 $0 模擬注)
+                    _n_sim = sum(1 for _ap in (st.session_state.analysis_result.get('auto_sys') or [])
+                                 if not v11_is_real_pick(_ap, st.session_state.analysis_result.get('picks', [])))
+                    _v15_log(_a15, f"🧠 分析完成：{_n_p} 個實注建議 / {_n_s} 個系統注項 (含 {_n_sim} 個 $0 模擬注)，自動提交投注")
+                    if not v9_set.get('auto_sys', True) and not _a15.get('_v155_autosys_noted'):
+                        _a15['_v155_autosys_noted'] = True
+                        _v15_log(_a15, "ℹ️ 側邊欄「系統自動預選每種盤口」目前為關閉；自動導入模式下系統仍會強制預選 $0 模擬注，"
+                                       "確保每場比賽都存入數據庫供學習 (此開關只影響手動模式，本提示每輪只顯示一次)")
+
+            except Exception as _v15e:
+                if _v15_is_control_exc(_v15e) or not (st.session_state.get('v15_auto') or {}).get('active'):
+                    raise
+                _v15_step_crash('ANALYZE', _v15e)
         if st.session_state.get('show_analysis', False) and not st.session_state.get('analysis_result', {}).get('v9'):
             st.session_state.show_analysis = False
 
@@ -9039,128 +9207,133 @@ def main():
             # V14.12：_v15_on('BET') 令自動模式走完全相同的手動投注路徑
             # (用家投注為空 → 只寫入系統注項；過往賽事毋須人手下注)
             if st.button(submit_btn_label, type="primary", use_container_width=True) or _v15_on('BET'):
-                all_keys = set(sys_selected + usr_selected)
-                if not all_keys:
-                    st.warning("⚠️ 請至少在系統或用家選擇一項投注！")
-                    # V14.12：自動模式 — 沒有可記錄注項，跳到下一場 (毋須結算)
-                    if _v15_on('BET'):
-                        _a15 = st.session_state['v15_auto']
-                        _v15_log(_a15, "⏭️ 本場沒有可記錄的注項，跳到下一場")
-                        _a15['idx'] += 1
-                        _a15['step'] = 'FILL'
-                        _a15['tries'] = 0
-                        _v15_save_remote(_a15)   # V15.5：跳過時也同步跨裝置進度
-                        st.rerun()
-                else:
-                    target_id = st.session_state.get('editing_bet_id')
-                    orig_record = None
-                    if target_id:
-                        orig_rows = st.session_state.df_db[st.session_state.df_db['ID'] == target_id]
-                        if not orig_rows.empty:
-                            orig_record = orig_rows.iloc[0].to_dict()
-                        st.session_state.df_db = st.session_state.df_db[st.session_state.df_db['ID'] != target_id]
-                    
-                    new_records = []
-                    _dup_skipped = []
-                    _dbx = st.session_state.df_db
-                    _dbx_m = _dbx['Match'].astype(str).map(v11_clean_name) if not _dbx.empty else pd.Series(dtype=str)
-                    _dbx_md = v10_md_series(_dbx) if not _dbx.empty else pd.Series(dtype=str)
-                    for i, sel in enumerate(all_keys):
-                        cand = option_map[sel]
-                        s_stk = sys_stakes.get(sel, 0.0)
-                        u_stk = usr_stakes.get(sel, 0.0)
-                        # V11：防止重複注單 (同一比賽、日期、盤口、方向、盤口線、賠率)
-                        if not _dbx.empty:
-                            _same = _dbx[(_dbx_m == f"{home_team} vs {away_team}") & (_dbx_md == match_date) &
-                                         (_dbx['Bet_Type'].astype(str).str.replace(' (即場)', '', regex=False) == str(cand['bet_type'])) &
-                                         (_dbx['Selection'].astype(str) == str(cand['selection'])) &
-                                         ((pd.to_numeric(_dbx['Initial_Line'], errors='coerce') - float(cand['line'])).abs() < 1e-6) &
-                                         ((pd.to_numeric(_dbx['Initial_Odds'], errors='coerce') - float(cand['odds'])).abs() < 1e-6)]
-                            if not _same.empty:
-                                _dup_skipped.append(f"{sel} (已存在注單 {', '.join(_same['ID'].astype(str))})")
-                                continue
-                        
-                        # 修改模式下：對應原本項目的注單沿用原 ID；
-                        # 若用家改變了投注方向/盤口 (無法對應原本項目) 而只選了一項，
-                        # 該項目仍視為對原注單的覆寫 (沿用原 ID 及原有其他欄位)
-                        _is_orig = False
-                        if target_id:
-                            eb = st.session_state.get('edit_bet_type')
-                            el = st.session_state.get('edit_line')
-                            es = st.session_state.get('edit_selection')
-                            if eb and el is not None and es and cand['bet_type'] == eb and abs(float(cand['line']) - float(el)) < 1e-4 and cand['selection'] == es:
-                                _is_orig = True
-                            elif len(all_keys) == 1:
-                                _is_orig = True
-                        
-                        if _is_orig and target_id:
-                            new_id = target_id
-                        else:
-                            new_id = f"B{get_hkt_now().strftime('%Y%m%d%H%M%S')}{i}"
-                        
-                        if _is_orig and orig_record is not None:
-                            # 修改模式：以原注單完整資料為基礎，只覆寫表單有關欄位，
-                            # 保留原有 ID、記錄日期及所有其他欄位 (含即場數據、結算欄位等)
-                            _orig_bt = str(orig_record.get('Bet_Type', ''))
-                            _keep_live_suffix = ' (即場)' in _orig_bt
-                            _final_bt = cand['bet_type'] + (' (即場)' if _keep_live_suffix and ' (即場)' not in cand['bet_type'] else '')
-                            new_record = dict(orig_record)
-                            new_record.update({
-                                'ID': new_id, 'Status': 'Open',
-                                'Tournament_Name': res['t_name'], 'Tournament_Category': res['t_cat'], 
-                                'Match': f"{home_team} vs {away_team}", 'Match_Date': match_date, 'Home_Team': home_team, 'Away_Team': away_team,
-                                'Home_Rating': 'NA' if no_rank else _final_rating_value(st.session_state.get('edit_h_rating_raw'), home_rank, default_h_rank), 'Away_Rating': 'NA' if no_rank else _final_rating_value(st.session_state.get('edit_a_rating_raw'), away_rank, default_a_rank), 'League_Size': int(league_size), 'Home_Form': home_form, 'Away_Form': away_form,
-                                'Bet_Type': _final_bt, 'Selection': cand['selection'], 'Initial_Line': cand['line'], 'Initial_Odds': cand['odds'], 
-                                'System_Stake': s_stk, 'User_Stake': u_stk,
-                                'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False)
-                            })
-                            new_record.update(_tipsme_context_fields(home_team, away_team))
-                        else:
-                            new_record = {
-                                'ID': new_id, 'Date': get_hkt_now().strftime('%Y-%m-%d %H:%M'), 'Status': 'Open',
-                                'Tournament_Name': res['t_name'], 'Tournament_Category': res['t_cat'], 
-                                'Match': f"{home_team} vs {away_team}", 'Match_Date': match_date, 'Home_Team': home_team, 'Away_Team': away_team,
-                                'Home_Rating': 'NA' if no_rank else int(home_rank), 'Away_Rating': 'NA' if no_rank else int(away_rank), 'League_Size': int(league_size), 'Home_Form': home_form, 'Away_Form': away_form,
-                                'Bet_Type': cand['bet_type'], 'Selection': cand['selection'], 'Initial_Line': cand['line'], 'Initial_Odds': cand['odds'], 
-                                'System_Stake': s_stk, 'User_Stake': u_stk,
-                                'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False),
-                                **_tipsme_context_fields(home_team, away_team)
-                            }
-                        new_records.append(new_record)
-                    if _dup_skipped:
-                        st.warning("⚠ 以下項目與數據庫現有注單完全相同，已略過以免重複計算：" + "；".join(_dup_skipped))
-                    if not new_records:
-                        if target_id and orig_record is not None:
-                            st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame([orig_record])], ignore_index=True)
-                        # V14.12：自動模式 — 全部為重複注單，跳到下一場
+                try:
+                    all_keys = set(sys_selected + usr_selected)
+                    if not all_keys:
+                        st.warning("⚠️ 請至少在系統或用家選擇一項投注！")
+                        # V14.12：自動模式 — 沒有可記錄注項，跳到下一場 (毋須結算)
                         if _v15_on('BET'):
                             _a15 = st.session_state['v15_auto']
-                            _v15_log(_a15, "⏭️ 本場全部為重複注單 (已存在)，跳到下一場")
+                            _v15_log(_a15, "⏭️ 本場沒有可記錄的注項，跳到下一場")
                             _a15['idx'] += 1
                             _a15['step'] = 'FILL'
                             _a15['tries'] = 0
+                            _v15_save_remote(_a15)   # V15.5：跳過時也同步跨裝置進度
                             st.rerun()
-                        st.stop()
-                    v11_save_league_size(res['t_name'], int(league_size), silent=True)
+                    else:
+                        target_id = st.session_state.get('editing_bet_id')
+                        orig_record = None
+                        if target_id:
+                            orig_rows = st.session_state.df_db[st.session_state.df_db['ID'] == target_id]
+                            if not orig_rows.empty:
+                                orig_record = orig_rows.iloc[0].to_dict()
+                            st.session_state.df_db = st.session_state.df_db[st.session_state.df_db['ID'] != target_id]
+                    
+                        new_records = []
+                        _dup_skipped = []
+                        _dbx = st.session_state.df_db
+                        _dbx_m = _dbx['Match'].astype(str).map(v11_clean_name) if not _dbx.empty else pd.Series(dtype=str)
+                        _dbx_md = v10_md_series(_dbx) if not _dbx.empty else pd.Series(dtype=str)
+                        for i, sel in enumerate(all_keys):
+                            cand = option_map[sel]
+                            s_stk = sys_stakes.get(sel, 0.0)
+                            u_stk = usr_stakes.get(sel, 0.0)
+                            # V11：防止重複注單 (同一比賽、日期、盤口、方向、盤口線、賠率)
+                            if not _dbx.empty:
+                                _same = _dbx[(_dbx_m == f"{home_team} vs {away_team}") & (_dbx_md == match_date) &
+                                             (_dbx['Bet_Type'].astype(str).str.replace(' (即場)', '', regex=False) == str(cand['bet_type'])) &
+                                             (_dbx['Selection'].astype(str) == str(cand['selection'])) &
+                                             ((pd.to_numeric(_dbx['Initial_Line'], errors='coerce') - float(cand['line'])).abs() < 1e-6) &
+                                             ((pd.to_numeric(_dbx['Initial_Odds'], errors='coerce') - float(cand['odds'])).abs() < 1e-6)]
+                                if not _same.empty:
+                                    _dup_skipped.append(f"{sel} (已存在注單 {', '.join(_same['ID'].astype(str))})")
+                                    continue
                         
-                    st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame(new_records)], ignore_index=True)
-                    st.toast("✅ 投注紀錄雲端同步成功！", icon="📝")
-                    st.session_state.last_bet_id = new_records[-1]['ID']
-                    save_db(st.session_state.df_db, db_file, db_table)
+                            # 修改模式下：對應原本項目的注單沿用原 ID；
+                            # 若用家改變了投注方向/盤口 (無法對應原本項目) 而只選了一項，
+                            # 該項目仍視為對原注單的覆寫 (沿用原 ID 及原有其他欄位)
+                            _is_orig = False
+                            if target_id:
+                                eb = st.session_state.get('edit_bet_type')
+                                el = st.session_state.get('edit_line')
+                                es = st.session_state.get('edit_selection')
+                                if eb and el is not None and es and cand['bet_type'] == eb and abs(float(cand['line']) - float(el)) < 1e-4 and cand['selection'] == es:
+                                    _is_orig = True
+                                elif len(all_keys) == 1:
+                                    _is_orig = True
+                        
+                            if _is_orig and target_id:
+                                new_id = target_id
+                            else:
+                                new_id = f"B{get_hkt_now().strftime('%Y%m%d%H%M%S')}{i}"
+                        
+                            if _is_orig and orig_record is not None:
+                                # 修改模式：以原注單完整資料為基礎，只覆寫表單有關欄位，
+                                # 保留原有 ID、記錄日期及所有其他欄位 (含即場數據、結算欄位等)
+                                _orig_bt = str(orig_record.get('Bet_Type', ''))
+                                _keep_live_suffix = ' (即場)' in _orig_bt
+                                _final_bt = cand['bet_type'] + (' (即場)' if _keep_live_suffix and ' (即場)' not in cand['bet_type'] else '')
+                                new_record = dict(orig_record)
+                                new_record.update({
+                                    'ID': new_id, 'Status': 'Open',
+                                    'Tournament_Name': res['t_name'], 'Tournament_Category': res['t_cat'], 
+                                    'Match': f"{home_team} vs {away_team}", 'Match_Date': match_date, 'Home_Team': home_team, 'Away_Team': away_team,
+                                    'Home_Rating': 'NA' if no_rank else _final_rating_value(st.session_state.get('edit_h_rating_raw'), home_rank, default_h_rank), 'Away_Rating': 'NA' if no_rank else _final_rating_value(st.session_state.get('edit_a_rating_raw'), away_rank, default_a_rank), 'League_Size': int(league_size), 'Home_Form': home_form, 'Away_Form': away_form,
+                                    'Bet_Type': _final_bt, 'Selection': cand['selection'], 'Initial_Line': cand['line'], 'Initial_Odds': cand['odds'], 
+                                    'System_Stake': s_stk, 'User_Stake': u_stk,
+                                    'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False)
+                                })
+                                new_record.update(_tipsme_context_fields(home_team, away_team))
+                            else:
+                                new_record = {
+                                    'ID': new_id, 'Date': get_hkt_now().strftime('%Y-%m-%d %H:%M'), 'Status': 'Open',
+                                    'Tournament_Name': res['t_name'], 'Tournament_Category': res['t_cat'], 
+                                    'Match': f"{home_team} vs {away_team}", 'Match_Date': match_date, 'Home_Team': home_team, 'Away_Team': away_team,
+                                    'Home_Rating': 'NA' if no_rank else int(home_rank), 'Away_Rating': 'NA' if no_rank else int(away_rank), 'League_Size': int(league_size), 'Home_Form': home_form, 'Away_Form': away_form,
+                                    'Bet_Type': cand['bet_type'], 'Selection': cand['selection'], 'Initial_Line': cand['line'], 'Initial_Odds': cand['odds'], 
+                                    'System_Stake': s_stk, 'User_Stake': u_stk,
+                                    'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False),
+                                    **_tipsme_context_fields(home_team, away_team)
+                                }
+                            new_records.append(new_record)
+                        if _dup_skipped:
+                            st.warning("⚠ 以下項目與數據庫現有注單完全相同，已略過以免重複計算：" + "；".join(_dup_skipped))
+                        if not new_records:
+                            if target_id and orig_record is not None:
+                                st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame([orig_record])], ignore_index=True)
+                            # V14.12：自動模式 — 全部為重複注單，跳到下一場
+                            if _v15_on('BET'):
+                                _a15 = st.session_state['v15_auto']
+                                _v15_log(_a15, "⏭️ 本場全部為重複注單 (已存在)，跳到下一場")
+                                _a15['idx'] += 1
+                                _a15['step'] = 'FILL'
+                                _a15['tries'] = 0
+                                st.rerun()
+                            st.stop()
+                        v11_save_league_size(res['t_name'], int(league_size), silent=True)
+                        
+                        st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame(new_records)], ignore_index=True)
+                        st.toast("✅ 投注紀錄雲端同步成功！", icon="📝")
+                        st.session_state.last_bet_id = new_records[-1]['ID']
+                        save_db(st.session_state.df_db, db_file, db_table)
                     
-                    # V14.12：自動模式 — 投注已寫入，自動切換至賽果結算
-                    if _v15_on('BET'):
-                        _a15 = st.session_state['v15_auto']
-                        _a15['bets'] = _a15.get('bets', 0) + len(new_records)
-                        _a15['step'] = 'SETTLE_READ'
-                        _a15['tries'] = 0
-                        _v15_log(_a15, f"📝 已寫入 {len(new_records)} 張注單 (含 $0 模擬注)，切換至賽果結算")
+                        # V14.12：自動模式 — 投注已寫入，自動切換至賽果結算
+                        if _v15_on('BET'):
+                            _a15 = st.session_state['v15_auto']
+                            _a15['bets'] = _a15.get('bets', 0) + len(new_records)
+                            _a15['step'] = 'SETTLE_READ'
+                            _a15['tries'] = 0
+                            _v15_log(_a15, f"📝 已寫入 {len(new_records)} 張注單 (含 $0 模擬注)，切換至賽果結算")
                     
-                    clear_edit_mode()
-                    st.session_state.odds_history = [{"id": 0, "type": "讓球", "record_time": "", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}] 
-                    st.session_state.show_analysis = False
-                    st.rerun()
+                        clear_edit_mode()
+                        st.session_state.odds_history = [{"id": 0, "type": "讓球", "record_time": "", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}] 
+                        st.session_state.show_analysis = False
+                        st.rerun()
 
+                except Exception as _v15e:
+                    if _v15_is_control_exc(_v15e) or not (st.session_state.get('v15_auto') or {}).get('active'):
+                        raise
+                    _v15_step_crash('BET', _v15e)
     with t_inplay:
         st.subheader("⏱ 即場賽事實時更新與智慧火力分析")
         
@@ -9674,135 +9847,140 @@ def main():
                                                 placeholder="https://tipsme.hk/zh-HK/tournament/schedule/seasonId/...")
                     # V14.12：_v15_on('SETTLE_READ') 令自動模式走完全相同的手動讀取路徑
                     if st.button("🤖 自動讀取此場賽果", key="auto_settle_btn", use_container_width=True) or _v15_on('SETTLE_READ'):
-                        _sinfo = None
-                        _src = ''
-                        # --- 來源 1：注單內記錄的 Tipsme 比賽 ID ---
-                        _mid_auto = None
-                        if 'Tipsme_Match_ID' in target_bets.columns:
-                            _mids = target_bets['Tipsme_Match_ID'].dropna()
-                            _mids = _mids[~_mids.astype(str).str.strip().isin(('', 'nan', 'None', '<NA>'))]
-                            _mids = _mids.map(lambda v: str(int(float(v))) if re.fullmatch(r'\d+(\.0+)?', str(v).strip()) else str(v).strip())
-                            if len(_mids):
-                                _mid_auto = str(_mids.mode().iloc[0])
-                        if _mid_auto:
-                            with st.spinner(f"讀取比賽 ID {_mid_auto} 的賽果..."):
-                                _try = tipsme_fetch_match_info(_mid_auto)
-                            if _try and _try.get('finished'):
-                                _sinfo, _src = _try, '注單記錄的比賽 ID'
-                        # --- 來源 2/3：賽程數據 (本工作階段已載入，或即時貼連結讀取) ---
-                        if _sinfo is None:
-                            _sched = st.session_state.get('tipsme_schedule')
-                            if not _sched and _sched_link2:
-                                with st.spinner("讀取賽程頁 (整季所有輪次)..."):
-                                    _sched, _smsg = tipsme_fetch_season_schedule(_sched_link2)
+                        try:
+                            _sinfo = None
+                            _src = ''
+                            # --- 來源 1：注單內記錄的 Tipsme 比賽 ID ---
+                            _mid_auto = None
+                            if 'Tipsme_Match_ID' in target_bets.columns:
+                                _mids = target_bets['Tipsme_Match_ID'].dropna()
+                                _mids = _mids[~_mids.astype(str).str.strip().isin(('', 'nan', 'None', '<NA>'))]
+                                _mids = _mids.map(lambda v: str(int(float(v))) if re.fullmatch(r'\d+(\.0+)?', str(v).strip()) else str(v).strip())
+                                if len(_mids):
+                                    _mid_auto = str(_mids.mode().iloc[0])
+                            if _mid_auto:
+                                with st.spinner(f"讀取比賽 ID {_mid_auto} 的賽果..."):
+                                    _try = tipsme_fetch_match_info(_mid_auto)
+                                if _try and _try.get('finished'):
+                                    _sinfo, _src = _try, '注單記錄的比賽 ID'
+                            # --- 來源 2/3：賽程數據 (本工作階段已載入，或即時貼連結讀取) ---
+                            if _sinfo is None:
+                                _sched = st.session_state.get('tipsme_schedule')
+                                if not _sched and _sched_link2:
+                                    with st.spinner("讀取賽程頁 (整季所有輪次)..."):
+                                        _sched, _smsg = tipsme_fetch_season_schedule(_sched_link2)
+                                    if _sched:
+                                        st.session_state['tipsme_schedule'] = _sched
                                 if _sched:
-                                    st.session_state['tipsme_schedule'] = _sched
-                            if _sched:
-                                _nm = lambda s: re.sub(r'[\s\-_·•]', '', str(s or ''))
-                                _th, _ta = (str(sel_match).split(' vs ', 1) + [''])[:2] if ' vs ' in str(sel_match) else ('', '')
-                                _best, _best_dd = None, 99
-                                for _x in _sched:
-                                    if not _x.get('finished'):
-                                        continue
-                                    if _nm(_x['home']) != _nm(_th) or _nm(_x['away']) != _nm(_ta):
-                                        continue
+                                    _nm = lambda s: re.sub(r'[\s\-_·•]', '', str(s or ''))
+                                    _th, _ta = (str(sel_match).split(' vs ', 1) + [''])[:2] if ' vs ' in str(sel_match) else ('', '')
+                                    _best, _best_dd = None, 99
+                                    for _x in _sched:
+                                        if not _x.get('finished'):
+                                            continue
+                                        if _nm(_x['home']) != _nm(_th) or _nm(_x['away']) != _nm(_ta):
+                                            continue
+                                        try:
+                                            _xd = datetime.fromtimestamp(_x['match_time'], HKT).strftime('%Y-%m-%d')
+                                        except Exception:
+                                            continue
+                                        _dd = abs((pd.to_datetime(_xd) - pd.to_datetime(str(sel_md)[:10])).days) if str(sel_md)[:10] else 0
+                                        if _dd <= 1 and _dd < _best_dd:
+                                            _best, _best_dd = _x, _dd
+                                    if _best is not None:
+                                        _sc2 = lambda a, b: (f"{a}-{b}" if (a is not None and b is not None) else '')
+                                        _sinfo = {
+                                            'match_id': str(_best.get('hkjc_match_id') or ''),
+                                            'home': _best['home'], 'away': _best['away'], 'league': '',
+                                            'kickoff': (datetime.fromtimestamp(_best['match_time'], HKT) if _best.get('match_time') else None),
+                                            'finished': True,
+                                            'score': _sc2(_best['home_goal'], _best['away_goal']),
+                                            'half_score': _sc2(_best['home_half'], _best['away_half']),
+                                            'corner': _sc2(_best['home_corner'], _best['away_corner']),
+                                            'home_red': int(_best['home_red'] or 0), 'away_red': int(_best['away_red'] or 0),
+                                            'home_yellow': int(_best['home_yellow'] or 0), 'away_yellow': int(_best['away_yellow'] or 0),
+                                        }
+                                        _src = '賽程數據'
+                            # --- 套用賽果 (與貼鏈結模式同一機制) ---
+                            if _sinfo and _sinfo.get('finished'):
+                                st.session_state['tipsme_settle_data'] = _sinfo
+                                # 同時更新收盤價 (有比賽 ID 時；只增不刪、冪等，失敗不影響賽果讀取)
+                                _mid_use = str(_sinfo.get('match_id') or _mid_auto or '').strip()
+                                if _mid_use:
                                     try:
-                                        _xd = datetime.fromtimestamp(_x['match_time'], HKT).strftime('%Y-%m-%d')
+                                        _api_odds_s = tipsme_fetch_hkjc_odds(_mid_use)
+                                        _core_s, _ = tipsme_build_odds_history(_api_odds_s) if _api_odds_s else ([], [])
+                                        if _core_s:
+                                            _upd_s, _add_s = clv_apply_closing_odds(
+                                                st.session_state.df_db, _core_s,
+                                                _sinfo.get('home'), _sinfo.get('away'), _sinfo.get('kickoff'))
+                                            if _add_s > 0:
+                                                save_db(st.session_state.df_db, db_file, db_table)
+                                                st.toast(f"🎯 已同時更新收盤價：{len(_upd_s)} 張注單共新增 {_add_s} 個快照", icon="🎯")
                                     except Exception:
-                                        continue
-                                    _dd = abs((pd.to_datetime(_xd) - pd.to_datetime(str(sel_md)[:10])).days) if str(sel_md)[:10] else 0
-                                    if _dd <= 1 and _dd < _best_dd:
-                                        _best, _best_dd = _x, _dd
-                                if _best is not None:
-                                    _sc2 = lambda a, b: (f"{a}-{b}" if (a is not None and b is not None) else '')
-                                    _sinfo = {
-                                        'match_id': str(_best.get('hkjc_match_id') or ''),
-                                        'home': _best['home'], 'away': _best['away'], 'league': '',
-                                        'kickoff': (datetime.fromtimestamp(_best['match_time'], HKT) if _best.get('match_time') else None),
-                                        'finished': True,
-                                        'score': _sc2(_best['home_goal'], _best['away_goal']),
-                                        'half_score': _sc2(_best['home_half'], _best['away_half']),
-                                        'corner': _sc2(_best['home_corner'], _best['away_corner']),
-                                        'home_red': int(_best['home_red'] or 0), 'away_red': int(_best['away_red'] or 0),
-                                        'home_yellow': int(_best['home_yellow'] or 0), 'away_yellow': int(_best['away_yellow'] or 0),
-                                    }
-                                    _src = '賽程數據'
-                        # --- 套用賽果 (與貼鏈結模式同一機制) ---
-                        if _sinfo and _sinfo.get('finished'):
-                            st.session_state['tipsme_settle_data'] = _sinfo
-                            # 同時更新收盤價 (有比賽 ID 時；只增不刪、冪等，失敗不影響賽果讀取)
-                            _mid_use = str(_sinfo.get('match_id') or _mid_auto or '').strip()
-                            if _mid_use:
-                                try:
-                                    _api_odds_s = tipsme_fetch_hkjc_odds(_mid_use)
-                                    _core_s, _ = tipsme_build_odds_history(_api_odds_s) if _api_odds_s else ([], [])
-                                    if _core_s:
-                                        _upd_s, _add_s = clv_apply_closing_odds(
-                                            st.session_state.df_db, _core_s,
-                                            _sinfo.get('home'), _sinfo.get('away'), _sinfo.get('kickoff'))
-                                        if _add_s > 0:
-                                            save_db(st.session_state.df_db, db_file, db_table)
-                                            st.toast(f"🎯 已同時更新收盤價：{len(_upd_s)} 張注單共新增 {_add_s} 個快照", icon="🎯")
-                                except Exception:
-                                    pass
-                            st.session_state['tipsme_settle_apply'] = True
-                            # V14.12：自動模式 — 先與賽程頁賽果交叉核對，無誤才自動結算
-                            if _v15_on('SETTLE_READ'):
-                                _a15 = st.session_state['v15_auto']
-                                _q15 = _a15.get('queue') or []
-                                _m15 = _q15[_a15['idx']] if _a15.get('idx', 0) < len(_q15) else None
-                                _mis15 = []
-                                if _m15 is not None:
-                                    _ph15, _pa15 = _tipsme_score_pair(_sinfo.get('score'))
-                                    if _ph15 is None or int(_ph15) != int(_m15.get('home_goal') or 0) or int(_pa15) != int(_m15.get('away_goal') or 0):
-                                        _mis15.append(f"全場比數 賽程 {_m15.get('home_goal')}-{_m15.get('away_goal')} vs 比賽頁 {_sinfo.get('score')}")
-                                    _pc15, _pd15 = _tipsme_score_pair(_sinfo.get('corner'))
-                                    if _pc15 is None or int(_pc15) != int(_m15.get('home_corner') or 0) or int(_pd15) != int(_m15.get('away_corner') or 0):
-                                        _mis15.append(f"角球 賽程 {_m15.get('home_corner')}-{_m15.get('away_corner')} vs 比賽頁 {_sinfo.get('corner')}")
-                                    if int(_sinfo.get('home_red') or 0) != int(_m15.get('home_red') or 0) or int(_sinfo.get('away_red') or 0) != int(_m15.get('away_red') or 0):
-                                        _mis15.append(f"紅牌 賽程 {_m15.get('home_red')}-{_m15.get('away_red')} vs 比賽頁 {_sinfo.get('home_red')}-{_sinfo.get('away_red')}")
-                                if _mis15:
-                                    # V15.3：核對不符 → 列入待手動處理 + 繼續下一場。
-                                    # 注單保持 Open，絕不會用未核實的賽果結算 (原 V14.12 行為是整體暫停)。
-                                    _v15_log(_a15, f"⚠️ 賽果核對不符：{sel_match} — " + "；".join(_mis15), 'err')
-                                    _v15_log(_a15, "此場注單保持待結算，請之後人手核對賽果再結算；繼續下一場。", 'err')
+                                        pass
+                                st.session_state['tipsme_settle_apply'] = True
+                                # V14.12：自動模式 — 先與賽程頁賽果交叉核對，無誤才自動結算
+                                if _v15_on('SETTLE_READ'):
+                                    _a15 = st.session_state['v15_auto']
+                                    _q15 = _a15.get('queue') or []
+                                    _m15 = _q15[_a15['idx']] if _a15.get('idx', 0) < len(_q15) else None
+                                    _mis15 = []
+                                    if _m15 is not None:
+                                        _ph15, _pa15 = _tipsme_score_pair(_sinfo.get('score'))
+                                        if _ph15 is None or int(_ph15) != int(_m15.get('home_goal') or 0) or int(_pa15) != int(_m15.get('away_goal') or 0):
+                                            _mis15.append(f"全場比數 賽程 {_m15.get('home_goal')}-{_m15.get('away_goal')} vs 比賽頁 {_sinfo.get('score')}")
+                                        _pc15, _pd15 = _tipsme_score_pair(_sinfo.get('corner'))
+                                        if _pc15 is None or int(_pc15) != int(_m15.get('home_corner') or 0) or int(_pd15) != int(_m15.get('away_corner') or 0):
+                                            _mis15.append(f"角球 賽程 {_m15.get('home_corner')}-{_m15.get('away_corner')} vs 比賽頁 {_sinfo.get('corner')}")
+                                        if int(_sinfo.get('home_red') or 0) != int(_m15.get('home_red') or 0) or int(_sinfo.get('away_red') or 0) != int(_m15.get('away_red') or 0):
+                                            _mis15.append(f"紅牌 賽程 {_m15.get('home_red')}-{_m15.get('away_red')} vs 比賽頁 {_sinfo.get('home_red')}-{_sinfo.get('away_red')}")
+                                    if _mis15:
+                                        # V15.3：核對不符 → 列入待手動處理 + 繼續下一場。
+                                        # 注單保持 Open，絕不會用未核實的賽果結算 (原 V14.12 行為是整體暫停)。
+                                        _v15_log(_a15, f"⚠️ 賽果核對不符：{sel_match} — " + "；".join(_mis15), 'err')
+                                        _v15_log(_a15, "此場注單保持待結算，請之後人手核對賽果再結算；繼續下一場。", 'err')
+                                        _m15f = (_a15.get('queue') or [{}])[min(_a15.get('idx', 0),
+                                                max(len(_a15.get('queue') or []) - 1, 0))]
+                                        _a15.setdefault('failed', []).append(
+                                            {'round': _m15f.get('round'), 'home': _m15f.get('home'),
+                                             'away': _m15f.get('away'), 'date': '', 'stage': '賽果核對',
+                                             'msg': '；'.join(_mis15)})
+                                        _a15['idx'] += 1
+                                        _a15['step'] = 'FILL'
+                                        _a15['tries'] = 0
+                                        _v15_save_remote(_a15)
+                                        st.rerun()
+                                    _a15['step'] = 'SETTLE_CONFIRM'
+                                    _a15['tries'] = 0
+                                    _v15_log(_a15, f"🤖 已讀取並核對賽果 (來源: {_src})，自動結算")
+                                st.toast(f"✅ 已自動讀取賽果 (來源: {_src})，請核對下方數值。", icon="🤖")
+                                st.rerun()
+                            else:
+                                # V15.3：讀取失敗 → 列入待手動處理 + 繼續下一場 (注單保持 Open，
+                                # 不會用錯誤賽果結算；原 V14.12 行為是整體暫停)
+                                if _v15_on('SETTLE_READ'):
+                                    _a15 = st.session_state['v15_auto']
+                                    _v15_log(_a15, f"⚠️ 未能自動讀取 {sel_match} 的賽果 (網絡或數據問題)，"
+                                                   f"此場注單保持待結算，繼續下一場。", 'err')
                                     _m15f = (_a15.get('queue') or [{}])[min(_a15.get('idx', 0),
                                             max(len(_a15.get('queue') or []) - 1, 0))]
                                     _a15.setdefault('failed', []).append(
                                         {'round': _m15f.get('round'), 'home': _m15f.get('home'),
-                                         'away': _m15f.get('away'), 'date': '', 'stage': '賽果核對',
-                                         'msg': '；'.join(_mis15)})
+                                         'away': _m15f.get('away'), 'date': '', 'stage': '結算讀取',
+                                         'msg': '未能自動讀取賽果'})
                                     _a15['idx'] += 1
                                     _a15['step'] = 'FILL'
                                     _a15['tries'] = 0
                                     _v15_save_remote(_a15)
                                     st.rerun()
-                                _a15['step'] = 'SETTLE_CONFIRM'
-                                _a15['tries'] = 0
-                                _v15_log(_a15, f"🤖 已讀取並核對賽果 (來源: {_src})，自動結算")
-                            st.toast(f"✅ 已自動讀取賽果 (來源: {_src})，請核對下方數值。", icon="🤖")
-                            st.rerun()
-                        else:
-                            # V15.3：讀取失敗 → 列入待手動處理 + 繼續下一場 (注單保持 Open，
-                            # 不會用錯誤賽果結算；原 V14.12 行為是整體暫停)
-                            if _v15_on('SETTLE_READ'):
-                                _a15 = st.session_state['v15_auto']
-                                _v15_log(_a15, f"⚠️ 未能自動讀取 {sel_match} 的賽果 (網絡或數據問題)，"
-                                               f"此場注單保持待結算，繼續下一場。", 'err')
-                                _m15f = (_a15.get('queue') or [{}])[min(_a15.get('idx', 0),
-                                        max(len(_a15.get('queue') or []) - 1, 0))]
-                                _a15.setdefault('failed', []).append(
-                                    {'round': _m15f.get('round'), 'home': _m15f.get('home'),
-                                     'away': _m15f.get('away'), 'date': '', 'stage': '結算讀取',
-                                     'msg': '未能自動讀取賽果'})
-                                _a15['idx'] += 1
-                                _a15['step'] = 'FILL'
-                                _a15['tries'] = 0
-                                _v15_save_remote(_a15)
-                                st.rerun()
-                            st.warning("未能自動讀取：此場注單沒有記錄比賽 ID，賽程數據中亦找不到已完場的此場比賽。"
-                                       "請在上方貼上該聯賽的賽程連結再按一次；或用下方「貼上比賽鏈結」/手動輸入。")
+                                st.warning("未能自動讀取：此場注單沒有記錄比賽 ID，賽程數據中亦找不到已完場的此場比賽。"
+                                           "請在上方貼上該聯賽的賽程連結再按一次；或用下方「貼上比賽鏈結」/手動輸入。")
 
+                        except Exception as _v15e:
+                            if _v15_is_control_exc(_v15e) or not (st.session_state.get('v15_auto') or {}).get('active'):
+                                raise
+                            _v15_step_crash('SETTLE_READ', _v15e)
                 # V12：貼上 Tipsme 鏈結自動讀取賽果 (全場比數 / 半場比分 / 角球 / 紅黃牌)
                 # V13.2：同一時間自動讀取最新盤口賠率並合併到該場注單 (收盤價)，CLV 即時可計算
                 with st.expander("🔗 貼上 Tipsme 鏈結自動讀取賽果 (比數 / 半場 / 角球 / 紅黃牌 / 收盤價)", expanded=False):
@@ -9937,79 +10115,84 @@ def main():
                 
                 # V14.12：_v15_on('SETTLE_CONFIRM') 令自動模式走完全相同的手動結算路徑
                 if st.button("⚖️ 確定結算此賽事所有注單", type="primary", use_container_width=True) or _v15_on('SETTLE_CONFIRM'):
-                    # V13.1 防呆：若已自動讀取賽果但輸入欄全部為 0 (讀取失敗或未核對)，
-                    # 阻止結算，避免全 0 賽果污染數據庫
-                    if _ts_use and settle_hg == 0 and settle_ag == 0 and settle_hc == 0 and settle_ac == 0:
-                        _fh, _fa = _tipsme_score_pair(_ts_use.get('score'))
-                        if _fh is not None and (int(_fh) + int(_fa)) > 0:
-                            # V15.3：防呆觸發 → 列入待手動處理 + 繼續下一場 (不會全 0 結算)
-                            if _v15_on('SETTLE_CONFIRM'):
-                                _a15 = st.session_state['v15_auto']
-                                _v15_log(_a15, "⚠️ 賽果輸入欄全為 0 與讀取賽果不符，"
-                                               "此場保留待手動結算，繼續下一場。", 'err')
-                                _m15z = (_a15.get('queue') or [{}])[min(_a15.get('idx', 0),
-                                        max(len(_a15.get('queue') or []) - 1, 0))]
-                                _a15.setdefault('failed', []).append(
-                                    {'round': _m15z.get('round'), 'home': _m15z.get('home'),
-                                     'away': _m15z.get('away'), 'date': '', 'stage': '結算防呆',
-                                     'msg': '輸入欄全 0 與讀取賽果不符'})
-                                _a15['idx'] += 1
-                                _a15['step'] = 'FILL'
-                                _a15['tries'] = 0
-                                _v15_save_remote(_a15)
-                                st.rerun()
-                            st.error(f"⚠️ 輸入的全場入球及角球全部為 0，但已讀取的 Tipsme 賽果為 {_ts_use.get('score')} "
-                                     f"(角球 {_ts_use.get('corner')})。請核對上方輸入欄數值後再結算。")
-                            st.stop()
-                    mask = v10_match_mask(st.session_state.df_db, sel_tourn, sel_match, sel_md) & (st.session_state.df_db['Status'] == 'Open')
-                    idx_to_settle = st.session_state.df_db[mask].index
+                    try:
+                        # V13.1 防呆：若已自動讀取賽果但輸入欄全部為 0 (讀取失敗或未核對)，
+                        # 阻止結算，避免全 0 賽果污染數據庫
+                        if _ts_use and settle_hg == 0 and settle_ag == 0 and settle_hc == 0 and settle_ac == 0:
+                            _fh, _fa = _tipsme_score_pair(_ts_use.get('score'))
+                            if _fh is not None and (int(_fh) + int(_fa)) > 0:
+                                # V15.3：防呆觸發 → 列入待手動處理 + 繼續下一場 (不會全 0 結算)
+                                if _v15_on('SETTLE_CONFIRM'):
+                                    _a15 = st.session_state['v15_auto']
+                                    _v15_log(_a15, "⚠️ 賽果輸入欄全為 0 與讀取賽果不符，"
+                                                   "此場保留待手動結算，繼續下一場。", 'err')
+                                    _m15z = (_a15.get('queue') or [{}])[min(_a15.get('idx', 0),
+                                            max(len(_a15.get('queue') or []) - 1, 0))]
+                                    _a15.setdefault('failed', []).append(
+                                        {'round': _m15z.get('round'), 'home': _m15z.get('home'),
+                                         'away': _m15z.get('away'), 'date': '', 'stage': '結算防呆',
+                                         'msg': '輸入欄全 0 與讀取賽果不符'})
+                                    _a15['idx'] += 1
+                                    _a15['step'] = 'FILL'
+                                    _a15['tries'] = 0
+                                    _v15_save_remote(_a15)
+                                    st.rerun()
+                                st.error(f"⚠️ 輸入的全場入球及角球全部為 0，但已讀取的 Tipsme 賽果為 {_ts_use.get('score')} "
+                                         f"(角球 {_ts_use.get('corner')})。請核對上方輸入欄數值後再結算。")
+                                st.stop()
+                        mask = v10_match_mask(st.session_state.df_db, sel_tourn, sel_match, sel_md) & (st.session_state.df_db['Status'] == 'Open')
+                        idx_to_settle = st.session_state.df_db[mask].index
                     
-                    for idx in idx_to_settle:
-                        row = st.session_state.df_db.loc[idx]
-                        sys_profit, usr_profit, sys_payout, usr_payout, unit_profit, res_label, diff_val = calculate_settlement(
-                            row['Bet_Type'], row['Selection'], row['Initial_Line'], row['Initial_Odds'], 
-                            row['System_Stake'], row['User_Stake'], 
-                            settle_hg, settle_ag, settle_hc, settle_ac
-                        )
-                        st.session_state.df_db.at[idx, 'Status'] = 'Settled'
-                        st.session_state.df_db.at[idx, 'Home_Goal'] = settle_hg
-                        st.session_state.df_db.at[idx, 'Away_Goal'] = settle_ag
-                        st.session_state.df_db.at[idx, 'Home_Corner'] = settle_hc
-                        st.session_state.df_db.at[idx, 'Away_Corner'] = settle_ac
-                        # V12：紅黃牌及半場比分一併寫入注單紀錄
-                        st.session_state.df_db.at[idx, 'Home_Red'] = settle_hred
-                        st.session_state.df_db.at[idx, 'Away_Red'] = settle_ared
-                        st.session_state.df_db.at[idx, 'Home_Yellow'] = settle_hyel
-                        st.session_state.df_db.at[idx, 'Away_Yellow'] = settle_ayel
-                        if str(settle_half).strip():
-                            st.session_state.df_db.at[idx, 'Half_Score'] = str(settle_half).strip()
-                        st.session_state.df_db.at[idx, 'System_Profit'] = sys_profit
-                        st.session_state.df_db.at[idx, 'User_Profit'] = usr_profit
-                        st.session_state.df_db.at[idx, 'System_Payout'] = sys_payout
-                        st.session_state.df_db.at[idx, 'User_Payout'] = usr_payout
-                        st.session_state.df_db.at[idx, 'Unit_Profit'] = unit_profit
-                        st.session_state.df_db.at[idx, 'Result_Label'] = res_label
+                        for idx in idx_to_settle:
+                            row = st.session_state.df_db.loc[idx]
+                            sys_profit, usr_profit, sys_payout, usr_payout, unit_profit, res_label, diff_val = calculate_settlement(
+                                row['Bet_Type'], row['Selection'], row['Initial_Line'], row['Initial_Odds'], 
+                                row['System_Stake'], row['User_Stake'], 
+                                settle_hg, settle_ag, settle_hc, settle_ac
+                            )
+                            st.session_state.df_db.at[idx, 'Status'] = 'Settled'
+                            st.session_state.df_db.at[idx, 'Home_Goal'] = settle_hg
+                            st.session_state.df_db.at[idx, 'Away_Goal'] = settle_ag
+                            st.session_state.df_db.at[idx, 'Home_Corner'] = settle_hc
+                            st.session_state.df_db.at[idx, 'Away_Corner'] = settle_ac
+                            # V12：紅黃牌及半場比分一併寫入注單紀錄
+                            st.session_state.df_db.at[idx, 'Home_Red'] = settle_hred
+                            st.session_state.df_db.at[idx, 'Away_Red'] = settle_ared
+                            st.session_state.df_db.at[idx, 'Home_Yellow'] = settle_hyel
+                            st.session_state.df_db.at[idx, 'Away_Yellow'] = settle_ayel
+                            if str(settle_half).strip():
+                                st.session_state.df_db.at[idx, 'Half_Score'] = str(settle_half).strip()
+                            st.session_state.df_db.at[idx, 'System_Profit'] = sys_profit
+                            st.session_state.df_db.at[idx, 'User_Profit'] = usr_profit
+                            st.session_state.df_db.at[idx, 'System_Payout'] = sys_payout
+                            st.session_state.df_db.at[idx, 'User_Payout'] = usr_payout
+                            st.session_state.df_db.at[idx, 'Unit_Profit'] = unit_profit
+                            st.session_state.df_db.at[idx, 'Result_Label'] = res_label
                         
-                    save_db(st.session_state.df_db, db_file, db_table)
-                    st.toast(f"✅ {sel_match} 結算完成！", icon="⚖️")
-                    # V14.1：結算後預先學習 — 只在數據簽名改變 (每 5 場新賽果) 時才真正重訓，
-                    # 把學習時間移到不急的結算步驟；下一場賽前分析直接命中快取 (即時完成)。
-                    with st.spinner("🧠 模型更新中 (每 5 場新賽果重訓一次；下次賽前分析會即時完成)..."):
-                        v14_warm_engines(st.session_state.df_db)
-                    # V14.12：自動模式 — 結算完成，推進到下一場；全部完成則自動停止
-                    if _v15_on('SETTLE_CONFIRM'):
-                        _a15 = st.session_state['v15_auto']
-                        _a15['done'] = _a15.get('done', 0) + 1
-                        _a15['idx'] = _a15.get('idx', 0) + 1
-                        _a15['tries'] = 0
-                        if _a15['idx'] >= len(_a15.get('queue') or []):
-                            _v15_finish_summary(_a15)
-                        else:
-                            _a15['step'] = 'FILL'
-                            _v15_log(_a15, f"✅ 已結算 ({_a15['idx']}/{len(_a15['queue'])})：{sel_match}，繼續下一場")
-                            _v15_save_remote(_a15)
-                    st.rerun()
+                        save_db(st.session_state.df_db, db_file, db_table)
+                        st.toast(f"✅ {sel_match} 結算完成！", icon="⚖️")
+                        # V14.1：結算後預先學習 — 只在數據簽名改變 (每 5 場新賽果) 時才真正重訓，
+                        # 把學習時間移到不急的結算步驟；下一場賽前分析直接命中快取 (即時完成)。
+                        with st.spinner("🧠 模型更新中 (每 5 場新賽果重訓一次；下次賽前分析會即時完成)..."):
+                            v14_warm_engines(st.session_state.df_db)
+                        # V14.12：自動模式 — 結算完成，推進到下一場；全部完成則自動停止
+                        if _v15_on('SETTLE_CONFIRM'):
+                            _a15 = st.session_state['v15_auto']
+                            _a15['done'] = _a15.get('done', 0) + 1
+                            _a15['idx'] = _a15.get('idx', 0) + 1
+                            _a15['tries'] = 0
+                            if _a15['idx'] >= len(_a15.get('queue') or []):
+                                _v15_finish_summary(_a15)
+                            else:
+                                _a15['step'] = 'FILL'
+                                _v15_log(_a15, f"✅ 已結算 ({_a15['idx']}/{len(_a15['queue'])})：{sel_match}，繼續下一場")
+                                _v15_save_remote(_a15)
+                        st.rerun()
 
+                    except Exception as _v15e:
+                        if _v15_is_control_exc(_v15e) or not (st.session_state.get('v15_auto') or {}).get('active'):
+                            raise
+                        _v15_step_crash('SETTLE_CONFIRM', _v15e)
     # 先渲染「時間維度盈虧記錄分析」分頁，再執行「全局模型」的 ML 訓練：
     # 確保分頁資料與圖表優先送出，ML 首次訓練不會阻塞其他分頁顯示 (解決空白分頁問題)。
     # (分頁的視覺順序不變，只是渲染順序調整)
