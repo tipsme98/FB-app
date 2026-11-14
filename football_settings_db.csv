@@ -10,7 +10,7 @@ v10_mode,🛡 自動 (只用已驗證策略)
 v11_new_league_paper,True
 v11_league_breaker,False
 v11_migrated,True
-v11_auto_sys,False
+v11_auto_sys,True
 v11_trial,False
 v11_act_min_n,10
 v11_act_roi,0.0
