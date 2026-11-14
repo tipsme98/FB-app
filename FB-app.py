@@ -10,6 +10,30 @@ import itertools
 from datetime import datetime, timedelta, timezone
 
 # ==============================================================================
+# V15.4 Tipsme 後備數據源 (azure API 故障期間照常運作)
+#
+#   背景 (2026-11-13/14)：Tipsme 數據 API (tipsme-web-2...azurewebsites.net)
+#   持續回傳 403「Web App - Unavailable」及 502，屬網站後端故障，非用家網絡或
+#   被封鎖 (主網站及比賽頁一切正常，數據仍在頁面內嵌 JSON 中)。此故障令填充與
+#   結算讀取全部失敗。經實測：比賽頁 /chat 內嵌 __NEXT_DATA__ 的 liveScore 與
+#   azure API 回傳完全同源同欄位 (home/away/league/排名/比分/半場/角球/紅黃牌/
+#   matchStatus)，h2h 及賠率頁的內嵌數據亦完整。V15.4 因此加入後備讀取：
+#
+#   1. tipsme_fetch_match_info：azure API 失敗時，改讀比賽頁 /chat 內嵌 liveScore
+#      (欄位一一對應，含結算所需的全部賽果數據) — 填充及結算讀取不再被 API
+#      故障阻斷。
+#   2. tipsme_fetch_h2h / tipsme_fetch_bookmaker_odds：改用瀏覽器模擬抓取
+#      (curl_cffi 模擬 Chrome → 系統 curl → requests)，對 Cloudflare 防護
+#      更有韌性。
+#   3. 頁面抓取函式 _tipsme_fetch_page_html 泛化：驗證標記可指定 (scheduleDetails
+#      / liveScore / teamDetails / oddsResponse)，賽程、比賽頁、h2h 頁共用。
+#
+#   4. (最重要) 多主機容錯：實測發現故障的只是 web-2 主機，舊版主機
+#      tipsme-web.azurewebsites.net 仍在線、數據格式完全相同 — _tipsme_get 現在
+#      會自動切換到在線主機 (比賽資料 + 賠率時間序列全部恢復)，azure API 故障
+#      對系統的影響降至零；連舊主機也故障時才退回頁面後備 (1-3 項)。
+# ==============================================================================
+# ==============================================================================
 # V15.3 自動輸入失敗續傳 + 跨裝置進度共享
 #
 #   背景 (2026-11-13)：用家啟動挪威聯賽第 18-26 輪自動輸入 (69 場)，前三場
@@ -5668,6 +5692,15 @@ def calc_margin_str(row):
 # 5.7 Tipsme 自動填充 (貼上鏈結自動讀取賽事資料、盤口賠率及賽果)
 # ==========================================
 TIPSME_API_BASE = "https://tipsme-web-2-gzd9cgfbhta3hghn.eastasia-01.azurewebsites.net/api"
+# V15.4：azure API 多主機容錯 — 2026-11-13 起 web-2 主機故障 (403/502)，實測發現
+# 舊版主機 tipsme-web.azurewebsites.net 仍在線且數據格式完全相同 (同一後端的不同
+# 部署)。_tipsme_get 會依序嘗試，記住上次成功的主機，單一主機故障不再令系統停擺。
+TIPSME_API_HOSTS = [
+    TIPSME_API_BASE,                                                          # web-2 (現行，故障中)
+    "https://tipsme-web.azurewebsites.net/api",                               # web (舊版，仍在線)
+    "https://tipsme-app-5-dbece6bxgwbwcsfm.eastasia-01.azurewebsites.net/api",  # app-5
+]
+_TIPSME_WORKING_HOST = {'idx': 0}
 TIPSME_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -5681,14 +5714,28 @@ def tipsme_match_id_from_url(url):
     return m.group(1) if m else None
 
 def _tipsme_get(url, timeout=15):
-    """帶瀏覽器 UA 的 GET (低頻率：每次貼鏈結只請求 1~2 次)"""
+    """帶瀏覽器 UA 的 GET (低頻率：每次貼鏈結只請求 1~2 次)。
+    V15.4：azure API URL 會自動在多個部署主機間容錯 (先試上次成功者)，
+    單一主機故障時改用仍在線的主機；非 azure URL (tipsme.hk 頁面) 沿用原本邏輯。"""
+    _path, _hosts = None, None
+    for _h in TIPSME_API_HOSTS:
+        if url.startswith(_h):
+            _path, _hosts = url[len(_h):], TIPSME_API_HOSTS
+            break
+    if _hosts is None:
+        _hosts, _path = [url], ''
+    _i = _TIPSME_WORKING_HOST['idx'] % len(_hosts)
+    _order = _hosts[_i:] + _hosts[:_i] if len(_hosts) > 1 else _hosts
     for _attempt in range(2):
-        try:
-            r = requests.get(url, headers=TIPSME_HEADERS, timeout=timeout)
-            if r.status_code == 200:
-                return r.text
-        except Exception:
-            pass
+        for _h in _order:
+            try:
+                r = requests.get(_h + _path, headers=TIPSME_HEADERS, timeout=timeout)
+                if r.status_code == 200:
+                    if _h in TIPSME_API_HOSTS:
+                        _TIPSME_WORKING_HOST['idx'] = TIPSME_API_HOSTS.index(_h)
+                    return r.text
+            except Exception:
+                pass
     return None
 
 def _tipsme_iso_time(s):
@@ -5747,14 +5794,39 @@ def _tipsme_cap_value(s):
     val = sum(vals) / len(vals)
     return -val if neg else val
 
-def tipsme_fetch_match_info(match_id):
-    """讀取比賽基本資料與賽果 (Score/match API：球隊、聯賽、排名、比數、半場、角球、紅黃牌)"""
-    txt = _tipsme_get(f"{TIPSME_API_BASE}/Score/match/{match_id}")
-    if not txt:
+def _tipsme_livescore_from_page(match_id, timeout=25):
+    """V15.4 後備數據源：比賽頁 /chat 內嵌 __NEXT_DATA__ 的 liveScore。
+    與 azure Score API 完全同源同欄位 (home/away/leagueName/排名/比數/半場/角球/
+    紅黃牌/matchStatus)。回傳 liveScore dict 或 None。"""
+    html = _tipsme_fetch_page_html(f"https://tipsme.hk/zh-HK/match/{match_id}/chat",
+                                    timeout=timeout, marker='liveScore')
+    if not html:
         return None
     try:
-        d = json.loads(txt)
+        m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.S)
+        if not m:
+            return None
+        d = json.loads(m.group(1))
+        ls = (((d.get('props') or {}).get('pageProps') or {}).get('liveScore')) or {}
+        return ls if (ls.get('home') and ls.get('away')) else None
     except Exception:
+        return None
+
+def tipsme_fetch_match_info(match_id):
+    """讀取比賽基本資料與賽果。優先 azure Score/match API；V15.4 起 API 失敗時
+    自動改用比賽頁內嵌 liveScore (後備數據源)，令 azure API 故障期間填充及
+    結算讀取照常運作。"""
+    txt = _tipsme_get(f"{TIPSME_API_BASE}/Score/match/{match_id}")
+    d = None
+    if txt:
+        try:
+            d = json.loads(txt)
+        except Exception:
+            d = None
+    if not d or not d.get('home') or not d.get('away'):
+        # V15.4：azure API 失敗 → 比賽頁後備
+        d = _tipsme_livescore_from_page(match_id)
+    if not d:
         return None
     if not d.get('home') or not d.get('away'):
         return None
@@ -5771,7 +5843,7 @@ def tipsme_fetch_match_info(match_id):
         'away_rank': _tipsme_int(d.get('awayRanking')),
         'is_cup': bool(d.get('isCup')),
         'is_neutral': bool(d.get('isNeutral')),
-        'finished': (str(d.get('liveTime', '')).strip() in ('完', 'FT')) or (d.get('matchStatus') in (8,)),
+        'finished': (str(d.get('liveTime', '')).strip() in ('完', 'FT')) or (d.get('matchStatus') in (8, '8')),
         'score': str(d.get('score') or ''),
         'half_score': str(d.get('halfScore') or ''),
         'corner': str(d.get('corner') or ''),
@@ -5782,8 +5854,12 @@ def tipsme_fetch_match_info(match_id):
     }
 
 def tipsme_fetch_h2h(match_id):
-    """讀取兩隊近況比賽、對賽往績、聯賽積分資料 (h2h 頁面內嵌 JSON；失敗回 None)"""
-    txt = _tipsme_get(f"https://tipsme.hk/zh-HK/match/{match_id}/h2h")
+    """讀取兩隊近況比賽、對賽往績、聯賽積分資料 (h2h 頁面內嵌 JSON；失敗回 None)。
+    V15.4：改用瀏覽器模擬抓取 (curl_cffi → curl → requests)，對 Cloudflare 更有韌性。"""
+    txt = _tipsme_fetch_page_html(f"https://tipsme.hk/zh-HK/match/{match_id}/h2h",
+                                   timeout=25, marker='teamDetails')
+    if not txt:
+        txt = _tipsme_get(f"https://tipsme.hk/zh-HK/match/{match_id}/h2h")  # 舊路徑後備
     if not txt:
         return None
     m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', txt, re.S)
@@ -5922,8 +5998,11 @@ def tipsme_fetch_bookmaker_odds(match_id):
     入球大小 / 主客和 → 網站 API /api/match-odds/{id}/{market}。
     回傳 dict {updated, hdp:[], hilo:[], had:[]}；完全失敗回 None"""
     out = {'updated': '', 'hdp': [], 'hilo': [], 'had': []}
-    # --- 讓球：賠率頁 SSR 內嵌 ---
-    txt = _tipsme_get(f"https://tipsme.hk/zh-HK/match/{match_id}/odds")
+    # --- 讓球：賠率頁 SSR 內嵌 (V15.4：瀏覽器模擬抓取，Cloudflare 韌性) ---
+    txt = _tipsme_fetch_page_html(f"https://tipsme.hk/zh-HK/match/{match_id}/odds",
+                                   timeout=25, marker='oddsResponse')
+    if not txt:
+        txt = _tipsme_get(f"https://tipsme.hk/zh-HK/match/{match_id}/odds")  # 舊路徑後備
     if txt:
         m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', txt, re.S)
         if m:
@@ -6340,18 +6419,20 @@ def _tipsme_context_fields(home_team, away_team):
         return {}
     return {k: v for k, v in (fd.get('ctx') or {}).items() if v}
 
-def _tipsme_fetch_page_html(url, timeout=25):
-    """下載 Tipsme 賽程頁 HTML。tipsme.hk 會攔截 Python 程式的 TLS 指紋 (HTTP 403)，
-    因此依序嘗試三種方法：
+def _tipsme_fetch_page_html(url, timeout=25, marker='scheduleDetails'):
+    """V15.4 泛化：下載 Tipsme 頁面 HTML (賽程頁 / 比賽頁 / h2h / 賠率頁通用)。
+    tipsme.hk 會攔截 Python 程式的 TLS 指紋 (HTTP 403)，因此依序嘗試三種方法：
       1. curl_cffi (若已安裝，模擬 Chrome 指紋，最可靠 — 可在 requirements.txt 加一行 curl_cffi)
       2. 系統 curl 指令 (大部分 Linux 容器都有)
       3. 普通 requests (後備)
+    marker：頁面特徵字串，用於確認回傳的是真頁面而非錯誤頁
+      (scheduleDetails=賽程頁 / liveScore=比賽頁 / teamDetails=h2h 頁 / oddsResponse=賠率頁)
     回傳 HTML 字串 or None"""
     # 1) curl_cffi (模擬瀏覽器 TLS 指紋)
     try:
         from curl_cffi import requests as cffi_requests
         r = cffi_requests.get(url, impersonate='chrome', timeout=timeout)
-        if r.status_code == 200 and 'scheduleDetails' in r.text:
+        if r.status_code == 200 and marker in r.text:
             return r.text
     except ImportError:
         pass
@@ -6367,14 +6448,14 @@ def _tipsme_fetch_page_html(url, timeout=25):
              '-H', 'Accept-Language: zh-HK,zh-TW;q=0.9,zh;q=0.8,en;q=0.7',
              url],
             capture_output=True, text=True, timeout=timeout + 5)
-        if out.returncode == 0 and 'scheduleDetails' in out.stdout:
+        if out.returncode == 0 and marker in out.stdout:
             return out.stdout
     except Exception:
         pass
     # 3) 普通 requests (後備)
     try:
         r = requests.get(url, headers=TIPSME_HEADERS, timeout=timeout)
-        if r.status_code == 200 and 'scheduleDetails' in r.text:
+        if r.status_code == 200 and marker in r.text:
             return r.text
     except Exception:
         pass
