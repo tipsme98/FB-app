@@ -8,7 +8,7 @@ v9_min_other,0.0
 v9_override_gate,False
 v10_mode,🛡 自動 (只用已驗證策略)
 v11_new_league_paper,True
-v11_league_breaker,False
+v11_league_breaker,True
 v11_migrated,True
 v11_auto_sys,True
 v11_trial,False
