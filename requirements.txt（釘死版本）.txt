@@ -1,0 +1,11 @@
+streamlit==1.67.0
+pandas==3.1.1
+numpy==2.5.4
+scikit-learn==1.9.1
+xgboost==3.4.1
+lightgbm==4.7.0
+sqlalchemy==2.1.8
+psycopg2-binary
+requests==2.34.2
+openpyxl==3.1.5
+curl_cffi==0.17.0
