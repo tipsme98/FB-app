@@ -10,6 +10,31 @@ import itertools
 from datetime import datetime, timedelta, timezone
 
 # ==============================================================================
+# V15.8 LR 落注閘門 (凍結邏輯回歸模型 — 前向驗證中，不會自動重訓)
+#
+#   背景 (2026-11-15)：2,863 注全量覆盤 — 系統整體命中率 50.4% (打和線 52.6%)、
+#   每注 −0.050 單位 (統計顯著)。「讓球高賠率優勢」不顯著 (p=0.18) 且 11/9 後
+#   逆轉為負；角球盤顯著虧損 (已另設停用開關)。以 14 個特徵 (去水市場概率、
+#   評分差、排名差、場均積分差、休息天數差、14日場數差、線移動、盤口類型等)
+#   重建的邏輯回歸模型，在嚴格樣本外滾動測試 (每週重訓) 4/4 週 Brier score
+#   皆優於市場基準 (0.2333→0.2273, p=0.01)；其中「讓球 + 模型概率高於去水
+#   市場概率 2%」子集在 11/08-14 測試窗口 +0.114/注 (n=46)。
+#
+#   V15.8 內容：
+#   1. 凍結邏輯回歸模型 (訓練數據 2026-10-05~11-14 全量, n=2,693) 以純 Python
+#      內嵌 — 不需新增 sklearn 相依套件，Streamlit Cloud 免費層 requirements.txt
+#      維持不變。係數、特徵工程、2% 門檻全部凍結，與前向驗證追蹤器
+#      (forward_tracker.py) 完全一致；前向驗證結束前不會重訓，事後調整會令
+#      驗證失效。
+#   2. 每張注單寫入時計算並記錄四個新欄位：Model_Prob (模型概率)、
+#      Market_Prob (去水市場概率)、Edge (兩者差距)、Gate (Y=通過 / N=攔截 /
+#      -=無法計算)。所有注單照常記錄 — 學習、結算、分析路徑零改動，
+#      前向驗證的對照組 (全部讓球注) 完整保留。
+#   3. 閘門 (預設開啟，側邊欄可關)：Bet_Type=讓球 且 Edge ≤ 2% 時，系統注碼
+#      強制 $0 (只作記錄供學習，不實注)；Edge > 2% 的讓球注照常實注。
+#      非讓球盤口不受影響。門檻 2% 為預先登記值，前向驗證期間不可調整。
+#
+# ==============================================================================
 # V15.7 自動輸入可靠性修復 (超時保護 + 例外續傳 + 跨裝置一鍵接手)
 #
 #   背景 (2026-11-14/15)：挪威超級聯賽第 18-26 輪自動輸入 (66 場) 反覆「靜默中斷」—
@@ -461,6 +486,7 @@ DB_COLUMNS = [
     'H2H_Records', 'Home_League_Stats', 'Away_League_Stats', 'Bookmaker_Odds', 'HKJC_Extra_Odds',
     'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds',
     'System_Stake', 'User_Stake', 'Odds_History', 'Tipsme_Match_ID',
+    'Model_Prob', 'Market_Prob', 'Edge', 'Gate',
     'InPlay_Minute', 'Home_DA', 'Away_DA', 'Home_SoT', 'Away_SoT', 'Home_SoFF', 'Away_SoFF',
     'Home_Red', 'Away_Red', 'Home_Yellow', 'Away_Yellow', 'Half_Score',
     'Home_Sub', 'Away_Sub', 'Home_Possession', 'Away_Possession',
@@ -3191,6 +3217,187 @@ HKJC_MIN_STAKE = {'讓球': 200.0}
 HKJC_MIN_STAKE_DEFAULT = 10.0
 
 
+# ==========================================
+# V15.8 凍結邏輯回歸落注閘門 (LR Gate, 2026-11-15 凍結)
+# — 純 Python 內嵌，不依賴 sklearn；係數/特徵工程/門檻與
+#   前向驗證追蹤器 (forward_tracker.py) 完全一致，前向驗證結束前不會重訓。
+#   訓練數據：2026-10-05 ~ 11-14 全部已結算注單 (n=2,693)，滾動樣本外測試
+#   4/4 週 Brier 0.2333→0.2273 (p=0.01)。
+# ==========================================
+V158_EDGE_THR = 0.02  # 預先登記門檻：讓球 Edge ≤ 2% → 系統注碼 $0 (前向驗證期間不可調整)
+V158_TOP_LEAGUES = ('英格蘭超級聯賽', '西班牙甲組聯賽', '意大利甲組聯賽', '德國甲組聯賽', '法國甲組聯賽', '荷蘭甲組聯賽')
+V158_FEATS = ['logit_mkt', 'rating_gap', 'rank_diff', 'ppg_diff', 'rest_diff', 'n14_diff',
+              'mv', 'abs_line', 'is_home_pick', 'is_over_pick', 'bt_ah', 'bt_goals',
+              'is_top_league', 'Odds_n']
+V158_B0 = 0.506372
+V158_W = {'logit_mkt': 0.25968, 'rating_gap': -0.007234, 'rank_diff': 0.003308,
+          'ppg_diff': -0.1009, 'rest_diff': 0.001892, 'n14_diff': 0.033062,
+          'mv': 0.448322, 'abs_line': 0.077058, 'is_home_pick': -0.095849,
+          'is_over_pick': -0.117969, 'bt_ah': 0.775568, 'bt_goals': 0.693944,
+          'is_top_league': 0.098039, 'Odds_n': -0.79392}
+V158_MED = {'logit_mkt': -0.0324, 'rating_gap': 0.0, 'rank_diff': 1.0, 'ppg_diff': 0.0,
+            'rest_diff': 0.0, 'n14_diff': 0.0, 'mv': 0.009, 'abs_line': 2.5,
+            'is_home_pick': 0.0, 'is_over_pick': 0.0, 'bt_ah': 0.0, 'bt_goals': 0.0,
+            'is_top_league': 1.0, 'Odds_n': 1.9}
+# Bet_Type → Odds_History type 對應 (與追蹤器 TYPE_MAP 一致；「 (即場)」歸同類)
+V158_TYPE_MAP = {'讓球': '讓球', '入球大小': '入球大小', '入球大小 (即場)': '入球大小',
+                 '角球大小': '角球大小', '角球大小 (即場)': '角球大小'}
+
+
+def _v158_pn(x):
+    """寬鬆轉 float (與追蹤器 pn() 同源：容許 % / + 前綴)；失敗回傳 None"""
+    try:
+        v = float(str(x).replace('%', '').replace('+', ''))
+        return v if pd.notna(v) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _v158_stat_tot(txt, key):
+    try:
+        data = json.loads(txt) if txt else None
+    except Exception:
+        return None
+    if not data:
+        return None
+    for row in data:
+        if row.get('type') == '總':
+            return row.get(key)
+    return None
+
+
+def _v158_side_key(selection):
+    return 'upper' if str(selection) in ('Home', 'Over') else 'lower'
+
+
+def v158_predict(feat):
+    """凍結模型預測 (缺值以凍結中位數補 — 與訓練 Pipeline 的 median 填補一致)"""
+    import math
+    z = V158_B0
+    for f in V158_FEATS:
+        v = feat.get(f)
+        if v is None:
+            v = V158_MED[f]
+        z += V158_W[f] * v
+    return 1.0 / (1.0 + math.exp(-z))
+
+
+def v158_lr_gate(rec):
+    """V15.8 凍結邏輯回歸閘門：計算單張注單的模型概率、去水市場概率與 Edge。
+
+    rec：注單 dict (含 Bet_Type / Selection / Initial_Line / Initial_Odds /
+    Odds_History / Home_Rating / Away_Rating / Home_League_Stats /
+    Away_League_Stats / Home_Recent_Matches / Away_Recent_Matches /
+    Match_Date / Tournament_Name)。
+    回傳 {'p_model', 'p_mkt', 'edge', 'cols'}：
+      cols = 可直接寫入注單的四個欄位 (Model_Prob / Market_Prob / Edge / Gate)；
+      edge 為 None 時代表數據不足無法計算 (不攔截，照常記錄)。
+    特徵工程與前向驗證追蹤器完全一致 (Edge = p_model − p_mkt)。
+    """
+    cols = {'Model_Prob': None, 'Market_Prob': None, 'Edge': None, 'Gate': '—'}
+    out = {'p_model': None, 'p_mkt': None, 'edge': None, 'cols': cols}
+    try:
+        bet_type = str(rec.get('Bet_Type') or '')
+        selection = str(rec.get('Selection') or '')
+        line = _v158_pn(rec.get('Initial_Line'))
+        odds_n = _v158_pn(rec.get('Initial_Odds'))
+        hist = json.loads(rec.get('Odds_History') or '[]') if rec.get('Odds_History') else None
+        # 去水市場概率 + 線移動 (Odds_History 同盤口最後一筆報價；與追蹤器一致)
+        p_mkt = None
+        mv = None
+        hist_type = V158_TYPE_MAP.get(bet_type)
+        if hist and line is not None and odds_n is not None and hist_type:
+            recs = [r for r in hist if r.get('type') == hist_type and r.get('line') is not None]
+            if recs:
+                same = [r for r in recs if abs(float(r['line']) - line) < 1e-6]
+                if len(same) < 2:
+                    same = recs
+                if len(same) >= 2:
+                    sk = _v158_side_key(selection)
+                    ok = 'lower' if sk == 'upper' else 'upper'
+                    o0, po, qo = float(same[0][sk]), float(same[-1][sk]), float(same[-1][ok])
+                    if o0 > 1.01 and po > 1.01 and qo > 1.01:
+                        mv = po / o0 - 1
+                        p_mkt = (1 / po) / ((1 / po) + (1 / qo))
+        if p_mkt is None or not (0.01 < p_mkt < 0.99):
+            return out  # 無法計算去水市場概率：不攔截，照常記錄
+        # 評分 / 排名 / 場均積分 (與追蹤器一致：rank_diff = 客隊排名 − 主隊排名)
+        hr = _v158_pn(rec.get('Home_Rating'))
+        ar = _v158_pn(rec.get('Away_Rating'))
+        rating_gap = (hr - ar) if (hr is not None and ar is not None) else None
+        h_rank = _v158_pn(_v158_stat_tot(rec.get('Home_League_Stats'), 'Rank'))
+        a_rank = _v158_pn(_v158_stat_tot(rec.get('Away_League_Stats'), 'Rank'))
+        rank_diff = (a_rank - h_rank) if (h_rank is not None and a_rank is not None) else None
+        h_ppg = _v158_pn(_v158_stat_tot(rec.get('Home_League_Stats'), 'Pts'))
+        a_ppg = _v158_pn(_v158_stat_tot(rec.get('Away_League_Stats'), 'Pts'))
+        h_p = _v158_pn(_v158_stat_tot(rec.get('Home_League_Stats'), 'P'))
+        a_p = _v158_pn(_v158_stat_tot(rec.get('Away_League_Stats'), 'P'))
+        ppg_diff = None
+        if h_ppg is not None and a_ppg is not None and h_p and a_p:
+            ppg_diff = h_ppg / h_p - a_ppg / a_p
+        # 賽程密度：休息天數差 / 14日場數差 (只計 Match_Date 之前的已完賽事；兩邊齊全才算)
+        import math as _m158
+        mdt = None
+        try:
+            mdt = pd.Timestamp(rec.get('Match_Date')) if rec.get('Match_Date') else None
+        except Exception:
+            mdt = None
+        rest_diff = None
+        n14_diff = None
+        if mdt is not None:
+            vals = {}
+            for side, col in (('h', 'Home_Recent_Matches'), ('a', 'Away_Recent_Matches')):
+                try:
+                    rm = json.loads(rec.get(col)) if rec.get(col) else None
+                except Exception:
+                    rm = None
+                if rm:
+                    dates = []
+                    for m in rm:
+                        if m.get('date'):
+                            try:
+                                dates.append(pd.Timestamp(m.get('date')))
+                            except Exception:
+                                pass
+                    dates = [d for d in dates if d < mdt]
+                    if dates:
+                        vals[side + '_rest'] = (mdt - max(dates)).days
+                        vals[side + '_n14'] = sum(1 for d in dates if (mdt - d).days <= 14)
+            if 'h_rest' in vals and 'a_rest' in vals:
+                rest_diff = vals['h_rest'] - vals['a_rest']
+                n14_diff = vals['h_n14'] - vals['a_n14']
+        # 特徵向量 → 凍結模型預測 (缺值 → 中位數)
+        feat = {
+            'logit_mkt': _m158.log(p_mkt / (1 - p_mkt)),
+            'rating_gap': rating_gap,
+            'rank_diff': rank_diff,
+            'ppg_diff': ppg_diff,
+            'rest_diff': rest_diff,
+            'n14_diff': n14_diff,
+            'mv': mv,
+            'abs_line': abs(line) if line is not None else None,
+            'is_home_pick': 1 if selection == 'Home' else 0,
+            'is_over_pick': 1 if selection == 'Over' else 0,
+            'bt_ah': 1 if bet_type == '讓球' else 0,
+            'bt_goals': 1 if bet_type == '入球大小' else 0,
+            'is_top_league': 1 if (rec.get('Tournament_Name') or '') in V158_TOP_LEAGUES else 0,
+            'Odds_n': odds_n,
+        }
+        p_model = v158_predict(feat)
+        edge = p_model - p_mkt
+        cols['Model_Prob'] = round(float(p_model), 4)
+        cols['Market_Prob'] = round(float(p_mkt), 4)
+        cols['Edge'] = round(float(edge), 4)
+        if bet_type == '讓球':
+            cols['Gate'] = 'Y' if edge > V158_EDGE_THR else 'N'
+        else:
+            cols['Gate'] = '—'
+        out.update({'p_model': p_model, 'p_mkt': p_mkt, 'edge': edge})
+        return out
+    except Exception:
+        return out  # 任何數據問題：不攔截，照常記錄
+
+
 def v9_bet_floor(bet_type, settings):
     """該盤口的馬會最低注額 (讓球 $200、其他 $10)，可於側邊欄調整"""
     bt = v9_clean_bt(str(bet_type))
@@ -4023,6 +4230,7 @@ V10_SETTING_DEFAULTS = {
     'v11_act_min_n': 50, 'v11_act_roi': 2.0, 'v11_trial_min_n': 30, 'v11_trial_roi': 1.0,
     'v11_corner_off': True,
     'v11_corner_tracker': True, 'v11_corner_track_gap': 1.0,
+    'v158_gate': True,
 }
 V10_MODE_OPTIONS = [V11_MODE_AUTO, '看盤規則', V11_MODE_STRICT, '看盤規則 + V9', '只用 V9 模型']
 V11_LS_PREFIX = 'LS|'
@@ -4985,6 +5193,8 @@ def v9_get_settings():
         'act_roi': float(st.session_state.get('v11_act_roi', V10_SETTING_DEFAULTS['v11_act_roi'])) / 100.0,
         'trial_min_n': int(st.session_state.get('v11_trial_min_n', V10_SETTING_DEFAULTS['v11_trial_min_n'])),
         'trial_roi': float(st.session_state.get('v11_trial_roi', V10_SETTING_DEFAULTS['v11_trial_roi'])) / 100.0,
+        # V15.8：LR 落注閘門 (讓球 Edge ≤ 2% 系統注碼 $0)
+        'v158_gate': bool(st.session_state.get('v158_gate', V10_SETTING_DEFAULTS['v158_gate'])),
     }
 
 
@@ -8527,8 +8737,9 @@ def main():
                     help="實測發現球隊角球攻防數據有預測能力，且馬會角球盤口線系統性偏高：模型預期總角球與盤口線差距 ≥1.0 角時，"
                          "歷史 64 注全贏率 65.6%。此模式在角球停用下仍會於差距達門檻時記錄一注 $0 模擬注 (方向跟隨模型偏離)，"
                          "零成本累積樣本驗證訊號；差距不足則完全不記錄。永遠 $0，絕不實注。")
-        st.number_input("角球訊號門檻 (角)", min_value=0.5, max_value=3.0, step=0.5, key="v11_corner_track_gap", on_change=v10_save_settings,
-                        help="模型預期總角球與盤口線的差距達到此數才記錄訊號追蹤注。1.0 = 實測全贏率 65.6% 的門檻；越高注數越少但歷史勝率越高。")
+        st.checkbox("🎯 V15.8 LR 落注閘門 (讓球 Edge ≤ 2% 系統注碼 $0)", key="v158_gate", value=V10_SETTING_DEFAULTS['v158_gate'], on_change=v10_save_settings,
+                    help="凍結邏輯回歸模型 (2026-11-15 凍結，與前向驗證追蹤器完全一致) 比較模型概率與去水市場概率：讓球注單 Edge (模型概率 − 市場概率) ≤ 2% 時系統注碼強制 $0，只作記錄供學習。"
+                         "所有注單 (包括被攔截的) 仍完整記錄 — 學習、結算、前向驗證對照組全部照常運作。非讓球盤口不受影響。前向驗證期間門檻固定 2%，模型不會自動重訓。")
         st.number_input("最低 EV 門檻 (%)", min_value=0.0, max_value=20.0, step=0.5, key="v9_min_ev", on_change=v10_save_settings,
                         help="只有估計期望值 ≥ 此門檻的盤口才會被建議。0% = 注數多但包含大量優勢極薄、估計誤差內的投注；3% = 注數少但每注質素較高。")
         st.select_slider("Kelly 分數", options=[0.1, 0.15, 0.2, 0.25, 0.33, 0.5], key="v9_kelly", on_change=v10_save_settings,
@@ -9116,6 +9327,32 @@ def main():
                 for _p in picks:
                     if _p.get('kp_fired'):
                         st.caption(f"📈 {_p['bet_type']} {_p['label']} 觸發的看盤規則：" + "；".join(_p['kp_fired']))
+                # V15.8：LR 閘門即時預覽 — 與寫入注單時用完全同一個凍結模型函數，
+                # 讓你在按「確定投注」前已看到每個讓球建議的閘門判定
+                try:
+                    _pf158 = _tipsme_context_fields(home_team, away_team)
+                    _oh158 = json.dumps(st.session_state.odds_history, ensure_ascii=False)
+                    for _p in picks:
+                        if v9_clean_bt(str(_p.get('bet_type'))) != '讓球':
+                            continue
+                        _pr158 = {
+                            'Bet_Type': str(_p.get('bet_type')), 'Selection': _p.get('selection'),
+                            'Initial_Line': _p.get('line'), 'Initial_Odds': _p.get('odds'),
+                            'Odds_History': _oh158, 'Match_Date': match_date,
+                            'Tournament_Name': res.get('t_name'),
+                            'Home_Rating': 'NA' if no_rank else int(home_rank),
+                            'Away_Rating': 'NA' if no_rank else int(away_rank),
+                            **_pf158,
+                        }
+                        _pg158 = v158_lr_gate(_pr158)
+                        if _pg158['edge'] is None:
+                            st.caption(f"🎯 V15.8 LR 閘門【{_p.get('bet_type')} {_p.get('label')}】：賠率快照不足，無法計算 Edge (照常記錄，閘門不攔截)")
+                        elif _pg158['edge'] > V158_EDGE_THR:
+                            st.caption(f"🎯 V15.8 LR 閘門【{_p.get('bet_type')} {_p.get('label')}】：模型 {_pg158['p_model']*100:.1f}% vs 市場 {_pg158['p_mkt']*100:.1f}% (Edge {_pg158['edge']*100:+.1f}%) → ✅ 通過，照常實注")
+                        else:
+                            st.caption(f"🎯 V15.8 LR 閘門【{_p.get('bet_type')} {_p.get('label')}】：模型 {_pg158['p_model']*100:.1f}% vs 市場 {_pg158['p_mkt']*100:.1f}% (Edge {_pg158['edge']*100:+.1f}%) → ⛔ 攔截，系統注碼 $0 (只作記錄供學習)")
+                except Exception:
+                    pass
             else:
                 mc1.metric("💡 首選推薦", "⛔ 本場不建議投注")
                 _top = cand_list[0] if cand_list else None
@@ -9231,6 +9468,7 @@ def main():
                     
                         new_records = []
                         _dup_skipped = []
+                        _v158_gated = []  # V15.8：LR 閘門攔截清單
                         _dbx = st.session_state.df_db
                         _dbx_m = _dbx['Match'].astype(str).map(v11_clean_name) if not _dbx.empty else pd.Series(dtype=str)
                         _dbx_md = v10_md_series(_dbx) if not _dbx.empty else pd.Series(dtype=str)
@@ -9295,7 +9533,29 @@ def main():
                                     'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False),
                                     **_tipsme_context_fields(home_team, away_team)
                                 }
+                            # V15.8：LR 落注閘門 — 凍結模型計算 Model_Prob / Market_Prob /
+                            # Edge / Gate 四欄並寫入注單；讓球且 Edge ≤ 2% 時系統注碼強制 $0
+                            # (只作記錄供學習，不實注；所有注單照常記錄，前向驗證對照組不變)。
+                            # 開關關閉時只記錄欄位、不攔截；任何數據問題不攔截。
+                            try:
+                                _g158 = v158_lr_gate(new_record)
+                                new_record.update(_g158['cols'])
+                                _bt158 = str(new_record.get('Bet_Type') or '').replace(' (即場)', '').strip()
+                                if (_g158['edge'] is not None and v9_get_settings().get('v158_gate', True)
+                                        and _bt158 == '讓球' and float(s_stk or 0) > 0
+                                        and float(_g158['edge']) <= V158_EDGE_THR):
+                                    new_record['System_Stake'] = 0.0
+                                    s_stk = 0.0
+                                    _v158_gated.append(
+                                        f"【{sel}】模型 {new_record['Model_Prob'] * 100:.1f}% vs 市場 {new_record['Market_Prob'] * 100:.1f}%"
+                                        f" (Edge {new_record['Edge'] * 100:+.1f}%) → 系統注碼 $0")
+                            except Exception:
+                                pass
                             new_records.append(new_record)
+                        if _v158_gated:
+                            st.info("🎯 V15.8 LR 落注閘門：以下讓球注單 Edge ≤ 2%，系統注碼已設為 $0 (只作記錄供學習，不實注)：\n\n"
+                                    + "\n".join(_v158_gated)
+                                    + "\n\n所有注單仍完整記錄，學習、結算及前向驗證對照組照常運作。")
                         if _dup_skipped:
                             st.warning("⚠ 以下項目與數據庫現有注單完全相同，已略過以免重複計算：" + "；".join(_dup_skipped))
                         if not new_records:
@@ -9775,6 +10035,14 @@ def main():
                                     'Home_Corner_Eff': round(h_corner_eff, 2), 'Away_Corner_Eff': round(a_corner_eff, 2),
                                     **_tipsme_context_fields(ip_res['h_team'], ip_res['a_team'])
                                 }
+                                # V15.8：LR 閘門欄位記錄 (即場讓球不在凍結模型的適用範圍 —
+                                # TYPE_MAP 與前向驗證追蹤器一致，即場讓球無法計算 Edge，
+                                # 閘門不觸發，只記錄欄位保持數據庫結構一致)
+                                try:
+                                    _ipg158 = v158_lr_gate(new_record)
+                                    new_record.update(_ipg158['cols'])
+                                except Exception:
+                                    pass
                                 ip_new_records.append(new_record)
 
                             st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame(ip_new_records)], ignore_index=True)
