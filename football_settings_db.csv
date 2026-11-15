@@ -19,6 +19,7 @@ v11_trial_roi,0.0
 v11_corner_off,True
 v11_corner_tracker,True
 v11_corner_track_gap,0.5
+v158_gate,True
 LS|亞冠二級聯賽,32
 LS|日本聯賽盃,40
 LS|南韓職業聯賽,12
@@ -34,6 +35,7 @@ LS|澳洲職業聯賽,12
 LS|日職百年構想聯賽,20
 LS|挪威超級聯賽,2
 LS|泰國甲組聯賽,20
+LS|日本乙組聯賽,20
 IGN|0f5016ae92c6,1
 IGN|0f5498dd4e47,1
 IGN|1f56a7f9d2e1,1
