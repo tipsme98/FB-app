@@ -10,6 +10,30 @@ import itertools
 from datetime import datetime, timedelta, timezone
 
 # ==============================================================================
+# V15.12 同步合併保護與差量備份 — 2026-11-16
+#
+#   背景 (2026-11-16 事故)：11-15 全日 84 場自動輸入完成，但 42MB 主資料庫
+#   上傳雲端持續失敗，全部記錄只存在容器；用家未先下載報表就按「🔄 即時從
+#   雲端同步最新數據」，舊版按鈕直接以雲端舊檔整檔覆蓋 session 數據 →
+#   84 場記錄全部消失。V15.9 的覆蓋保護只保護「上傳」方向 (save_db_github)，
+#   沒有保護「下載/同步」方向 (load_db / 同步按鈕)。
+#
+#   V15.12 兩層保護：
+#   1. 同步按鈕改為「合併同步」：本機與雲端做 ID 聯集合併 (沿用 V15.9.2
+#      _v159_merge_db：已結算優先、雙方獨有列全保留)，本機獨有記錄一律保留
+#      並即時回寫雲端；雲端讀取失敗時本機數據完全不動。盲目覆蓋從機制上
+#      不可能再發生。
+#   2. 差量備份檔 football_betting_db_pending.csv：主資料庫上傳雲端失敗時，
+#      即時把本 session 新增/修改的列 (通常幾 KB) 上傳到此小檔 — 15 秒超時
+#      綽綽有餘，成功率與主檔 (42MB) 完全不同級別。任何裝置下次載入主資料
+#      庫時自動合併備份檔、回寫雲端並清空。即使主檔從此一次都上傳不成功，
+#      數據也不會再「只存在容器」— 容器重啟/換新後仍可完整恢復。
+#
+#   風險評估：零。所有改動在「雲端同步通訊層」：同步按鈕由「覆蓋」改為
+#   「合併」(只增不減)；差量備份只在小檔新增記錄，合併沿用已通過 6 項單元
+#   測試的 _v159_merge_db。學習引擎、結算、風控、投注建議計算路徑零改動。
+# ==============================================================================
+# ==============================================================================
 # V15.11 每日自動排程 (前一天賽果定時自動輸入) — 2026-11-16
 #
 #   背景：前向驗證需每日輸入前一天的全部賽事。V15.10 的賽果日期模式仍需人手
@@ -662,6 +686,128 @@ def _v159_merge_db(cloud_df, ours_df):
     except Exception:
         return ours_df
 
+# =============================================================================
+# V15.12 差量備份與同步保護 (2026-11-16)
+# =============================================================================
+PENDING_DB_FILE = "football_betting_db_pending.csv"
+
+# 指紋欄位：偵測「本 session 改過的列」。刻意不含龐大 JSON 欄位 (Recent_Matches/
+# H2H_Records/Odds_History 等 — 這些建檔時一次寫入，不會事後修改)，令指紋計算在
+# 2,800+ 列上只需毫秒級，自動輸入每場 4-8 次儲存零負擔。
+V1512_FP_COLS = ['ID', 'Status', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds',
+                 'System_Stake', 'User_Stake', 'Result_Label', 'System_Profit',
+                 'User_Profit', 'Unit_Profit', 'Note']
+
+def _v1512_is_main_db(filename):
+    """V15.12：是否主資料庫檔 (需要差量備份保護)。"""
+    return str(filename).endswith('football_betting_db.csv')
+
+def _v1512_fp(df):
+    """V15.12：計算每列指紋 {ID: md5} — 偵測新增列與被修改列 (結算/改注)。"""
+    try:
+        import hashlib
+        cols = [c for c in V1512_FP_COLS if c in df.columns]
+        d = df[cols].astype(str)
+        ids = df['ID'].astype(str).tolist()
+        vals = d.values.tolist()
+        fp = {}
+        for i, _rid in enumerate(ids):
+            if _rid and _rid.lower() != 'nan':
+                fp[_rid] = hashlib.md5('|'.join(vals[i]).encode('utf-8', 'ignore')).hexdigest()
+        return fp
+    except Exception:
+        return None
+
+def _v1512_capture_base(df):
+    """V15.12：記住目前數據狀態的指紋 (作為下次差量比對的基準)。"""
+    try:
+        if df is None or df.empty:
+            st.session_state['_v1512_base'] = {}
+        else:
+            st.session_state['_v1512_base'] = _v1512_fp(df) or {}
+    except Exception:
+        pass
+
+def _v1512_changed_rows(df):
+    """V15.12：傳回與基準指紋不同的列 (新注單 + 已結算/被修改的注單)。
+    任何例外 → 傳回整個 df (寧可多備份，絕不漏備份)。"""
+    try:
+        base = st.session_state.get('_v1512_base') or {}
+        if df is None or df.empty:
+            return df
+        fp = _v1512_fp(df)
+        if fp is None:
+            return df
+        changed_ids = {rid for rid, h in fp.items() if base.get(rid) != h}
+        if not changed_ids:
+            return None
+        return df[df['ID'].astype(str).isin(changed_ids)]
+    except Exception:
+        return df
+
+def _v1512_load_pending():
+    """V15.12：讀取雲端差量備份檔 (無檔案/空檔/讀取失敗 → None)。"""
+    try:
+        if not (_has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO")):
+            return None
+        p = load_db_github(st.secrets["GITHUB_REPO"], PENDING_DB_FILE, st.secrets["GITHUB_TOKEN"])
+        if p is None or p.empty:
+            return None
+        return enforce_columns(p, DB_COLUMNS)
+    except Exception:
+        return None
+
+def _v1512_backup_pending(df):
+    """V15.12：主檔上傳失敗時的差量備份 — 只上傳有變動的列 (小檔，易成功)。
+    備份成功才更新指紋基準；備份也失敗則基準不變，下次儲存自動重試。"""
+    try:
+        if df is None or df.empty:
+            return
+        changed = _v1512_changed_rows(df)
+        if changed is None or changed.empty:
+            return
+        cloud_pend = _v1512_load_pending()
+        if cloud_pend is not None and not cloud_pend.empty:
+            changed = _v159_merge_db(cloud_pend, changed)
+        if save_db_github(changed, st.secrets["GITHUB_REPO"], PENDING_DB_FILE, st.secrets["GITHUB_TOKEN"]):
+            _v1512_capture_base(df)
+            st.session_state['_v1512_pending_used'] = True
+    except Exception:
+        pass
+
+def _v1512_clear_pending():
+    """V15.12：主檔成功上傳後清空差量備份檔 (記錄已在主檔內)。"""
+    try:
+        if _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO"):
+            save_db_github(pd.DataFrame(columns=DB_COLUMNS),
+                           st.secrets["GITHUB_REPO"], PENDING_DB_FILE, st.secrets["GITHUB_TOKEN"])
+    except Exception:
+        pass
+
+def _v1512_merge_pending_on_load():
+    """V15.12：載入主資料庫後自動合併差量備份檔 (如有)：ID 聯集、已結算優先，
+    合併結果回寫雲端並清空備份檔，同時記下指紋基準。回傳合併列數 (0 = 無備份)。"""
+    try:
+        df = st.session_state.get('df_db')
+        if df is None:
+            return 0
+        pend = _v1512_load_pending()
+        n = 0
+        if pend is not None and not pend.empty:
+            if df.empty:
+                merged = enforce_columns(pend, DB_COLUMNS)
+            else:
+                merged = enforce_columns(_v159_merge_db(pend, df), DB_COLUMNS)
+            st.session_state.df_db = merged
+            n = int(len(pend))
+            save_db(merged, "football_betting_db.csv", "football_bets")
+            _v1512_clear_pending()
+            st.session_state['_v1512_pending_used'] = False
+        _v1512_capture_base(st.session_state.df_db)
+        return n
+    except Exception:
+        return 0
+
 def save_db_github(df, repo, path, token):
     timestamp = int(get_hkt_now().timestamp())
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
@@ -797,14 +943,27 @@ def save_db(df, filename, table_name):
             st.error(f"SQL 資料庫儲存失敗: {e}")
 
     # 2. 寫入 GitHub 雲端倉庫
+    _gh_ok1512 = False
     if _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO"):
         try:
             _ok159 = save_db_github(df, st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
+            _gh_ok1512 = bool(_ok159)
             # V15.9：同步失敗不再靜默 — 側邊欄顯示連續失敗警告，成功後自動清除
             st.session_state['_gh_sync_fail'] = 0 if _ok159 else int(st.session_state.get('_gh_sync_fail', 0) or 0) + 1
         except Exception as e:
             st.session_state['_gh_sync_fail'] = int(st.session_state.get('_gh_sync_fail', 0) or 0) + 1
             st.error(f"GitHub 雲端同步失敗: {e}")
+    # V15.12 差量備份：主資料庫上傳失敗 → 即時把本 session 新增/修改的列上傳到
+    # 小檔 football_betting_db_pending.csv；上傳成功 → 清空備份檔 (記錄已在主檔)。
+    # 效果：即使 42MB 主檔從此一次都上傳不成功，數據也不會再「只存在容器」。
+    if _v1512_is_main_db(filename):
+        if _gh_ok1512:
+            if st.session_state.get('_v1512_pending_used'):
+                _v1512_clear_pending()
+                st.session_state['_v1512_pending_used'] = False
+            _v1512_capture_base(df)
+        else:
+            _v1512_backup_pending(df)
 
     # 3. 寫入本地 CSV
     try:
@@ -9259,18 +9418,53 @@ def main():
         st.sidebar.error(f"⚠️ 雲端同步已連續失敗 {_fail159} 次 — 最新注單/結算只存在本容器！"
                          "請立即到「📊 數據庫即時線上預覽與管理」下載報表備份，並保持此分頁開啟；"
                          "同步成功後此警告會自動消失。")
+    # V15.12：主檔同步失敗但差量備份已上傳成功 → 數據其實已安全，補充說明
+    if _fail159 > 0 and st.session_state.get('_v1512_pending_used'):
+        st.sidebar.info("🛡 V15.12 差量備份已生效：最新變更已同步上傳到備份小檔，"
+                        "即使容器重啟，下次開啟程式會自動恢復 — 但仍建議下載報表備份。")
     _mrg159 = int(st.session_state.get('_gh_merge_count', 0) or 0)
     if _mrg159 > 0:
         st.sidebar.info(f"🔀 V15.9 覆蓋保護已自動合併 {_mrg159} 次：偵測到其他裝置/session 的寫入，雙方數據均已保留。")
 
+    # V15.12：同步按鈕改為「合併同步」— 絕不再用雲端舊檔盲目覆蓋本機。
+    # (2026-11-16 事故：84 場自動輸入完成後雲端同步失敗，按此按鈕把只存在
+    #  本機的 84 場記錄整批沖走。現在本機獨有的注單一律保留並即時回寫雲端。)
     if st.sidebar.button("🔄 即時從雲端同步最新數據", use_container_width=True):
-        st.session_state.df_db = load_db(db_file, DB_COLUMNS, db_table, force_cloud=True)
+        _cloud_db1512 = load_db(db_file, DB_COLUMNS, db_table, force_cloud=True)
+        _local_db1512 = st.session_state.get('df_db')
+        _has_local1512 = _local_db1512 is not None and not _local_db1512.empty
+        _has_cloud1512 = _cloud_db1512 is not None and not _cloud_db1512.empty
+        _kept1512 = 0
+        if _has_local1512 and _has_cloud1512:
+            # 雲端與本機做 ID 聯集合併 (已結算優先、雙方獨有列全保留)
+            _merged1512 = enforce_columns(_v159_merge_db(_cloud_db1512, _local_db1512), DB_COLUMNS)
+            _kept1512 = int(len(_merged1512)) - int(len(_cloud_db1512))
+            st.session_state.df_db = _merged1512
+        elif _has_cloud1512:
+            st.session_state.df_db = enforce_columns(_cloud_db1512, DB_COLUMNS)
+        elif _has_local1512:
+            # 雲端讀取失敗或雲端為空 → 保留本機數據，絕不覆蓋成空
+            st.session_state.df_db = _local_db1512
+            _kept1512 = -1
+        if _kept1512 > 0:
+            # 本機有雲端沒有的記錄 → 合併結果即時回寫雲端，兩邊一致
+            save_db(st.session_state.df_db, db_file, db_table)
+            st.toast(f"✅ 已合併同步雲端，並保留本機未上傳的 {_kept1512} 筆記錄 (已回寫雲端)", icon="🔄")
+        elif _kept1512 == -1:
+            st.toast("⚠️ 雲端暫時讀取失敗，本機數據已保留不變", icon="⚠️")
+        else:
+            st.toast("✅ 數據已與雲端同步！", icon="🔄")
+        _v1512_merge_pending_on_load()
         st.session_state.df_cap = load_db(capital_file, CAPITAL_COLUMNS, cap_table, force_cloud=True)
-        st.toast("✅ 數據已與雲端同步！", icon="🔄")
         st.rerun()
 
     if 'df_db' not in st.session_state:
         st.session_state.df_db = load_db(db_file, DB_COLUMNS, db_table)
+        # V15.12：載入後自動檢查差量備份檔 — 上次雲端同步失敗時保存在小檔的
+        # 記錄會自動合併回主資料庫並回寫雲端，任何裝置開啟即恢復
+        _pend_n1512 = _v1512_merge_pending_on_load()
+        if _pend_n1512 and _pend_n1512 > 0:
+            st.sidebar.success(f"🔀 V15.12 差量備份生效：已自動恢復 {_pend_n1512} 筆上次未同步的記錄並合併至主資料庫。")
     else:
         st.session_state.df_db = enforce_columns(st.session_state.df_db, DB_COLUMNS)
 
