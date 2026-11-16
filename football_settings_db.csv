@@ -14,7 +14,7 @@ v11_auto_sys,True
 v11_trial,True
 v11_act_min_n,30
 v11_act_roi,2.0
-v11_trial_min_n,5
+v11_trial_min_n,50
 v11_trial_roi,1.0
 v11_corner_off,True
 v11_corner_tracker,True
