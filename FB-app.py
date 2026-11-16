@@ -10,6 +10,57 @@ import itertools
 from datetime import datetime, timedelta, timezone
 
 # ==============================================================================
+# V15.11 每日自動排程 (前一天賽果定時自動輸入) — 2026-11-16
+#
+#   背景：前向驗證需每日輸入前一天的全部賽事。V15.10 的賽果日期模式仍需人手
+#   開程式、選日期、按開始 — 忘記一天，前向驗證數據就斷一天。
+#
+#   V15.11 內容：
+#   1. 每日排程：到達觸發時間 (預設 09:30 香港) 後，任何開啟著程式的裝置會
+#      自動讀取前一天 (香港時間日曆日) 全部聯賽的已完場賽果，按設定時段
+#      (預設 00:00–23:59) 自動啟動「填充 → 分析 → 投注 → 結算 → 學習」。
+#   2. 運作機制：頁面頂部背景檢查 fragment (每 5 分鐘自動執行，與遠端進度
+#      橫幅同一模式)；完成後在雲端標記 last_run，所有裝置同步、不會重複；
+#      中斷自動續傳 (last_run 未標記 → 下次檢查重新啟動，重複檢查略過已記錄)。
+#   3. 設定儲存於獨立雲端檔 football_schedule_db.csv (啟用/觸發時間/時段/
+#      last_run)，與投注策略設定 (football_settings_db.csv) 完全分開，
+#      互不影響。
+#   4. 跨裝置互斥沿用 V15.7 sid 機制：兩部裝置同時觸發時，狀態檔 sid 不符的
+#      一方自動停止，不會重複寫入；手動模式 (輪次/日期) 完全不受影響。
+#
+#   限制 (如實說明)：Streamlit Community Cloud 沒有伺服器端排程 — 排程由
+#   開啟著的分頁驅動 (背景 fragment 每 5 分鐘檢查)。保持至少一部裝置的
+#   分頁開啟即可；若 09:30 時全部分頁關閉，下次開啟程式時會立即補跑。
+#
+#   風險評估：零。新功能在「排程觸發層」— 觸發的仍是 V15.10 日期模式自動
+#   輸入 (既有程式碼路徑)。學習引擎、結算、風控、投注建議計算零改動。
+# ==============================================================================
+# V15.10 賽果日期模式 (按日期時段自動輸入全部聯賽) — 2026-11-16
+#
+#   背景：前向驗證需要每日批量輸入前一天的全部賽事。舊有「賽程連結模式」以
+#   聯賽為單位、按輪次選擇 — 每天要逐個聯賽貼連結、逐輪選擇，費時失事。
+#
+#   V15.10 內容：
+#   1. tipsme_fetch_day_results()：讀取 Tipsme 賽果頁 (/zh-HK/results)
+#      ?date=D&page=N，一次取得指定日曆日 (香港時間 00:00–23:59) 全部聯賽的
+#      已完場比賽。實測 (2026-11-16)：Tipsme 的「日期」是 [D-1 16:00, D 16:00)
+#      滾動窗口，故完整覆蓋日曆日 D 需合併 D 與 D+1 兩天 (以馬會 matchId 去重，
+#      實測 11-15 全日 84 場)。每場含馬會比賽 ID、主客隊、開賽時間、全場/半場
+#      比分、角球、紅黃牌 — 與賽程連結模式完全同一數據結構。
+#   2. 「賽前建檔與投注」新增「📆 賽果日期模式」：選日期 (預設昨天) → 讀取當日
+#      賽果；「自動導入歷史賽事」面板在日期模式下改為選擇時段 (開始/結束時間，
+#      預設 00:00–23:59)，佇列按時段過濾，其後填充 → 分析 → 投注 → 結算 → 學習
+#      全自動流程與輪次模式完全共用同一執行器，零新邏輯。
+#   3. 跨裝置接手同步支援日期模式：狀態檔記錄 mode/rdate/win，接手裝置自動
+#      重新讀取當日賽果重建佇列，毋須再貼任何連結。
+#   4. 輪次標籤改為 _v15_mlabel()：輪次模式顯示「第X輪」、日期模式顯示日期，
+#      日誌/進度/待手動清單自動適配。
+#
+#   風險評估：零。新功能完全在「數據讀取層」與「佇列選擇層」— 讀取來源是
+#   Tipsme 官方賽果頁 (與既有賽程頁同一網站、同一比賽 ID 空間)，讀取後的
+#   填充、分析、投注、結算、學習全部走既有程式碼路徑。學習引擎、結算、
+#   風控、投注建議計算零改動。
+# ==============================================================================
 # V15.9 資料庫同步修復 (120 秒超時 + 覆蓋保護) — 2026-11-16
 #
 #   背景 (2026-11-15/16)：手機自動輸入時賽果明明已結算，頁面更新或訊號不佳
@@ -7098,6 +7149,92 @@ def tipsme_fetch_season_schedule(url, timeout=25):
         return None, f'讀取賽程頁失敗: {e}'
 
 
+def tipsme_fetch_day_results(date_str, timeout=25):
+    """V15.10 賽果日期模式：讀取指定日曆日 (香港時間 00:00–23:59) 全部聯賽的已完場比賽。
+    Tipsme 賽果頁 (/zh-HK/results?date=D&page=N) 的「日期」是 [D-1 16:00, D 16:00) 的
+    滾動窗口 (2026-11-16 實測)，因此完整覆蓋日曆日 D 需讀取 D 與 D+1 兩天再合併
+    (以馬會 matchId 去重)。每場數據結構與「賽程連結模式」完全相同 (round=0、
+    day=日期)，可直接餵入既有的填充 → 分析 → 投注 → 結算全自動流程。
+    回傳 (比賽列表 or None, 訊息)"""
+    date_str = str(date_str or '').strip()
+    if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', date_str):
+        return None, '日期格式錯誤：請用 YYYY-MM-DD (例如 2026-11-16)。'
+    try:
+        d0 = datetime.strptime(date_str, '%Y-%m-%d')
+        d1 = d0 + timedelta(days=1)
+    except Exception:
+        return None, f'無法辨認日期：{date_str}'
+    by_id = {}
+    for _d in (d0.strftime('%Y-%m-%d'), d1.strftime('%Y-%m-%d')):
+        page = 1
+        while page <= 40:
+            url = f'https://tipsme.hk/zh-HK/results?date={_d}&page={page}'
+            html = _tipsme_fetch_page_html(url, timeout=timeout, marker='matchResults')
+            if not html:
+                break
+            mm = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.S)
+            if not mm:
+                break
+            try:
+                _d_j = json.loads(mm.group(1))
+                pp = (((_d_j.get('props') or {}).get('pageProps') or {}))
+                mr = pp.get('matchResults') or []
+            except Exception:
+                break
+            for x in mr:
+                mid = x.get('matchId')
+                if not mid or str(x.get('matchStatus')) != '8':
+                    continue
+                if mid not in by_id:
+                    by_id[mid] = x
+            if not pp.get('hasNextPage'):
+                break
+            page += 1
+    if not by_id:
+        return None, ('賽果頁讀取失敗 (可能被網站防護攔截或沒有數據)。'
+                      '解決方法：稍後再試，或改用「賽程連結模式」。')
+
+    def _pair(s, i):
+        try:
+            return int(str(s or '').split('-')[i])
+        except Exception:
+            return None
+
+    def _int(v):
+        try:
+            return int(str(v or '0'))
+        except Exception:
+            return 0
+
+    matches = []
+    for mid, x in by_id.items():
+        try:
+            _ts = int(datetime.strptime(str(x.get('fullMatchTime') or ''), '%Y-%m-%d %H:%M')
+                      .replace(tzinfo=HKT).timestamp())
+        except Exception:
+            continue
+        matches.append({
+            'round': 0, 'day': date_str, 'league': str(x.get('leagueName') or ''),
+            'hkjc_match_id': int(mid),
+            'home': str(x.get('home') or '').strip(), 'away': str(x.get('away') or '').strip(),
+            'match_time': _ts, 'finished': True,
+            'home_goal': _pair(x.get('score'), 0), 'away_goal': _pair(x.get('score'), 1),
+            'home_half': _pair(x.get('halfScore'), 0), 'away_half': _pair(x.get('halfScore'), 1),
+            'home_corner': _pair(x.get('corner'), 0), 'away_corner': _pair(x.get('corner'), 1),
+            'home_red': _int(x.get('homeRedCard')), 'away_red': _int(x.get('awayRedCard')),
+            'home_yellow': _int(x.get('homeYellowCard')), 'away_yellow': _int(x.get('awayYellowCard')),
+        })
+    # 只保留日曆日 D 00:00–23:59 (香港時間) 開賽的比賽
+    t_lo = int(d0.replace(tzinfo=HKT).timestamp())
+    t_hi = t_lo + 24 * 3600 - 1
+    matches = [m for m in matches if t_lo <= (m.get('match_time') or 0) <= t_hi]
+    matches.sort(key=lambda r: r.get('match_time') or 0)
+    if not matches:
+        return None, f'{date_str} 沒有已完場比賽。'
+    return matches, (f'已讀取 {date_str} 全日賽果：{len(matches)} 場已完場比賽 (全部聯賽；'
+                     f'Tipsme 賽果日期為滾動窗口，已自動合併相鄰兩天並以馬會 ID 去重)')
+
+
 # =============================================================================
 # V14.12 自動導入歷史賽事：狀態機 + 執行器 + 設定面板
 #
@@ -7133,6 +7270,48 @@ def _v15_on(step):
     """此 rerun 是否應自動觸發某按鈕分支 (自動模式啟用且目前步驟吻合)"""
     a = st.session_state.get('v15_auto') or {}
     return bool(a.get('active')) and a.get('step') == step
+
+def _v15_mlabel(m):
+    """V15.10：佇列項目的輪次標籤 — 輪次模式「第X輪」；賽果日期模式 (round=0) 顯示日期。"""
+    try:
+        r = int((m or {}).get('round') or 0)
+    except Exception:
+        r = 0
+    if r > 0:
+        return f"第{r}輪"
+    return str((m or {}).get('day') or (m or {}).get('date') or '') or '本場'
+
+def _v15_build_queue_date(sched, df_db, rdate, t0='00:00', t1='23:59'):
+    """V15.10 賽果日期模式：按 日期+時段 過濾比賽並做重複檢查 (與輪次模式同一套
+    重複檢查邏輯：已記錄且全部已結算 → 略過；已記錄待結算 → 仍入佇列自動結算)。
+    回傳佇列 (按開賽時間排序)。"""
+    try:
+        _d = datetime.strptime(str(rdate), '%Y-%m-%d')
+    except Exception:
+        return []
+    def _ts(hhmm):
+        try:
+            _h, _m = str(hhmm).split(':')[:2]
+            return int(_d.replace(hour=int(_h), minute=int(_m), tzinfo=HKT).timestamp())
+        except Exception:
+            return int(_d.replace(tzinfo=HKT).timestamp())
+    _lo, _hi = _ts(t0), _ts(t1)
+    if _lo > _hi:
+        _lo, _hi = _hi, _lo
+    _hi = _hi + 59   # 結束時間含該分鐘 (xx:xx:00–xx:xx:59)
+    q = []
+    for r in sched or []:
+        _mt = r.get('match_time') or 0
+        if not r.get('finished') or not r.get('hkjc_match_id') or not (_lo <= _mt <= _hi):
+            continue
+        _dt = _v15_sched_date(r)
+        _dup = v14_find_duplicate_match(df_db, r['home'], r['away'], _dt, tipsme_id=r.get('hkjc_match_id'))
+        if _dup is not None and not _dup.empty:
+            if not (_dup['Status'].astype(str) == 'Open').any():
+                continue  # 已記錄且全部已結算 → 毋須處理
+        q.append(dict(r))
+    q.sort(key=lambda x: x.get('match_time') or 0)
+    return q
 
 def _v15_sched_date(m):
     try:
@@ -7190,10 +7369,13 @@ def _v15_finish_summary(a):
     if _failed:
         _v15_log(f"📋 共 {len(_failed)} 場需手動處理 (填充或結算失敗，未寫入任何錯誤數據；注單保持 Open)：")
         for _f in _failed[:60]:
-            _v15_log(f"    第{_f.get('round')}輪 {_f.get('home')} vs {_f.get('away')} ({_f.get('stage')}失敗) — "
+            _v15_log(f"    {_v15_mlabel(_f)} {_f.get('home')} vs {_f.get('away')} ({_f.get('stage')}失敗) — "
                      f"請在賽程列表按「填充此場」手動補入後結算")
     a['active'] = False
     _v15_save_remote(a)
+    # V15.11：排程啟動的批次完成 → 在雲端標記 last_run，其他裝置不會重複啟動
+    if a.get('sched') and a.get('rdate'):
+        _v1511_mark_done(a.get('rdate'))
 
 # --- V15.7 自動輸入可靠性：例外續傳 + 跨裝置接手 (純錯誤處理層，不改任何計算) ---
 
@@ -7218,7 +7400,7 @@ def _v15_step_crash(step, exc):
     if a.get('idx', 0) < len(_q):
         _m = _q[a['idx']] or {}
     _msg = f"{type(exc).__name__}: {exc}"
-    _v15_log(a, f"❌ 第{_m.get('round', '?')}輪 {_m.get('home', '?')} vs {_m.get('away', '?')}："
+    _v15_log(a, f"❌ {_v15_mlabel(_m)} {_m.get('home', '?')} vs {_m.get('away', '?')}："
                  f"步驟 {step} 發生未預期錯誤，此場列入待手動處理，繼續下一場 — {_msg}", 'err')
     a.setdefault('failed', []).append({
         'round': _m.get('round'), 'home': _m.get('home'), 'away': _m.get('away'),
@@ -7249,7 +7431,49 @@ def _v15_takeover(_s):
     """V15.7：另一裝置的自動輸入中斷逾 5 分鐘時，本裝置一鍵接手續傳。
     佇列按狀態檔記錄的輪次、以「已完場且未記錄」重建 (與「開始自動輸入」同一套
     重複檢查邏輯，已記錄/已結算的比賽自動略過)；接手後原裝置會因狀態檔 sid 不符
-    自動停止，兩邊不會同時寫入。需先在本裝置貼上同一聯賽的賽程連結。"""
+    自動停止，兩邊不會同時寫入。需先在本裝置貼上同一聯賽的賽程連結。
+    V15.10：日期模式 (mode=date) 接手時自動重新讀取當日賽果重建佇列，毋須貼連結。"""
+    # --- V15.10：賽果日期模式接手 ---
+    if str(_s.get('mode') or '') == 'date':
+        _rdate = str(_s.get('rdate') or '')
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', _rdate):
+            st.warning("狀態檔沒有記錄日期，無法接手；請重新讀取當日賽果後再開始。")
+            return
+        df_db = st.session_state.get('df_db')
+        if df_db is None:
+            st.warning("數據庫尚未載入完成，請稍後再試。")
+            return
+        _t0, _t1 = '00:00', '23:59'
+        try:
+            _w = str(_s.get('win') or '').split('-')
+            if len(_w) == 2 and _w[0].strip() and _w[1].strip():
+                _t0, _t1 = _w[0].strip(), _w[1].strip()
+        except Exception:
+            pass
+        with st.spinner(f"接手：重新讀取 {_rdate} 賽果 ..."):
+            sched, _msg = tipsme_fetch_day_results(_rdate)
+        if not sched:
+            st.warning(f"接手失敗：讀不到 {_rdate} 的賽果 ({_msg})。請手動讀取當日賽果後重新開始。")
+            return
+        st.session_state['tipsme_schedule'] = sched
+        q = _v15_build_queue_date(sched, df_db, _rdate, _t0, _t1)
+        if not q:
+            st.toast("ℹ️ 該時段的比賽已全部記錄，毋須接手。", icon="✅")
+            st.rerun()
+            return
+        st.session_state['v15_auto'] = {
+            'active': True, 'mode': 'date', 'rdate': _rdate, 't0': _t0, 't1': _t1,
+            'rounds': [], 'queue': q, 'idx': 0,
+            'step': 'FILL', 'log': [], 'tries': 0, 'err': 0, 'done': 0, 'bets': 0,
+            'failed': [], 'sid': _v15_new_sid(), 'took_over': True,
+        }
+        _v15_log(st.session_state['v15_auto'],
+                 f"🤝 V15.10 本裝置接手中斷的自動輸入 (日期模式)：{_rdate} {_t0}-{_t1} 重建佇列共 {len(q)} 場未記錄比賽，"
+                 f"從頭掃描續傳 (已記錄/已結算的自動略過)")
+        _v15_save_remote(st.session_state['v15_auto'])
+        st.rerun()
+        return
+    # --- 原有輪次模式 ---
     sched = st.session_state.get('tipsme_schedule') or []
     if not sched:
         st.warning("接手前請先在「賽前建檔與投注」貼上同一聯賽的賽程連結讀取賽程 (與啟動自動輸入時相同)，再按接手。")
@@ -7336,17 +7560,17 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
         _dup = v14_find_duplicate_match(df_db, m['home'], m['away'], _dt, tipsme_id=m.get('hkjc_match_id'))
         if _dup is not None and not _dup.empty:
             if (_dup['Status'].astype(str) == 'Open').any():
-                _v15_log(f"▶️ 第{m['round']}輪 {m['home']} vs {m['away']}：已記錄待結算，直接結算")
+                _v15_log(f"▶️ {_v15_mlabel(m)} {m['home']} vs {m['away']}：已記錄待結算，直接結算")
                 a['step'] = 'SETTLE_READ'
             else:
-                _v15_log(f"⏭️ 第{m['round']}輪 {m['home']} vs {m['away']}：已記錄且已結算，跳過")
+                _v15_log(f"⏭️ {_v15_mlabel(m)} {m['home']} vs {m['away']}：已記錄且已結算，跳過")
                 a['idx'] += 1
             a['tries'] = 0
             _v15_save_remote(a)
             st.rerun()
             return
         _murl = f"https://tipsme.hk/zh-HK/match/{m['hkjc_match_id']}/chat"
-        with st.spinner(f"🤖 自動填充 ({a['idx'] + 1}/{len(q)})：第{m['round']}輪 {m['home']} vs {m['away']} ..."):
+        with st.spinner(f"🤖 自動填充 ({a['idx'] + 1}/{len(q)})：{_v15_mlabel(m)} {m['home']} vs {m['away']} ..."):
             ok, msg, _ = tipsme_auto_fill(_murl, df_db, opts_tournaments, opts_teams)
         if not ok:
             # V15.3 失敗續傳：填充失敗不再整體停止 — 該場列入待手動處理清單，
@@ -7365,7 +7589,7 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
             st.rerun()
             return
         a['err'] = 0
-        _v15_log(f"✅ 已填充 ({a['idx'] + 1}/{len(q)})：第{m['round']}輪 {m['home']} vs {m['away']}")
+        _v15_log(f"✅ 已填充 ({a['idx'] + 1}/{len(q)})：{_v15_mlabel(m)} {m['home']} vs {m['away']}")
         a['step'] = 'ANALYZE'
         a['tries'] = 0
         st.rerun()
@@ -7381,7 +7605,7 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
         # 確保分析有產生有效盤口候選時不會整場空手跳過。
         _picks = res.get('auto_sys') or res.get('picks') or res.get('paper_picks') or []
         if not res.get('v9') or not _picks:
-            _v15_log(f"⚠️ 第{m['round']}輪 {m['home']} vs {m['away']}：分析後沒有可記錄的注項 (無有效盤口)，跳過此場")
+            _v15_log(f"⚠️ {_v15_mlabel(m)} {m['home']} vs {m['away']}：分析後沒有可記錄的注項 (無有效盤口)，跳過此場")
             a['idx'] += 1
             a['step'] = 'FILL'
             a['tries'] = 0
@@ -7394,7 +7618,7 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
     if step in ('SETTLE_READ', 'SETTLE_CONFIRM'):
         _lab = v15_settle_label(df_db, m.get('hkjc_match_id'), m.get('home'), m.get('away'))
         if _lab is None:
-            _v15_log(f"⏭️ 第{m['round']}輪 {m['home']} vs {m['away']}：沒有待結算注單，下一場")
+            _v15_log(f"⏭️ {_v15_mlabel(m)} {m['home']} vs {m['away']}：沒有待結算注單，下一場")
             a['idx'] += 1
             a['step'] = 'FILL'
             a['tries'] = 0
@@ -7418,6 +7642,10 @@ def _v15_save_remote(a):
         _row = {
             'active': '1' if a.get('active') else '0',
             'rounds': ','.join(str(r) for r in (a.get('rounds') or [])),
+            # V15.10：賽果日期模式的接手資訊 (mode=date 時接手裝置自動重讀賽果)
+            'mode': str(a.get('mode') or ''),
+            'rdate': str(a.get('rdate') or ''),
+            'win': (f"{a.get('t0', '00:00')}-{a.get('t1', '23:59')}" if str(a.get('mode')) == 'date' else ''),
             'total': len(a.get('queue') or []),
             'idx': a.get('idx', 0),
             'done': a.get('done', 0),
@@ -7517,6 +7745,144 @@ def v15_render_remote_status():
     else:
         _v15_render_remote_body()
 
+# =============================================================================
+# V15.11 每日自動排程：設定儲存 + 觸發檢查 + 背景 fragment
+# =============================================================================
+
+SCHED_FILE = 'football_schedule_db.csv'
+SCHED_COLUMNS = ['Key', 'Value']
+SCHED_TABLE = 'football_schedule'
+SCHED_DEFAULTS = {'enabled': '0', 'time': '09:30', 't0': '00:00', 't1': '23:59', 'last_run': ''}
+
+def _v1511_sched_load():
+    """讀取排程設定 (雲端 → 本地；session 內 10 分鐘快取，避免頻繁網絡請求)。"""
+    _cache = st.session_state.get('_v1511_sched_cache')
+    if _cache and (get_hkt_now().timestamp() - _cache[0]) < 600:
+        return _cache[1]
+    cfg = dict(SCHED_DEFAULTS)
+    try:
+        df_s = load_db(SCHED_FILE, SCHED_COLUMNS, SCHED_TABLE)
+        if df_s is not None and not df_s.empty:
+            for _, r in df_s.iterrows():
+                k = str(r.get('Key') or '').strip()
+                if k:
+                    cfg[k] = str(r.get('Value') or '')
+    except Exception:
+        pass
+    st.session_state['_v1511_sched_cache'] = (get_hkt_now().timestamp(), cfg)
+    return cfg
+
+def _v1511_sched_save(cfg):
+    """儲存排程設定到雲端 (SQL → GitHub → 本地)。回傳是否成功。"""
+    try:
+        rows = [{'Key': k, 'Value': str(cfg.get(k, ''))} for k in SCHED_DEFAULTS]
+        for k, v in (cfg or {}).items():
+            if k not in SCHED_DEFAULTS:
+                rows.append({'Key': k, 'Value': str(v)})
+        save_db(pd.DataFrame(rows, columns=SCHED_COLUMNS), SCHED_FILE, SCHED_TABLE)
+        st.session_state['_v1511_sched_cache'] = None
+        return True
+    except Exception:
+        return False
+
+def _v1511_mark_done(yday):
+    """排程批次完成 — 在雲端標記 last_run，其他裝置不會重複啟動。"""
+    try:
+        cfg = _v1511_sched_load()
+        if str(cfg.get('last_run') or '') < str(yday):
+            cfg['last_run'] = str(yday)
+            _v1511_sched_save(cfg)
+    except Exception:
+        pass
+
+def _v1511_sched_try_start(df_db):
+    """V15.11 排程觸發檢查：已啟用 + 到達觸發時間 + 前一天賽果未輸入 →
+    自動啟動日期模式自動輸入 (V15.10 既有路徑)。回傳 True 表示已啟動。"""
+    cfg = _v1511_sched_load()
+    if str(cfg.get('enabled')) != '1':
+        return False
+    now = get_hkt_now()
+    yday = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+    if str(cfg.get('last_run') or '') >= yday:
+        return False                      # 昨天已完成 (或已標記)
+    try:
+        _tt = datetime.strptime(str(cfg.get('time') or '09:30'), '%H:%M').time()
+    except Exception:
+        _tt = datetime.strptime('09:30', '%H:%M').time()
+    if now.time() < _tt:
+        return False                      # 未到觸發時間
+    a = st.session_state.get('v15_auto') or {}
+    if a.get('active'):
+        return False                      # 本 session 已有進行中的自動輸入
+    # 其他裝置正在跑 (5 分鐘內有更新) → 不搶；逾 5 分鐘無更新 → 可接手
+    try:
+        _s = _v15_load_remote()
+        if _s and str(_s.get('active')) == '1':
+            if (now.timestamp() - float(_s.get('updated_ts') or 0)) < 300:
+                return False
+    except Exception:
+        pass
+    if df_db is None:
+        return False
+    # 讀取失敗節流：5 分鐘內不重試 (避免 Tipsme 故障時每次 rerun 都打請求)
+    _la = st.session_state.get('_v1511_last_attempt') or 0
+    if (now.timestamp() - _la) < 280:
+        return False
+    sched, _msg = tipsme_fetch_day_results(yday)
+    if not sched:
+        st.session_state['_v1511_last_attempt'] = now.timestamp()
+        return False                      # 讀取失敗 → 5 分鐘後重試
+    st.session_state['tipsme_schedule'] = sched
+    q = _v15_build_queue_date(sched, df_db, yday,
+                              str(cfg.get('t0') or '00:00'), str(cfg.get('t1') or '23:59'))
+    if not q:
+        _v1511_mark_done(yday)            # 前一天已全部記錄 (例如手動輸入過) → 標記完成
+        return False
+    st.session_state['v15_auto'] = {
+        'active': True, 'mode': 'date', 'rdate': yday, 'sched': True,
+        't0': str(cfg.get('t0') or '00:00'), 't1': str(cfg.get('t1') or '23:59'),
+        'rounds': [], 'queue': q, 'idx': 0,
+        'step': 'FILL', 'log': [], 'tries': 0, 'err': 0, 'done': 0, 'bets': 0,
+        'failed': [], 'sid': _v15_new_sid(),
+    }
+    _v15_log(f"⏰ 每日排程自動啟動：{yday} {cfg.get('t0', '00:00')}-{cfg.get('t1', '23:59')} "
+             f"共 {len(q)} 場未記錄的已完場比賽 (填充 → 分析 → 投注 → 結算 全自動)")
+    _v15_save_remote(st.session_state['v15_auto'])
+    return True
+
+def _v1511_sched_body():
+    """V15.11 排程背景檢查 (fragment 每 5 分鐘自動執行；每次頁面載入亦會執行)。"""
+    cfg = _v1511_sched_load()
+    if str(cfg.get('enabled')) != '1':
+        return
+    try:
+        if _v1511_sched_try_start(st.session_state.get('df_db')):
+            st.rerun()
+            return
+    except Exception:
+        pass
+    _now = get_hkt_now()
+    _yday = (_now - timedelta(days=1)).strftime('%Y-%m-%d')
+    if str(cfg.get('last_run') or '') >= _yday:
+        st.caption(f"⏰ 每日排程：{_yday} 賽果已完成自動輸入 ✅ (觸發時間 {cfg.get('time', '09:30')}，"
+                   f"明日自動處理 {_now.strftime('%Y-%m-%d')} 的賽果)")
+    else:
+        st.caption(f"⏰ 每日排程已啟用 — 每日 {cfg.get('time', '09:30')} (香港) 自動讀取前一天 "
+                   f"({_yday}) 全部聯賽賽果並輸入 {cfg.get('t0', '00:00')}-{cfg.get('t1', '23:59')} 時段。"
+                   f"背景檢查每 5 分鐘一次，保持此分頁開啟即可。")
+
+def v1511_render_sched_status():
+    """在頁面頂部渲染排程背景檢查 fragment (與 V15.3 遠端進度橫幅同一模式)。"""
+    try:
+        _frag = st.fragment(run_every=300)
+    except Exception:
+        _frag = None
+    if _frag is not None:
+        _frag(_v1511_sched_body)()
+    else:
+        _v1511_sched_body()
+
+
 def v15_render_auto_panel(df_db):
     """V14.12 設定面板：選輪次 → 開始/停止 → 進度 + 日誌"""
     sched = st.session_state.get('tipsme_schedule') or []
@@ -7524,51 +7890,84 @@ def v15_render_auto_panel(df_db):
         return
     sched, _nd = _tipsme_dedupe_schedule(sched)
     rounds = sorted({r.get('round', 0) for r in sched if (r.get('round') or 0) > 0})
-    if not rounds:
-        return
+    date_mode = not rounds   # V15.10：賽果日期模式 (全部輪次值為 0，按日期時段選擇)
     a = st.session_state.get('v15_auto') or {}
-    with st.expander("🤖 自動導入歷史賽事 (V14.12：填充 → 分析 → 投注 → 結算，全自動逐場處理)",
+    with st.expander("🤖 自動導入歷史賽事 (填充 → 分析 → 投注 → 結算，全自動逐場處理)",
                      expanded=bool(a.get('active'))):
         if not a.get('active'):
-            st.caption("貼上聯賽賽程連結讀取後，選擇輪次 (可選一輪或多輪，例如只選第 4 輪，或選第 4 至 10 輪)，"
-                       "系統即會自動處理所選輪次內所有「已完場且未記錄」的比賽：填充 → 分析 → 系統投注 (含 $0 模擬注) → "
-                       "讀取賽果 (與賽程交叉核對) → 結算 → 學習 → 下一場，直到全部完成。"
-                       "過往賽事用家無法投注，因此只執行系統投注 (用家注碼 $0)。"
-                       "V15.3：單場填充或結算失敗不會停止整個輪次 — 失敗場次會列入待手動處理清單，"
-                       "最後在日誌列出；其他裝置開啟程式可即時看到進度 (唯讀)。")
-        c_r, c_b = st.columns([3, 1])
-        sel_rounds = c_r.multiselect("要自動輸入的輪次 (可多選)",
-                                     rounds, default=[r for r in st.session_state.get('v15_rounds_sel', []) if r in rounds],
-                                     format_func=lambda r: f"第 {r} 輪", key="v15_rounds_sel")
-        if not a.get('active') and c_b.button("▶️ 開始自動輸入", key="v15_start_btn", type="primary", use_container_width=True):
-            if not sel_rounds:
-                st.warning("請先選擇至少一個輪次。")
+            if date_mode:
+                st.caption("📆 賽果日期模式：上方已讀取某日的全部聯賽賽果。選擇時段 (香港時間) 後按開始，"
+                           "系統即會自動處理該時段內所有「已完場且未記錄」的比賽：填充 → 分析 → 系統投注 (含 $0 模擬注) → "
+                           "讀取賽果 (與賽果頁交叉核對) → 結算 → 學習 → 下一場，直到全部完成。"
+                           "過往賽事用家無法投注，因此只執行系統投注 (用家注碼 $0)。"
+                           "適合每日批量輸入前一天的賽事，實行前向驗證。"
+                           "V15.3：單場填充或結算失敗不會停止 — 失敗場次會列入待手動處理清單，最後在日誌列出。")
             else:
-                q = []
-                for r in sched:
-                    if (r.get('round') or 0) not in sel_rounds or not r.get('finished') or not r.get('hkjc_match_id'):
-                        continue
-                    _dt = _v15_sched_date(r)
-                    _dup = v14_find_duplicate_match(df_db, r['home'], r['away'], _dt, tipsme_id=r.get('hkjc_match_id'))
-                    if _dup is not None and not _dup.empty:
-                        if not (_dup['Status'].astype(str) == 'Open').any():
-                            continue  # 已記錄且全部已結算 → 毋須處理
-                        # 已記錄但待結算 → 仍加入佇列；執行器會自動跳到結算步驟
-                    q.append(dict(r))
-                q.sort(key=lambda x: (x.get('round') or 0, x.get('match_time') or 0))
+                st.caption("貼上聯賽賽程連結讀取後，選擇輪次 (可選一輪或多輪，例如只選第 4 輪，或選第 4 至 10 輪)，"
+                           "系統即會自動處理所選輪次內所有「已完場且未記錄」的比賽：填充 → 分析 → 系統投注 (含 $0 模擬注) → "
+                           "讀取賽果 (與賽程交叉核對) → 結算 → 學習 → 下一場，直到全部完成。"
+                           "過往賽事用家無法投注，因此只執行系統投注 (用家注碼 $0)。"
+                           "V15.3：單場填充或結算失敗不會停止整個輪次 — 失敗場次會列入待手動處理清單，"
+                           "最後在日誌列出；其他裝置開啟程式可即時看到進度 (唯讀)。")
+        if date_mode:
+            # --- V15.10 賽果日期模式：時段選擇 (預設全日 00:00–23:59) ---
+            _rday = (sched[0].get('day') if sched and sched[0].get('day') else '') or \
+                    (datetime.fromtimestamp(sched[0]['match_time'], HKT).strftime('%Y-%m-%d') if sched and sched[0].get('match_time') else '')
+            c_t0, c_t1, c_b = st.columns([1, 1, 1.2])
+            _wt0 = c_t0.time_input("開始時間", value=st.session_state.get('v15_win_t0', datetime.strptime('00:00', '%H:%M').time()),
+                                   key="v15_win_t0")
+            _wt1 = c_t1.time_input("結束時間", value=st.session_state.get('v15_win_t1', datetime.strptime('23:59', '%H:%M').time()),
+                                   key="v15_win_t1")
+            if not a.get('active') and c_b.button("▶️ 開始自動輸入 (此時段)", key="v15_start_btn", type="primary", use_container_width=True):
+                _t0s, _t1s = _wt0.strftime('%H:%M'), _wt1.strftime('%H:%M')
+                q = _v15_build_queue_date(sched, df_db, _rday, _t0s, _t1s)
                 if not q:
-                    st.warning("所選輪次沒有需要處理的比賽 (已完場的全部已記錄且已結算)。")
+                    st.warning(f"{_rday} {_t0s}-{_t1s} 沒有需要處理的比賽 (已完場的全部已記錄且已結算)。")
                 else:
                     st.session_state['v15_auto'] = {
-                        'active': True, 'rounds': list(sel_rounds), 'queue': q, 'idx': 0,
+                        'active': True, 'mode': 'date', 'rdate': _rday, 't0': _t0s, 't1': _t1s,
+                        'rounds': [], 'queue': q, 'idx': 0,
                         'step': 'FILL', 'log': [], 'tries': 0, 'err': 0, 'done': 0, 'bets': 0,
                         'failed': [], 'sid': _v15_new_sid(),
                     }
-                    _rs = f"第 {min(sel_rounds)} 輪" if len(sel_rounds) == 1 else f"第 {min(sel_rounds)}-{max(sel_rounds)} 輪"
-                    _v15_log(f"🚀 開始自動輸入：{_rs}共 {len(q)} 場未記錄的已完場比賽")
-                    _v15_log("ℹ️ V15.3：單場失敗不會停止整個輪次 — 失敗場次最後會列出待手動處理。")
+                    _v15_log(f"🚀 開始自動輸入 (日期模式)：{_rday} {_t0s}-{_t1s} 共 {len(q)} 場未記錄的已完場比賽")
+                    _v15_log("ℹ️ V15.3：單場失敗不會停止 — 失敗場次最後會列出待手動處理。")
                     _v15_save_remote(st.session_state['v15_auto'])
                     st.rerun()
+        else:
+            c_r, c_b = st.columns([3, 1])
+            sel_rounds = c_r.multiselect("要自動輸入的輪次 (可多選)",
+                                         rounds, default=[r for r in st.session_state.get('v15_rounds_sel', []) if r in rounds],
+                                         format_func=lambda r: f"第 {r} 輪", key="v15_rounds_sel")
+            if not a.get('active') and c_b.button("▶️ 開始自動輸入", key="v15_start_btn", type="primary", use_container_width=True):
+                if not sel_rounds:
+                    st.warning("請先選擇至少一個輪次。")
+                else:
+                    q = []
+                    for r in sched:
+                        if (r.get('round') or 0) not in sel_rounds or not r.get('finished') or not r.get('hkjc_match_id'):
+                            continue
+                        _dt = _v15_sched_date(r)
+                        _dup = v14_find_duplicate_match(df_db, r['home'], r['away'], _dt, tipsme_id=r.get('hkjc_match_id'))
+                        if _dup is not None and not _dup.empty:
+                            if not (_dup['Status'].astype(str) == 'Open').any():
+                                continue  # 已記錄且全部已結算 → 毋須處理
+                            # 已記錄但待結算 → 仍加入佇列；執行器會自動跳到結算步驟
+                        q.append(dict(r))
+                    q.sort(key=lambda x: (x.get('round') or 0, x.get('match_time') or 0))
+                    if not q:
+                        st.warning("所選輪次沒有需要處理的比賽 (已完場的全部已記錄且已結算)。")
+                    else:
+                        st.session_state['v15_auto'] = {
+                            'active': True, 'rounds': list(sel_rounds), 'queue': q, 'idx': 0,
+                            'step': 'FILL', 'log': [], 'tries': 0, 'err': 0, 'done': 0, 'bets': 0,
+                            'failed': [], 'sid': _v15_new_sid(),
+                        }
+                        _rs = f"第 {min(sel_rounds)} 輪" if len(sel_rounds) == 1 else f"第 {min(sel_rounds)}-{max(sel_rounds)} 輪"
+                        _v15_log(f"🚀 開始自動輸入：{_rs}共 {len(q)} 場未記錄的已完場比賽")
+                        _v15_log("ℹ️ V15.3：單場失敗不會停止整個輪次 — 失敗場次最後會列出待手動處理。")
+                        _v15_save_remote(st.session_state['v15_auto'])
+                        st.rerun()
         if a.get('active'):
             if st.button("⏹️ 停止自動輸入", key="v15_stop_btn", use_container_width=True):
                 a['active'] = False
@@ -7585,7 +7984,7 @@ def v15_render_auto_panel(df_db):
             c_p5.metric("目前步驟", {'FILL': '填充', 'ANALYZE': '分析', 'BET': '投注',
                                     'SETTLE_READ': '讀取賽果', 'SETTLE_CONFIRM': '結算'}.get(a.get('step'), '-'))
             if m:
-                st.caption(f"正在處理：**第 {m['round']} 輪 — {m['home']} vs {m['away']}**"
+                st.caption(f"正在處理：**{_v15_mlabel(m)} — {m['home']} vs {m['away']}**"
                            f" (完 {m.get('home_goal')}-{m.get('away_goal')})")
         if a.get('log'):
             st.caption("執行日誌 (最新在最上)：")
@@ -7633,6 +8032,24 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
         st.caption("💡 賽程頁一條連結已內嵌整季全部輪次 (R1 至最後一輪) 的比賽：主客隊、開賽時間、馬會比賽 ID，"
                    "以及已完場比賽的賽果 (入球、半場、角球、紅黃牌)。讀取一次後，下方按輪次選擇比賽，"
                    "逐場按「填充此場」即等同貼上該場比賽鏈結，之後的分析、下注、結算流程完全不變。")
+
+        # --- V15.10 賽果日期模式：按日期讀取全部聯賽的已完場比賽 ---
+        st.markdown("**📆 賽果日期模式 (跨全部聯賽，適合每日批量輸入前一天賽事)**")
+        c_d, c_b2 = st.columns([2, 1])
+        _yday = (get_hkt_now() - timedelta(days=1)).date()
+        res_date = c_d.date_input("賽果日期 (香港時間，預設昨天)", value=_yday, key="tipsme_res_date")
+        if c_b2.button("📆 讀取當日賽果", key="tipsme_res_btn", type="primary", use_container_width=True):
+            with st.spinner("讀取賽果頁 (全部聯賽，約 10 數個分頁) ..."):
+                _rm, _rmsg = tipsme_fetch_day_results(res_date.strftime('%Y-%m-%d'))
+            if _rm:
+                st.session_state['tipsme_schedule'] = _rm
+                st.toast("✅ " + _rmsg, icon="📆")
+                st.rerun()
+            else:
+                st.error(_rmsg)
+        st.caption("💡 讀取所選日期 00:00–23:59 (香港時間) 全部聯賽的已完場比賽 (約 80–120 場)，"
+                   "含主客隊、開賽時間、馬會比賽 ID 及賽果。讀取後到下方「自動導入歷史賽事」選擇時段，"
+                   "即可全自動處理：填充 → 分析 → 投注 → 結算。適合每日輸入前一天的賽事，實行前向驗證。")
         sched = st.session_state.get('tipsme_schedule')
         if sched:
             # V14.10：顯示前同樣去重 (涵蓋去重功能推出前已讀入 session 的舊賽程數據)
@@ -7648,75 +8065,113 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
                             f"右側狀態 = 資料庫記錄進度：✅ 賽果已結算 / 📝 已記錄待結算 / "
                             f"<span style='color:#b45309'>⚠️ 未記錄</span>",
                             unsafe_allow_html=True)
-                for r in rm:
-                    c_m, c_b, c_s = st.columns([4, 1, 1])
-                    _ko = ''
-                    try:
-                        _ko = datetime.fromtimestamp(r['match_time'], HKT).strftime('%m-%d %H:%M')
-                    except Exception:
-                        pass
-                    # V14.5：此場在資料庫的記錄狀態 (同隊伍+同日期的注單)
-                    _st_dt = None
-                    try:
-                        _st_dt = datetime.fromtimestamp(r['match_time'], HKT).date() if r.get('match_time') else None
-                    except Exception:
-                        pass
-                    # V14.7：同時以 Tipsme 比賽 ID 比對 — 賽程頁譯名 (加泰) 與比賽頁譯名 (基達菲) 可能不同
-                    _rec = v14_find_duplicate_match(df_db, r['home'], r['away'], _st_dt,
-                                                    tipsme_id=r.get('hkjc_match_id'))
-                    # V14.6：三種記錄狀態都明確顯示，不再以「空白」代表未記錄
-                    _settled_all = False
-                    if _rec is not None and not _rec.empty:
-                        _sts = set(_rec['Status'].astype(str))
-                        _settled_all = bool(_sts and _sts.issubset({'Settled'}))
-                        _st_badge = '✅ **賽果已結算**' if _settled_all else '📝 已記錄 · 待結算'
-                    elif r['finished']:
-                        # 已完場但資料庫未有記錄 — 最需要跟進的一種，橙色突出顯示
-                        _st_badge = "<span style='color:#b45309'>⚠️ **未記錄**</span>"
+            else:
+                # V15.10 賽果日期模式：不分輪次，直接列出全部已完場比賽
+                rm = sched
+                st.markdown(f"**賽果日期模式：共 {len(rm)} 場已完場比賽 (全部聯賽)** "
+                            f"<span style='color:#8f959e'>灰色 = 已完場且已結算 (毋須跟進)</span> · "
+                            f"黑色 = 未記錄 / 待結算 (需要跟進) · "
+                            f"右側狀態 = 資料庫記錄進度：✅ 賽果已結算 / 📝 已記錄待結算 / "
+                            f"<span style='color:#b45309'>⚠️ 未記錄</span>",
+                            unsafe_allow_html=True)
+            for r in rm:
+                c_m, c_b, c_s = st.columns([4, 1, 1])
+                _ko = ''
+                try:
+                    _ko = datetime.fromtimestamp(r['match_time'], HKT).strftime('%m-%d %H:%M')
+                except Exception:
+                    pass
+                # V14.5：此場在資料庫的記錄狀態 (同隊伍+同日期的注單)
+                _st_dt = None
+                try:
+                    _st_dt = datetime.fromtimestamp(r['match_time'], HKT).date() if r.get('match_time') else None
+                except Exception:
+                    pass
+                # V14.7：同時以 Tipsme 比賽 ID 比對 — 賽程頁譯名 (加泰) 與比賽頁譯名 (基達菲) 可能不同
+                _rec = v14_find_duplicate_match(df_db, r['home'], r['away'], _st_dt,
+                                                tipsme_id=r.get('hkjc_match_id'))
+                # V14.6：三種記錄狀態都明確顯示，不再以「空白」代表未記錄
+                _settled_all = False
+                if _rec is not None and not _rec.empty:
+                    _sts = set(_rec['Status'].astype(str))
+                    _settled_all = bool(_sts and _sts.issubset({'Settled'}))
+                    _st_badge = '✅ **賽果已結算**' if _settled_all else '📝 已記錄 · 待結算'
+                elif r['finished']:
+                    # 已完場但資料庫未有記錄 — 最需要跟進的一種，橙色突出顯示
+                    _st_badge = "<span style='color:#b45309'>⚠️ **未記錄**</span>"
+                else:
+                    _st_badge = "<span style='color:#9e9e9e'>未記錄</span>"
+                if r['finished']:
+                    # V14.9：只有「已完場且已結算」才灰色 (毋須跟進)；
+                    # 已完場但未記錄或待結算保持黑色 — 需要跟進，不會被灰色淹沒
+                    _res = (f"完 {r['home_goal']}-{r['away_goal']} (半 {r['home_half']}-{r['away_half']}, "
+                            f"角 {r['home_corner']}-{r['away_corner']}, 紅 {r['home_red']}-{r['away_red']})")
+                    if _settled_all:
+                        _line = (f"<span style='color:#8f959e'>{r['home']} vs {r['away']} · {_ko} · {_res}</span>")
+                        c_m.markdown(_line, unsafe_allow_html=True)
                     else:
-                        _st_badge = "<span style='color:#9e9e9e'>未記錄</span>"
-                    if r['finished']:
-                        # V14.9：只有「已完場且已結算」才灰色 (毋須跟進)；
-                        # 已完場但未記錄或待結算保持黑色 — 需要跟進，不會被灰色淹沒
-                        _res = (f"完 {r['home_goal']}-{r['away_goal']} (半 {r['home_half']}-{r['away_half']}, "
-                                f"角 {r['home_corner']}-{r['away_corner']}, 紅 {r['home_red']}-{r['away_red']})")
-                        if _settled_all:
-                            _line = (f"<span style='color:#8f959e'>{r['home']} vs {r['away']} · {_ko} · {_res}</span>")
-                            c_m.markdown(_line, unsafe_allow_html=True)
-                        else:
-                            _line = f"**{r['home']} vs {r['away']}** · {_ko} · {_res}"
-                            c_m.markdown(_line)
-                    else:
-                        _line = f"🕒 **{r['home']} vs {r['away']}** · {_ko} · 未開賽"
+                        _line = f"**{r['home']} vs {r['away']}** · {_ko} · {_res}"
                         c_m.markdown(_line)
-                    c_s.markdown(_st_badge, unsafe_allow_html=True)
-                    if r.get('hkjc_match_id'):
-                        if c_b.button("填充此場", key=f"sched_fill_{r['hkjc_match_id']}", use_container_width=True):
-                            # V14.4：先檢查資料庫是否已有此比賽記錄，避免重複記錄
-                            _dup_dt = None
-                            try:
-                                _dup_dt = datetime.fromtimestamp(r['match_time'], HKT).date() if r.get('match_time') else None
-                            except Exception:
-                                pass
-                            _dup = v14_find_duplicate_match(df_db, r['home'], r['away'], _dup_dt,
-                                                            tipsme_id=r.get('hkjc_match_id'))
-                            if _dup is not None and not _dup.empty:
-                                st.warning(f"⚠️ 資料庫已有此比賽的記錄 ({len(_dup)} 張注單，ID: "
-                                           f"{', '.join(_dup['ID'].astype(str).head(5))})，已略過填充以避免重複記錄。"
-                                           f"如確實要為此場加新注單，請直接貼上該場比賽鏈結。")
+                else:
+                    _line = f"🕒 **{r['home']} vs {r['away']}** · {_ko} · 未開賽"
+                    c_m.markdown(_line)
+                c_s.markdown(_st_badge, unsafe_allow_html=True)
+                if r.get('hkjc_match_id'):
+                    if c_b.button("填充此場", key=f"sched_fill_{r['hkjc_match_id']}", use_container_width=True):
+                        # V14.4：先檢查資料庫是否已有此比賽記錄，避免重複記錄
+                        _dup_dt = None
+                        try:
+                            _dup_dt = datetime.fromtimestamp(r['match_time'], HKT).date() if r.get('match_time') else None
+                        except Exception:
+                            pass
+                        _dup = v14_find_duplicate_match(df_db, r['home'], r['away'], _dup_dt,
+                                                        tipsme_id=r.get('hkjc_match_id'))
+                        if _dup is not None and not _dup.empty:
+                            st.warning(f"⚠️ 資料庫已有此比賽的記錄 ({len(_dup)} 張注單，ID: "
+                                       f"{', '.join(_dup['ID'].astype(str).head(5))})，已略過填充以避免重複記錄。"
+                                       f"如確實要為此場加新注單，請直接貼上該場比賽鏈結。")
+                        else:
+                            _murl = f"https://tipsme.hk/zh-HK/match/{r['hkjc_match_id']}/chat"
+                            ok, msg2, _ = tipsme_auto_fill(_murl, df_db, opts_tournaments, opts_teams)
+                            if ok:
+                                st.toast(f"✅ 已填充：{r['home']} vs {r['away']}", icon="🔗")
+                                st.rerun()
                             else:
-                                _murl = f"https://tipsme.hk/zh-HK/match/{r['hkjc_match_id']}/chat"
-                                ok, msg2, _ = tipsme_auto_fill(_murl, df_db, opts_tournaments, opts_teams)
-                                if ok:
-                                    st.toast(f"✅ 已填充：{r['home']} vs {r['away']}", icon="🔗")
-                                    st.rerun()
-                                else:
-                                    st.error(msg2)
-                    else:
-                        c_b.caption("無馬會盤")
+                                st.error(msg2)
+                else:
+                    c_b.caption("無馬會盤")
 
-                # V14.12：自動導入歷史賽事設定面板 (選輪次 → 全自動逐場處理)
-                v15_render_auto_panel(df_db)
+            # V14.12：自動導入歷史賽事設定面板 (選輪次 → 全自動逐場處理)
+            v15_render_auto_panel(df_db)
+
+        # --- V15.11 每日自動排程設定 (獨立於投注策略設定，儲存於 football_schedule_db.csv) ---
+        with st.expander("⏰ 每日自動排程 (定時自動讀取前一天賽果並輸入)"):
+            _cfg = _v1511_sched_load()
+            _en = st.checkbox("啟用每日自動排程", value=str(_cfg.get('enabled')) == '1', key="v1511_en")
+            _ct, _c0, _c1 = st.columns(3)
+            _tm = _ct.time_input("觸發時間 (香港)", key="v1511_time",
+                                 value=datetime.strptime(str(_cfg.get('time') or '09:30'), '%H:%M').time())
+            _w0 = _c0.time_input("時段開始", key="v1511_t0",
+                                 value=datetime.strptime(str(_cfg.get('t0') or '00:00'), '%H:%M').time())
+            _w1 = _c1.time_input("時段結束", key="v1511_t1",
+                                 value=datetime.strptime(str(_cfg.get('t1') or '23:59'), '%H:%M').time())
+            if st.button("💾 儲存排程設定", key="v1511_save", use_container_width=True):
+                _new_cfg = {'enabled': '1' if _en else '0',
+                            'time': _tm.strftime('%H:%M'), 't0': _w0.strftime('%H:%M'),
+                            't1': _w1.strftime('%H:%M'),
+                            'last_run': str(_cfg.get('last_run') or '')}
+                if _v1511_sched_save(_new_cfg):
+                    st.toast("✅ 排程已儲存到雲端，所有裝置同步生效。", icon="⏰")
+                    st.rerun()
+                else:
+                    st.error("排程儲存失敗，請再試一次。")
+            st.caption("💡 運作原理：到達觸發時間後，任何開啟著程式的裝置會自動讀取前一天 (香港時間日曆日) "
+                       "全部聯賽的已完場賽果，按所選時段自動輸入 (填充 → 分析 → 投注 → 結算 → 學習)。"
+                       "完成後在雲端標記，不會重複；中斷自動續傳 (已記錄的自動略過)。"
+                       "背景檢查每 5 分鐘一次 — 保持至少一部裝置的分頁開啟即可 (與自動輸入相同)；"
+                       "若觸發時間時全部分頁關閉，下次開啟程式會立即補跑。"
+                       f"目前狀態：{'✅ 已啟用' if str(_cfg.get('enabled')) == '1' else '未啟用'} · "
+                       f"上次完成日期：{_cfg.get('last_run') or '未執行'}")
 
         fd = st.session_state.get('tipsme_fill_data')
         if fd:
@@ -8975,6 +9430,7 @@ def main():
 
     # V15.3：其他裝置的即時進度 (唯讀，每 10 秒自動更新；本 session 正在跑時不顯示)
     v15_render_remote_status()
+    v1511_render_sched_status()   # V15.11：每日排程背景檢查 (每 5 分鐘)
 
     t_pre, t_inplay, t_settle, t_ai, t_time_pnl, t_clv = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖ 賽果結算與管理", "🤖 全局模型", "📅 時間維度盈虧記錄分析", "🎯 CLV 與本金模擬"])
 
