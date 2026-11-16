@@ -10,6 +10,35 @@ import itertools
 from datetime import datetime, timedelta, timezone
 
 # ==============================================================================
+# V15.9 資料庫同步修復 (120 秒超時 + 覆蓋保護) — 2026-11-16
+#
+#   背景 (2026-11-15/16)：手機自動輸入時賽果明明已結算，頁面更新或訊號不佳
+#   後「已結算又變回未記錄」。根因 — V15.7 起所有 GitHub 請求統一 15 秒超時，
+#   而 football_betting_db.csv 已達 42MB：整檔 PUT 上傳遠超 15 秒，幾乎必敗
+#   (11-15 全日僅 18:32 成功一次)。save_db 寫入順序 SQL→雲端→本地：雲端上傳
+#   失敗後本地容器照常寫入，畫面看似正常，但雲端仍是舊檔；一旦容器重啟，
+#   load_db 從雲端拉回舊檔，「新結算的賽事全部消失」。另外 18:32 那次成功
+#   上傳，實為「舊 session 快照整檔覆蓋」，把雲端既有的 Open 注單覆蓋刪除。
+#
+#   V15.9.1 GITHUB_TIMEOUT_DB = 120：主資料庫上傳/下載單獨放寬至 120 秒
+#   (其餘小檔維持 15 秒不變)，逾時仍自動重試一次。
+#
+#   V15.9.2 覆蓋保護 (合併優先，絕不盲目整檔覆蓋)：save_db_github 覆寫主資料
+#   庫前先查雲端最新 sha — 與本 session 載入時記下的 sha 比對；不一致代表
+#   其他裝置/session 已寫入，先下載雲端與本地做 ID 聯集合併 (重複 ID 以雲端
+#   已結算紀錄優先、Open 注單保留雲端版本、本地獨有列全保留) 再上傳。
+#
+#   V15.9.3 側邊欄醒目警示：雲端同步連續失敗時顯示紅色警告 (提醒立即下載
+#   報表備份並保持分頁開啟)；發生自動合併時顯示藍色提示；成功後自動消失。
+#
+#   V15.9.4 設定檔覆蓋保護：v10_save_settings 只把「本 session 真正改過的
+#   鍵」寫回雲端，未改動的鍵跟隨雲端現值；LS|/IGN| 累積紀錄與雲端取聯集 —
+#   修復「V10 設定改完又自己變回去」(舊分頁快照整檔覆蓋其他裝置的設定)。
+#
+#   風險評估：零。所有改動在「雲端同步通訊層」與「警示層」— 120 秒超時只
+#   影響上傳成功率 (更高)，合併邏輯只增不減 (雲端獨有列全保留)。學習引擎、
+#   結算、風控、投注建議計算路徑零改動。
+# ==============================================================================
 # V15.8 LR 落注閘門 (凍結邏輯回歸模型 — 前向驗證中，不會自動重訓)
 #
 #   背景 (2026-11-15)：2,863 注全量覆盤 — 系統整體命中率 50.4% (打和線 52.6%)、
@@ -502,37 +531,109 @@ CATEGORY_OPTIONS = ["國內聯賽 (Domestic League)", "國際聯賽 (Internation
 # V15.7：所有 GitHub 請求統一 15 秒超時 + 重試一次 — 舊版無超時，一旦請求卡住，
 # 自動輸入整個流程會無限期凍結 (2026-11-14 挪威聯賽自動輸入靜默中斷的根因之一)。
 GITHUB_TIMEOUT = 15
+# V15.9：主資料庫 (football_betting_db.csv，42MB+) 的上傳/下載超時。
+# V15.7 的 15 秒對 42MB 檔案幾乎必然失敗 — 11-14 (V15.6 無超時) 時 DB 每 1-4 分鐘
+# 成功 commit 一次，V15.7/15.8 之後 26 小時僅成功 1 次，自動輸入的注單/結算全部
+# 只落在容器本地檔案，頁面一刷新新 session 載入 GitHub 舊版 → 結算記錄「消失」。
+GITHUB_TIMEOUT_DB = 120
 
-def _gh_request(method, url, token, *, accept=None, json_body=None):
-    """V15.7：GitHub API 請求統一帶 15 秒超時，失敗重試一次，仍失敗回傳 None。
+def _gh_is_big_file(path):
+    """V15.9：主資料庫檔案 (需要 120 秒長超時 + 覆蓋保護)。"""
+    return str(path).endswith('football_betting_db.csv')
+
+def _gh_request(method, url, token, *, accept=None, json_body=None, timeout=None):
+    """V15.7：GitHub API 請求統一帶超時，失敗重試一次，仍失敗回傳 None。
+    V15.9：timeout 可由呼叫方指定 (主資料庫用 120 秒)，未指定時維持 15 秒。
     呼叫方按既有邏輯處理 None (load 回退本地檔案 / save 顯示同步失敗)，行為不變。"""
+    _to = timeout or GITHUB_TIMEOUT
     headers = {"Authorization": f"token {token}", "Cache-Control": "no-cache"}
     if accept:
         headers["Accept"] = accept
     for _attempt in range(2):
         try:
             if method == "GET":
-                return requests.get(url, headers=headers, timeout=GITHUB_TIMEOUT)
-            return requests.put(url, headers=headers, json=json_body, timeout=GITHUB_TIMEOUT)
+                return requests.get(url, headers=headers, timeout=_to)
+            return requests.put(url, headers=headers, json=json_body, timeout=_to)
         except Exception:
             continue
     return None
 
-def load_db_github(repo, path, token):
+def load_db_github(repo, path, token, timeout=None, record_sha_key=None):
     timestamp = int(get_hkt_now().timestamp())
     url = f"https://api.github.com/repos/{repo}/contents/{path}?t={timestamp}"
-    res = _gh_request("GET", url, token, accept="application/vnd.github.v3.raw")
+    res = _gh_request("GET", url, token, accept="application/vnd.github.v3.raw", timeout=timeout)
     if res is not None and res.status_code == 200:
+        # V15.9：記下雲端檔案目前的 sha，供 save_db_github 覆蓋保護比對
+        # (對 >1MB 檔案 GitHub 的 JSON 端點只回中繼資料不含內容，很快)
+        if record_sha_key:
+            try:
+                res_j = _gh_request("GET", f"https://api.github.com/repos/{repo}/contents/{path}", token)
+                if res_j is not None and res_j.status_code == 200:
+                    _sha159 = res_j.json().get("sha")
+                    if _sha159:
+                        st.session_state[record_sha_key] = _sha159
+            except Exception:
+                pass
         return pd.read_csv(io.StringIO(res.text))
     return None
+
+def _v159_merge_db(cloud_df, ours_df):
+    """V15.9 覆蓋保護：雲端與本地快照分岔時的注單 ID 聯集合併。
+    - 雲端獨有 ID → 其他 session 寫入的新注單，保留；
+    - 本地獨有 ID → 本 session 寫入的新注單，保留；
+    - 共同 ID → 已結算 (Settled) 優先於未結算 (Open)；同狀態時以本 session 版本為準。
+    任何例外 → 回傳本地版本 (絕不因合併失敗而丟失本 session 數據)。
+    (2026-11-15 18:32 事故：持舊快照的 session 成功上傳，把雲端一筆 Open 注單覆蓋掉)"""
+    try:
+        if cloud_df is None or cloud_df.empty:
+            return ours_df
+        if ours_df is None or ours_df.empty:
+            return cloud_df
+        cloud = enforce_columns(cloud_df.copy(), DB_COLUMNS)
+        ours = enforce_columns(ours_df.copy(), DB_COLUMNS)
+        cloud_ids = set(cloud['ID'].astype(str))
+        ours_ids = set(ours['ID'].astype(str))
+        cloud_rows = {str(r['ID']): r for _, r in cloud.iterrows()}
+        keep, extra = [], []
+        for _, r in ours.iterrows():
+            c = cloud_rows.get(str(r['ID']))
+            if c is None:
+                keep.append(r)                      # 本 session 新注單
+            elif str(r.get('Status') or '') != 'Settled' and str(c.get('Status') or '') == 'Settled':
+                extra.append(c)                     # 雲端已結算、本地仍 Open → 用雲端版本
+            else:
+                keep.append(r)                      # 本地已結算或同狀態 → 本地優先
+        for _rid, c in cloud_rows.items():
+            if _rid not in ours_ids:
+                extra.append(c)                     # 其他 session 新注單 → 保留
+        merged = pd.DataFrame([r.to_dict() for r in keep] + [c.to_dict() for c in extra])
+        return enforce_columns(merged, DB_COLUMNS)
+    except Exception:
+        return ours_df
 
 def save_db_github(df, repo, path, token):
     timestamp = int(get_hkt_now().timestamp())
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
-    res_get = _gh_request("GET", f"{url}?t={timestamp}", token)
+    _big159 = _gh_is_big_file(path)
+    _to159 = GITHUB_TIMEOUT_DB if _big159 else GITHUB_TIMEOUT
+    res_get = _gh_request("GET", f"{url}?t={timestamp}", token, timeout=_to159)
     sha = res_get.json().get("sha") if (res_get is not None and res_get.status_code == 200) else None
 
+    # V15.9 覆蓋保護 (主資料庫)：上傳前先偵測雲端是否已被其他 session 寫入
+    # (雲端 sha ≠ 本 session 載入時記下的 sha，或本 session 來源不明/本地後備載入)，
+    # 是的話先下載雲端版本做 ID 聯集合併，絕不把舊快照整檔覆蓋上去。
+    if _big159 and sha is not None and st.session_state.get('_gh_db_load_sha') != sha:
+        try:
+            cloud_df = load_db_github(repo, path, token, timeout=GITHUB_TIMEOUT_DB)
+            if cloud_df is not None and not cloud_df.empty:
+                df = _v159_merge_db(cloud_df, df)
+                st.session_state['_gh_merge_count'] = int(st.session_state.get('_gh_merge_count', 0) or 0) + 1
+        except Exception:
+            pass
+
     csv_content = df.to_csv(index=False)
+    if len(csv_content) > 2_000_000:
+        _to159 = GITHUB_TIMEOUT_DB
     content_b64 = base64.b64encode(csv_content.encode("utf-8")).decode("utf-8")
 
     payload = {
@@ -542,8 +643,18 @@ def save_db_github(df, repo, path, token):
     if sha:
         payload["sha"] = sha
 
-    res = _gh_request("PUT", url, token, json_body=payload)
-    return res is not None and res.status_code in [200, 201]
+    res = _gh_request("PUT", url, token, json_body=payload, timeout=_to159)
+    if res is not None and res.status_code in [200, 201]:
+        # V15.9：記下新版本 sha 作為本 session 後續儲存的比對基準
+        if _big159:
+            try:
+                _new_sha159 = res.json().get('content', {}).get('sha')
+                if _new_sha159:
+                    st.session_state['_gh_db_load_sha'] = _new_sha159
+            except Exception:
+                pass
+        return True
+    return False
 
 def process_legacy_columns(df):
     """處理舊資料庫欄位轉移防呆"""
@@ -591,7 +702,11 @@ def load_db(filename, columns, table_name, force_cloud=False):
     # 其次從 GitHub 雲端倉庫讀取
     if df.empty and _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO"):
         try:
-            gh_df = load_db_github(st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
+            # V15.9：主資料庫用 120 秒超時下載，並記下雲端 sha 供覆蓋保護比對
+            _big159 = _gh_is_big_file(filename)
+            gh_df = load_db_github(st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"],
+                                   timeout=GITHUB_TIMEOUT_DB if _big159 else None,
+                                   record_sha_key='_gh_db_load_sha' if _big159 else None)
             if gh_df is not None and not gh_df.empty:
                 df = process_legacy_columns(gh_df)
         except Exception:
@@ -633,8 +748,11 @@ def save_db(df, filename, table_name):
     # 2. 寫入 GitHub 雲端倉庫
     if _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO"):
         try:
-            save_db_github(df, st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
+            _ok159 = save_db_github(df, st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
+            # V15.9：同步失敗不再靜默 — 側邊欄顯示連續失敗警告，成功後自動清除
+            st.session_state['_gh_sync_fail'] = 0 if _ok159 else int(st.session_state.get('_gh_sync_fail', 0) or 0) + 1
         except Exception as e:
+            st.session_state['_gh_sync_fail'] = int(st.session_state.get('_gh_sync_fail', 0) or 0) + 1
             st.error(f"GitHub 雲端同步失敗: {e}")
 
     # 3. 寫入本地 CSV
@@ -4288,15 +4406,48 @@ def v10_load_settings_into_state():
         st.session_state[k] = v
     st.session_state['_v10_settings_loaded'] = True
     st.session_state['_v10_settings_saved'] = bool(saved)
+    # V15.9：記下載入時的設定快照 — v10_save_settings 只把「本 session 真正改過的鍵」
+    # 寫回雲端，未動過的鍵跟隨雲端現值，避免舊分頁把其他裝置剛儲存的設定沖走
+    # (2026-11-15「改了又自己變回去」事故的根因)。
+    st.session_state['_v10_settings_base'] = {k: str(st.session_state.get(k, d))
+                                              for k, d in V10_SETTING_DEFAULTS.items()}
 
 
 def v10_save_settings(silent=False):
     rows = [{'Key': k, 'Value': str(st.session_state.get(k, d))} for k, d in V10_SETTING_DEFAULTS.items()]
     rows += [{'Key': f"{V11_LS_PREFIX}{t}", 'Value': str(int(n))} for t, n in (st.session_state.get('_v11_ls_map', {}) or {}).items()]
     rows += [{'Key': f"IGN|{k}", 'Value': '1'} for k in sorted(st.session_state.get('_v11_ign', set()) or set())]
+    # V15.9 覆蓋保護（設定檔）：其他裝置/session 可能已寫入較新設定。本 session
+    # 未修改過的鍵跟隨雲端現值 (避免舊快照把別人剛改的設定沖走)；LS|/IGN| 累積
+    # 型資料與雲端取聯集。任何失敗都按舊行為整份寫入 (與 V15.8 相容)。
+    try:
+        if _has_secret('GITHUB_TOKEN') and _has_secret('GITHUB_REPO'):
+            _cloud_s = load_db_github(st.secrets['GITHUB_REPO'], SETTINGS_FILE, st.secrets['GITHUB_TOKEN'])
+            if _cloud_s is not None and not _cloud_s.empty:
+                _cloud_map = {str(r.get('Key', '')): str(r.get('Value', ''))
+                              for _, r in _cloud_s.iterrows() if str(r.get('Key', ''))}
+                _base159 = st.session_state.get('_v10_settings_base') or {}
+                _ours159 = {r['Key']: r['Value'] for r in rows}
+                _out159 = []
+                for r in rows:
+                    k = r['Key']
+                    if (k in V10_SETTING_DEFAULTS and k in _cloud_map and k in _base159
+                            and _ours159[k] == str(_base159[k])):
+                        r = {'Key': k, 'Value': _cloud_map[k]}   # 本 session 沒改過 → 跟雲端現值
+                    _out159.append(r)
+                _ours_keys159 = {r['Key'] for r in _out159}
+                for k, v in _cloud_map.items():
+                    if (k.startswith(V11_LS_PREFIX) or k.startswith('IGN|')) and k not in _ours_keys159:
+                        _out159.append({'Key': k, 'Value': v})  # 雲端獨有的聯賽/忽略紀錄 → 保留
+                rows = _out159
+    except Exception:
+        pass
     try:
         save_db(pd.DataFrame(rows, columns=SETTINGS_COLUMNS), SETTINGS_FILE, SETTINGS_TABLE)
         st.session_state['_v10_settings_saved'] = True
+        # V15.9：儲存成功後更新基準快照，之後的比對以本次寫入值為準
+        st.session_state['_v10_settings_base'] = {r['Key']: r['Value'] for r in rows
+                                                  if r['Key'] in V10_SETTING_DEFAULTS}
         if not silent:
             st.toast("✅ 投注策略設定已永久儲存，下次開啟程式會自動載入。", icon="💾")
     except Exception as e:
@@ -8645,6 +8796,17 @@ def main():
         st.sidebar.success(f"✅ 已連接 GitHub 倉庫同步 (`{st.secrets['GITHUB_REPO']}`)")
     else:
         st.sidebar.warning("⚠️ 未偵測到 Secrets！資料僅存於臨時容器。如需永久儲存，請至 Streamlit 設定 GITHUB_TOKEN 與 GITHUB_REPO。")
+
+    # V15.9：雲端同步失敗醒目警告 (成功後自動消失) — 過去失敗只顯示一行錯誤，
+    # 自動輸入照常推進，注單/結算默默只存在容器本地，刷新頁面就「消失」。
+    _fail159 = int(st.session_state.get('_gh_sync_fail', 0) or 0)
+    if _fail159 > 0:
+        st.sidebar.error(f"⚠️ 雲端同步已連續失敗 {_fail159} 次 — 最新注單/結算只存在本容器！"
+                         "請立即到「📊 數據庫即時線上預覽與管理」下載報表備份，並保持此分頁開啟；"
+                         "同步成功後此警告會自動消失。")
+    _mrg159 = int(st.session_state.get('_gh_merge_count', 0) or 0)
+    if _mrg159 > 0:
+        st.sidebar.info(f"🔀 V15.9 覆蓋保護已自動合併 {_mrg159} 次：偵測到其他裝置/session 的寫入，雙方數據均已保留。")
 
     if st.sidebar.button("🔄 即時從雲端同步最新數據", use_container_width=True):
         st.session_state.df_db = load_db(db_file, DB_COLUMNS, db_table, force_cloud=True)
