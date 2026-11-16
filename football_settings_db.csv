@@ -12,7 +12,7 @@ v11_league_breaker,True
 v11_migrated,True
 v11_auto_sys,True
 v11_trial,True
-v11_act_min_n,10
+v11_act_min_n,30
 v11_act_roi,2.0
 v11_trial_min_n,5
 v11_trial_roi,1.0
