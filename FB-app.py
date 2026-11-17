@@ -58,6 +58,43 @@ from datetime import datetime, timedelta, timezone
 #   測試的 _v159_merge_db。學習引擎、結算、風控、投注建議計算路徑零改動。
 # ==============================================================================
 # ==============================================================================
+# V16 開賽前 CLV 自動記錄器 (賠率快照 + 開賽前自動下注) — 2026-11-17
+#
+#   背景：CLV (Closing Line Value) 的意義在「以開賽前的入市價 vs 收盤價」衡量
+#   投注質素。目前所有注單都是翌晨結算時補錄 (Initial_Odds = 收盤價)，CLV
+#   恆為 0 — 有 CLV 面板、有計算引擎，卻從來沒有「真正的開賽前價格」可比。
+#   項目 015 回測亦證實：固定提早下注 (T-2h) 對讓球盤平均 CLV −1.01%，並非
+#   好策略；正確做法是「記錄快照 + 可調整的下注時點」讓數據說話。
+#
+#   V16 內容 (三個新機制，全部走既有程式碼路徑)：
+#   1. 開賽前自動下注 (T-n 觸發)：背景 fragment 每 5 分鐘檢查 Tipsme 首頁
+#      matchSchedules；任何有馬會盤 (isHkjc)、將於「開賽前 N 分鐘」(預設 30，
+#      可設 0=只快照不下注) 內開賽、且資料庫未記錄的比賽，自動啟動
+#      「填充 → 分析 → 投注」(v15_auto 執行器新 mode='clv'，投注後跳到下一場，
+#      不結算 — 比賽還未完場)。Initial_Odds = 下注時的真實市價。
+#   2. 開賽前賠率快照：每 5 分鐘為「開賽前 X 小時內 (預設 2) 有未結算注單」
+#      的比賽讀取馬會賠率 API，把最新盤口冪等合併進注單 Odds_History
+#      (只增不刪，沿用結算路徑的 clv_apply_closing_odds) — CLV 面板開賽前
+#      已可即時顯示；亦保障 API 歷史被刪減時收盤線仍在。
+#   3. 收盤價自動補上：翌晨 09:30 每日排程結算時，既有結算路徑本來就會呼叫
+#      clv_apply_closing_odds 合併完整賠率史 — 開賽前注單的 CLV 於結算後
+#      自動計算，零新邏輯。
+#
+#   設定儲存於獨立雲端檔 football_clv_db.csv (啟用/下注提前分鐘/快照窗口)，
+#   與投注策略、每日排程設定完全分開。跨裝置互斥沿用 V15.7 sid 機制；
+#   clv 模式完成時不標記排程 last_run (sched=False)，不會影響翌晨結算。
+#
+#   限制 (如實說明)：與每日排程相同 — 由開啟著的分頁驅動 (背景 fragment
+#   每 5 分鐘)；分頁全關時該場不會開賽前下注，翌晨照舊補錄 (CLV=0)。
+#   處理速度受限於逐場填充+分析 (每場約 30–90 秒)；同時段多場開賽時，
+#   後處理的場次下注時點會比 T-n 略遲 — 實際入市時間如實記錄在
+#   Initial_Odds 與 Odds_History，不影響 CLV 真實性。
+#
+#   風險評估：零。新功能在「觸發層」— 觸發的填充/分析/投注是既有
+#   v15_auto 執行器與手動按鈕的同一程式碼路徑；快照合併沿用結算路徑的
+#   冪等函式。學習引擎、結算、風控、投注建議計算零改動。
+# ==============================================================================
+# ==============================================================================
 # V15.11 每日自動排程 (前一天賽果定時自動輸入) — 2026-11-16
 #
 #   背景：前向驗證需每日輸入前一天的全部賽事。V15.10 的賽果日期模式仍需人手
@@ -7621,7 +7658,11 @@ def _v15_finish_summary(a):
     寫入共用檔案 (auto_status.csv)，令其他裝置也能看到完成結果與待手動清單。"""
     _q = a.get('queue') or []
     _failed = a.get('failed') or []
-    _v15_log(f"🏁 全部 {len(_q)} 場已掃描完畢 (已結算 {a.get('done', 0)} 場，寫入 {a.get('bets', 0)} 張注單)")
+    if str(a.get('mode')) == 'clv':
+        _v15_log(f"🏁 V16 開賽前記錄完畢：{len(_q)} 場已掃描，開賽前寫入 {a.get('bets', 0)} 張注單 — "
+                 f"收盤價於翌晨 09:30 每日排程結算時自動補上，CLV 屆時自動計算")
+    else:
+        _v15_log(f"🏁 全部 {len(_q)} 場已掃描完畢 (已結算 {a.get('done', 0)} 場，寫入 {a.get('bets', 0)} 張注單)")
     if _failed:
         _v15_log(f"📋 共 {len(_failed)} 場需手動處理 (填充或結算失敗，未寫入任何錯誤數據；注單保持 Open)：")
         for _f in _failed[:60]:
@@ -7816,8 +7857,13 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
         _dup = v14_find_duplicate_match(df_db, m['home'], m['away'], _dt, tipsme_id=m.get('hkjc_match_id'))
         if _dup is not None and not _dup.empty:
             if (_dup['Status'].astype(str) == 'Open').any():
-                _v15_log(f"▶️ {_v15_mlabel(m)} {m['home']} vs {m['away']}：已記錄待結算，直接結算")
-                a['step'] = 'SETTLE_READ'
+                if str(a.get('mode')) == 'clv':
+                    # V16 開賽前模式：比賽未完場，不結算 — 跳到下一場
+                    _v15_log(f"⏭️ {_v15_mlabel(m)} {m['home']} vs {m['away']}：開賽前注單已存在，跳到下一場")
+                    a['idx'] += 1
+                else:
+                    _v15_log(f"▶️ {_v15_mlabel(m)} {m['home']} vs {m['away']}：已記錄待結算，直接結算")
+                    a['step'] = 'SETTLE_READ'
             else:
                 _v15_log(f"⏭️ {_v15_mlabel(m)} {m['home']} vs {m['away']}：已記錄且已結算，跳過")
                 a['idx'] += 1
@@ -8127,6 +8173,346 @@ def _v1511_sched_body():
                    f"({_yday}) 全部聯賽賽果並輸入 {cfg.get('t0', '00:00')}-{cfg.get('t1', '23:59')} 時段。"
                    f"背景檢查每 5 分鐘一次，保持此分頁開啟即可。")
 
+# ==============================================================================
+# --- V16 開賽前 CLV 自動記錄器：設定 + 快照 + T-n 自動下注 + 背景 fragment ---
+# ==============================================================================
+
+CLV_FILE = 'football_clv_db.csv'
+CLV_TABLE = 'football_clv_settings'
+CLV_COLUMNS = ['enabled', 'bet_lead_min', 'snap_hours', 'updated_ts']
+
+def _v16_clv_load():
+    """V16：讀取 CLV 記錄器設定 (本地優先、雲端後備；無檔案回預設值)。"""
+    now = get_hkt_now()
+    cfg = {'enabled': '1', 'bet_lead_min': '30', 'snap_hours': '2',
+           'updated_ts': str(int(now.timestamp()))}
+    try:
+        df_c = load_db(CLV_FILE, CLV_COLUMNS, CLV_TABLE)
+        if not df_c.empty:
+            cfg = {k: (str(v) if v is not None else '') for k, v in df_c.iloc[0].to_dict().items()}
+    except Exception:
+        pass
+    for k in ('enabled', 'bet_lead_min', 'snap_hours'):
+        cfg.setdefault(k, {'enabled': '1', 'bet_lead_min': '30', 'snap_hours': '2'}[k])
+    return cfg
+
+def _v16_clv_save(cfg):
+    """V16：儲存 CLV 記錄器設定到雲端 (SQL → GitHub → 本地)。回傳是否成功。"""
+    try:
+        now = get_hkt_now()
+        cfg = dict(cfg)
+        cfg['updated_ts'] = str(int(now.timestamp()))
+        save_db(pd.DataFrame([{k: str(cfg.get(k, '')) for k in CLV_COLUMNS}], columns=CLV_COLUMNS),
+                CLV_FILE, CLV_TABLE)
+        return True
+    except Exception:
+        return False
+
+def tipsme_fetch_today_schedule():
+    """V16：讀取 Tipsme 首頁 __NEXT_DATA__ 的 matchSchedules — 今日全部比賽
+    (含未開賽)，每場含 matchId/主客隊/聯賽/開賽時間/isHkjc。賽果頁只列已完場，
+    未開賽比賽的唯一來源是首頁。回傳 list (空 list = 讀取失敗)。"""
+    url = 'https://tipsme.hk/zh-HK/'
+    html = _tipsme_fetch_page_html(url, marker='matchSchedules')
+    if not html:
+        return []
+    try:
+        m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.S)
+        if not m:
+            return []
+        d = json.loads(m.group(1))
+        ms = (d.get('props') or {}).get('pageProps') or {}
+        ms = ms.get('matchSchedules') or []
+        out = []
+        for x in ms:
+            try:
+                mid = int(x.get('matchId') or 0)
+                if not mid:
+                    continue
+                ko = None
+                for k in ('fullMatchTimeUtc', 'fullMatchTime'):
+                    s = str(x.get(k) or '')
+                    if not s:
+                        continue
+                    try:
+                        if k == 'fullMatchTimeUtc':
+                            # 明確標記為 UTC 再轉香港 — 避免 astimezone 以伺服器本地時區解讀 naive datetime
+                            ko = datetime.fromisoformat(s).replace(tzinfo=timezone.utc).astimezone(HKT)
+                        else:
+                            ko = datetime.strptime(s, '%Y-%m-%d %H:%M:%S').replace(tzinfo=HKT)
+                        break
+                    except Exception:
+                        ko = None
+                if ko is None:
+                    continue
+                out.append({'round': 0, 'day': ko.strftime('%Y-%m-%d'),
+                            'hkjc_match_id': mid,
+                            'home': str(x.get('home') or ''), 'away': str(x.get('away') or ''),
+                            'league': str(x.get('leagueName') or ''),
+                            'match_time': ko.timestamp(), 'finished': False,
+                            'is_hkjc': bool(x.get('isHkjc'))})
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+def _v16_today_cache():
+    """V16：今日賽程快取 (fragment 每 5 分鐘才重新下載一次，避免重複請求)。"""
+    now = get_hkt_now()
+    c = st.session_state.get('_v16_sched_cache')
+    if c and (now.timestamp() - float(c.get('ts') or 0)) < 240:
+        return c.get('matches') or []
+    matches = tipsme_fetch_today_schedule()
+    if matches:
+        st.session_state['_v16_sched_cache'] = {'ts': now.timestamp(), 'matches': matches}
+        return matches
+    # 讀取失敗 → 沿用舊快照 (如有)，否則空
+    if c:
+        st.session_state['_v16_sched_cache'] = {'ts': now.timestamp(), 'matches': c.get('matches') or []}
+        return c.get('matches') or []
+    return []
+
+def v16_snapshot_open_bets(df_db, cfg):
+    """V16 開賽前賠率快照：為「開賽前 X 小時內、有未結算注單」的比賽讀取馬會
+    賠率 API，把最新盤口冪等合併進注單 Odds_History (只增不刪 — 沿用結算路徑
+    的 clv_apply_closing_odds，同一邏輯)。每場每 4 分鐘最多讀一次。
+    回傳 (新增快照總數, 已更新比賽 list of (主, 客, 新增數))；df_db 由呼叫者儲存。"""
+    now = get_hkt_now()
+    try:
+        hours = float(cfg.get('snap_hours') or 2)
+    except Exception:
+        hours = 2.0
+    if hours <= 0 or df_db is None:
+        return 0, []
+    try:
+        open_df = df_db[df_db['Status'].astype(str) == 'Open']
+    except Exception:
+        return 0, []
+    if open_df.empty:
+        return 0, []
+    matches = _v16_today_cache()
+    if not matches:
+        return 0, []
+    snap_ts = st.session_state.get('_v16_snap_ts') or {}
+    total_added, updated = 0, []
+    for m in matches:
+        ko = m.get('match_time')
+        mid = m.get('hkjc_match_id')
+        if not ko or not mid:
+            continue
+        try:
+            ko_dt = datetime.fromtimestamp(ko, HKT)
+        except Exception:
+            continue
+        if ko_dt <= now or ko_dt > now + timedelta(hours=hours):
+            continue   # 已開賽 / 超出監察窗口
+        # 此場是否有未結算注單？(先以 Tipsme_Match_ID 精確比對，無命中退回名稱+日期)
+        _dt = ko_dt.date()
+        try:
+            _rows = open_df[open_df['Tipsme_Match_ID'].astype(str) == str(mid)]
+        except Exception:
+            _rows = open_df.iloc[0:0]
+        if _rows is None or _rows.empty:
+            _rows2 = v14_find_duplicate_match(open_df, m.get('home'), m.get('away'), _dt, tipsme_id=mid)
+            _rows = _rows2 if (_rows2 is not None and not _rows2.empty) else _rows
+        if _rows is None or _rows.empty:
+            continue   # 無注單 → 不浪費請求
+        # 每場節流：4 分鐘內已讀過 → 跳過
+        if (now.timestamp() - float(snap_ts.get(mid) or 0)) < 240:
+            continue
+        api_odds = tipsme_fetch_hkjc_odds(mid)
+        snap_ts[mid] = now.timestamp()
+        st.session_state['_v16_snap_ts'] = snap_ts
+        if not api_odds:
+            continue
+        core_hist, _extra = tipsme_build_odds_history(api_odds)
+        if not core_hist:
+            continue
+        _upd, _added = clv_apply_closing_odds(df_db, core_hist, m.get('home'), m.get('away'), ko_dt)
+        if _added > 0:
+            total_added += _added
+            updated.append((m.get('home'), m.get('away'), _added))
+    return total_added, updated
+
+def v16_try_start_auto_bet(df_db, cfg):
+    """V16 開賽前自動下注觸發：任何 isHkjc、將於「開賽前 N 分鐘」內開賽、
+    資料庫未記錄的比賽 → 啟動 v15_auto 執行器 (mode='clv'，只做 填充→分析→
+    投注，不結算)。跨裝置互斥沿用 V15.7 狀態檔 (5 分鐘內有活動不搶)。
+    回傳 True 表示已啟動。"""
+    if str(cfg.get('enabled')) != '1':
+        return False
+    try:
+        lead = int(float(cfg.get('bet_lead_min') or 0))
+    except Exception:
+        lead = 30
+    if lead <= 0:
+        return False
+    a = st.session_state.get('v15_auto') or {}
+    if a.get('active'):
+        return False   # 本 session 已有自動輸入在跑 (含每日排程/手動批次)
+    now = get_hkt_now()
+    if df_db is None:
+        return False
+    matches = _v16_today_cache()
+    if not matches:
+        return False
+    # 其他裝置正在跑 (5 分鐘內有更新) → 不搶；逾 5 分鐘無更新 → 可接手
+    try:
+        _s = _v15_load_remote()
+        if _s and str(_s.get('active')) == '1':
+            if (now.timestamp() - float(_s.get('updated_ts') or 0)) < 300:
+                return False
+    except Exception:
+        pass
+    tried = st.session_state.get('_v16_bet_tried') or {}
+    q = []
+    for m in matches:
+        ko = m.get('match_time')
+        mid = m.get('hkjc_match_id')
+        if not ko or not mid:
+            continue
+        try:
+            ko_dt = datetime.fromtimestamp(ko, HKT)
+        except Exception:
+            continue
+        if ko_dt <= now:
+            continue                 # 已開賽 → 不補注 (翌晨照舊補錄)
+        mins = (ko_dt - now).total_seconds() / 60.0
+        if mins > lead:
+            continue                 # 未到 T-n
+        if mins < 1:
+            continue                 # 距開賽不足 1 分鐘 → 放棄 (安全邊際)
+        if not m.get('is_hkjc'):
+            continue                 # 無馬會盤 → 無盤口可下
+        if int(tried.get(mid, 0)) >= 2:
+            continue                 # 同場已試 2 次 (填充失敗等) → 不再重試
+        _dt = ko_dt.date()
+        _dup = v14_find_duplicate_match(df_db, m.get('home'), m.get('away'), _dt, tipsme_id=mid)
+        if _dup is not None and not _dup.empty:
+            continue                 # 已記錄 (手動或早前已下注) → 跳過
+        q.append(dict(m))
+    if not q:
+        return False
+    for m in q:
+        tried[m['hkjc_match_id']] = int(tried.get(m['hkjc_match_id'], 0)) + 1
+    st.session_state['_v16_bet_tried'] = tried
+    # sched=False 至關重要：clv 批次完成時不可標記每日排程 last_run，
+    # 否則翌晨 09:30 的賽果結算會被誤判「已完成」而跳過。
+    st.session_state['v15_auto'] = {
+        'active': True, 'mode': 'clv', 'rdate': now.strftime('%Y-%m-%d'), 'sched': False,
+        't0': '00:00', 't1': '23:59', 'rounds': [], 'queue': q, 'idx': 0,
+        'step': 'FILL', 'log': [], 'tries': 0, 'err': 0, 'done': 0, 'bets': 0,
+        'failed': [], 'sid': _v15_new_sid(),
+    }
+    _v15_log(st.session_state['v15_auto'],
+             f"🎯 V16 開賽前 CLV 記錄自動啟動：{len(q)} 場即將開賽 (開賽前 {lead} 分鐘觸發) — "
+             f"自動 填充 → 分析 → 投注；Initial_Odds = 下注時真實市價，"
+             f"收盤價翌晨結算時自動補上 → CLV 自動計算")
+    _v15_save_remote(st.session_state['v15_auto'])
+    return True
+
+def _v16_clv_body():
+    """V16 背景 fragment 主體 (每 5 分鐘 + 每次頁面載入)：
+    (a) 開賽前賠率快照 (b) T-n 自動下注觸發 (c) 狀態顯示。"""
+    cfg = _v16_clv_load()
+    if str(cfg.get('enabled')) != '1':
+        return
+    df_db = st.session_state.get('df_db')
+    if df_db is None or df_db.empty:
+        return
+    # (a) 開賽前賠率快照 — 例外不外洩 (背景檢查絕不令程式崩潰)
+    try:
+        added, updated_matches = v16_snapshot_open_bets(df_db, cfg)
+        if added > 0:
+            save_db(df_db, 'football_betting_db.csv', 'football_bets')
+            st.toast(f"📸 V16 CLV 快照：{len(updated_matches)} 場新增 {added} 個賠率快照", icon="📸")
+    except Exception:
+        pass
+    # (b) T-n 自動下注 — v15_auto 執行器會在主流程逐場推進 (每步一次 rerun)
+    try:
+        if v16_try_start_auto_bet(df_db, cfg):
+            st.rerun()
+            return
+    except Exception:
+        pass
+    # (c) 狀態顯示
+    try:
+        now = get_hkt_now()
+        matches = _v16_today_cache() or []
+        try:
+            lead = int(float(cfg.get('bet_lead_min') or 0))
+        except Exception:
+            lead = 0
+        try:
+            hours = float(cfg.get('snap_hours') or 2)
+        except Exception:
+            hours = 2.0
+        hkjc = [m for m in matches if m.get('is_hkjc')]
+        upcoming = [m for m in hkjc if m.get('match_time')
+                    and datetime.fromtimestamp(m['match_time'], HKT) > now]
+        _nxt = ''
+        if upcoming:
+            upcoming.sort(key=lambda x: x['match_time'])
+            _n0 = upcoming[0]
+            _nxt = (f" · 下一場 {_n0.get('home')} vs {_n0.get('away')} "
+                    f"{datetime.fromtimestamp(_n0['match_time'], HKT).strftime('%H:%M')}")
+        st.caption(f"🎯 V16 開賽前 CLV 記錄器運作中：今日 {len(matches)} 場 (馬會盤 {len(hkjc)})，"
+                   f"未開賽 {len(upcoming)} 場{_nxt} · "
+                   f"自動下注：{'開賽前 ' + str(lead) + ' 分鐘' if lead > 0 else '只快照不下注'} · "
+                   f"快照窗口：開賽前 {hours:g} 小時 · 背景 check 每 5 分鐘一次 (保持分頁開啟)")
+    except Exception:
+        pass
+
+def v16_render_clv_recorder():
+    """在頁面頂部渲染 V16 CLV 記錄器背景 fragment (與每日排程同一模式)。"""
+    try:
+        _frag = st.fragment(run_every=300)
+    except Exception:
+        _frag = None
+    if _frag is not None:
+        _frag(_v16_clv_body)()
+    else:
+        _v16_clv_body()
+
+def v16_render_clv_config():
+    """V16：CLV 記錄器設定面板 (賽前 tab，每日排程設定下方)。"""
+    with st.expander("🎯 V16 開賽前 CLV 自動記錄器 (自動賠率快照 + 開賽前自動下注)"):
+        _cc = _v16_clv_load()
+        _cen = st.checkbox("啟用 V16 開賽前 CLV 記錄器", value=str(_cc.get('enabled')) == '1', key="v16_en")
+        _c1, _c2 = st.columns(2)
+        try:
+            _lv = int(float(_cc.get('bet_lead_min') or 30))
+        except Exception:
+            _lv = 30
+        try:
+            _hv = float(_cc.get('snap_hours') or 2)
+        except Exception:
+            _hv = 2.0
+        _lead = _c1.number_input("自動下注時點 (開賽前 N 分鐘；0 = 只快照不下注)",
+                                 min_value=0, max_value=180, value=_lv, step=5, key="v16_lead")
+        _hrs = _c2.number_input("快照監察窗口 (開賽前 X 小時內的未結算注單)",
+                                min_value=0.0, max_value=12.0, value=_hv, step=0.5, key="v16_hrs")
+        if st.button("💾 儲存 CLV 記錄器設定", key="v16_save", use_container_width=True):
+            _new = {'enabled': '1' if _cen else '0', 'bet_lead_min': str(int(_lead)),
+                    'snap_hours': str(float(_hrs)), 'updated_ts': ''}
+            if _v16_clv_save(_new):
+                st.toast("✅ V16 CLV 記錄器設定已儲存到雲端，所有裝置同步生效。", icon="🎯")
+                st.rerun()
+            else:
+                st.error("設定儲存失敗，請再試一次。")
+        st.caption("💡 運作原理 (預設 開賽前 30 分鐘 自動下注)：背景檢查每 5 分鐘一次，讀取 "
+                   "Tipsme 首頁今日賽程；任何有馬會盤、即將到達「開賽前 N 分鐘」且未記錄的比賽，"
+                   "自動執行 填充 → 分析 → 系統投注 (含 $0 模擬注) — Initial_Odds 即下注時的真實市價。"
+                   "同時為開賽前 X 小時內有未結算注單的比賽每 5 分鐘記錄賠率快照 (只增不刪)，"
+                   "CLV 面板開賽前已可即時顯示。收盤價於翌晨 09:30 每日排程結算時自動補上 "
+                   "(結算路徑本來就會合併完整賠率史)，CLV 自動計算 — 毋須任何手動步驟。"
+                   "與每日排程相同：由開啟著的分頁驅動，保持至少一部裝置分頁開啟即可；"
+                   "分頁全關時該場翌晨照舊補錄 (CLV=0)。"
+                   f"目前狀態：{'✅ 已啟用' if str(_cc.get('enabled')) == '1' else '未啟用'} · "
+                   f"下注時點：{'開賽前 ' + str(_cc.get('bet_lead_min') or '30') + ' 分鐘' if str(_cc.get('bet_lead_min') or '0') not in ('0', '') else '只快照不下注'} · "
+                   f"快照窗口：開賽前 {str(_cc.get('snap_hours') or '2')} 小時")
+
 def v1511_render_sched_status():
     """在頁面頂部渲染排程背景檢查 fragment (與 V15.3 遠端進度橫幅同一模式)。"""
     try:
@@ -8428,6 +8814,9 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
                        "若觸發時間時全部分頁關閉，下次開啟程式會立即補跑。"
                        f"目前狀態：{'✅ 已啟用' if str(_cfg.get('enabled')) == '1' else '未啟用'} · "
                        f"上次完成日期：{_cfg.get('last_run') or '未執行'}")
+
+        # --- V16 開賽前 CLV 自動記錄器設定 (獨立雲端檔 football_clv_db.csv) ---
+        v16_render_clv_config()
 
         fd = st.session_state.get('tipsme_fill_data')
         if fd:
@@ -9727,6 +10116,7 @@ def main():
     # V15.3：其他裝置的即時進度 (唯讀，每 10 秒自動更新；本 session 正在跑時不顯示)
     v15_render_remote_status()
     v1511_render_sched_status()   # V15.11：每日排程背景檢查 (每 5 分鐘)
+    v16_render_clv_recorder()     # V16：開賽前 CLV 記錄器背景檢查 (每 5 分鐘)
 
     t_pre, t_inplay, t_settle, t_ai, t_time_pnl, t_clv = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖ 賽果結算與管理", "🤖 全局模型", "📅 時間維度盈虧記錄分析", "🎯 CLV 與本金模擬"])
 
@@ -10495,9 +10885,18 @@ def main():
                         if _v15_on('BET'):
                             _a15 = st.session_state['v15_auto']
                             _a15['bets'] = _a15.get('bets', 0) + len(new_records)
-                            _a15['step'] = 'SETTLE_READ'
+                            if str(_a15.get('mode')) == 'clv':
+                                # V16 開賽前模式：投注已寫入 — 比賽未完場不結算，跳到下一場；
+                                # 收盤價翌晨 09:30 每日排程結算時自動合併 → CLV 自動計算
+                                _v15_log(_a15, f"🎯 V16 已開賽前寫入 {len(new_records)} 張注單 "
+                                               f"(Initial_Odds = 此刻真實市價)，跳到下一場 — "
+                                               f"收盤價翌晨結算時自動補上，CLV 自動計算")
+                                _a15['idx'] += 1
+                                _a15['step'] = 'FILL'
+                            else:
+                                _a15['step'] = 'SETTLE_READ'
+                                _v15_log(_a15, f"📝 已寫入 {len(new_records)} 張注單 (含 $0 模擬注)，切換至賽果結算")
                             _a15['tries'] = 0
-                            _v15_log(_a15, f"📝 已寫入 {len(new_records)} 張注單 (含 $0 模擬注)，切換至賽果結算")
                     
                         clear_edit_mode()
                         st.session_state.odds_history = [{"id": 0, "type": "讓球", "record_time": "", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}] 
