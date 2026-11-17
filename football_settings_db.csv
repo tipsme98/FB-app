@@ -7,7 +7,7 @@ v9_min_hd,200.0
 v9_min_other,0.0
 v9_override_gate,False
 v10_mode,🛡 自動 (只用已驗證策略)
-v11_new_league_paper,False
+v11_new_league_paper,True
 v11_league_breaker,True
 v11_migrated,True
 v11_auto_sys,True
@@ -66,6 +66,7 @@ LS|女子挪威超級聯賽,20
 LS|阿聯酋聯賽盃,20
 LS|女子瑞典超級聯賽,20
 LS|女子荷蘭甲組聯賽,2
+LS|女子阿根廷甲組聯賽,20
 IGN|0f5016ae92c6,1
 IGN|0f5498dd4e47,1
 IGN|1f56a7f9d2e1,1
