@@ -800,7 +800,10 @@ def _v1512_backup_pending(df):
         pass
 
 def _v1512_clear_pending():
-    """V15.12：主檔成功上傳後清空差量備份檔 (記錄已在主檔內)。"""
+    """V15.13.1 修正：主檔「已確認」持久化 (SQL 或 GitHub 上傳成功) 後才清空差量備份檔。
+    V15.12 缺陷：merge_pending_on_load 無條件 save_db + clear —— 若主檔上傳失敗，
+    備份列只存在容器，下次容器重建即全部遺失。此函式由 save_db 的成功分支呼叫
+    (SQL 成功 _sql_ok1513 或 GitHub 成功 _gh_ok1512)，確保數據已持久化。"""
     try:
         if _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO"):
             save_db_github(pd.DataFrame(columns=DB_COLUMNS),
@@ -849,8 +852,13 @@ def _v1512_save_sql_main(df, table_name):
         return False
 
 def _v1512_merge_pending_on_load():
-    """V15.12：載入主資料庫後自動合併差量備份檔 (如有)：ID 聯集、已結算優先，
-    合併結果回寫雲端並清空備份檔，同時記下指紋基準。回傳合併列數 (0 = 無備份)。"""
+    """V15.13.1 修正：載入主資料庫後合併差量備份檔 (如有)：ID 聯集、已結算優先。
+    V15.12 缺陷：合併後「無條件」save_db 回寫主檔並清空備份 —— 主檔上傳失敗時
+    備份被清掉，數據只留在容器，容器重建即全部遺失 (2026-11-17 實際發生：
+    備份檔被清空成 0 列)。
+    修正後：合併到 session 後先呼叫 save_db (SQL → GitHub → 本地)；只當主檔
+    「已確認持久化」(SQL 寫入成功，或 42MB 主檔上傳 GitHub 成功) 才清空備份；
+    持久化失敗則保留備份檔原狀，數據仍在雲端備份，下次載入重試。"""
     try:
         df = st.session_state.get('df_db')
         if df is None:
@@ -865,8 +873,14 @@ def _v1512_merge_pending_on_load():
             st.session_state.df_db = merged
             n = int(len(pend))
             save_db(merged, "football_betting_db.csv", "football_bets")
-            _v1512_clear_pending()
-            st.session_state['_v1512_pending_used'] = False
+            # 主檔已確認持久化 → 才清空備份 (SQL 成功即代表已進 SQL 資料庫)
+            _persisted = bool(st.session_state.get('_v1512_sql_ok') or
+                             st.session_state.get('_gh_sync_ok_main'))
+            if _persisted:
+                _v1512_clear_pending()
+                st.session_state['_v1512_pending_used'] = False
+            else:
+                st.warning(f"⚠️ 主檔持久化未確認，差量備份檔保留 {n} 列不清空，下次載入將重試合併。")
         _v1512_capture_base(st.session_state.df_db)
         return n
     except Exception:
@@ -1027,6 +1041,10 @@ def save_db(df, filename, table_name):
         try:
             _ok159 = save_db_github(df, st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
             _gh_ok1512 = bool(_ok159)
+            # V15.13.1：記錄主檔 GitHub 持久化結果，供 merge_pending_on_load 判斷
+            # 是否可安全清空差量備份 (V15.12 缺陷：無條件清空 → 備份被丟)
+            if _gh_ok1512 and _v1512_is_main_db(filename):
+                st.session_state['_gh_sync_ok_main'] = True
             # V15.9：同步失敗不再靜默 — 側邊欄顯示連續失敗警告，成功後自動清除
             st.session_state['_gh_sync_fail'] = 0 if _ok159 else int(st.session_state.get('_gh_sync_fail', 0) or 0) + 1
         except Exception as e:
