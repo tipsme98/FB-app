@@ -9,3 +9,4 @@ psycopg2-binary
 requests==2.34.2
 openpyxl==3.1.5
 curl_cffi==0.17.0
+psycopg[binary]
