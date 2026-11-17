@@ -10,6 +10,30 @@ import itertools
 from datetime import datetime, timedelta, timezone
 
 # ==============================================================================
+# V15.13 SQL 雲端資料庫即時同步 (Supabase PostgreSQL) — 2026-11-16
+#
+#   背景：42MB 主資料庫整檔上傳 GitHub 在用家網絡環境下持續失敗 (11-15 18:32
+#   後再無一次成功)。V15.12 差量備份已保證「不丟數據」，但主檔同步變成
+#   「延遲合併」而非「即時」。程式碼本就支援 SQL 雲端資料庫 (Streamlit
+#   Secrets 的 DB_URL + SQLAlchemy) — 本版把它變成切實可用的即時主儲存：
+#
+#   V15.13 內容：
+#   1. 主資料庫 SQL 增量寫入 (_v1512_save_sql_main)：表不存在時一次性整檔
+#      遷移；之後每次儲存只 DELETE+INSERT 有變動的列 (新增/結算/修改) 及
+#      已被清理的列 — 幾 KB 級流量、秒級完成，毋須每次重寫整個 42MB 表。
+#      小表 (資金紀錄) 維持整檔覆寫不變。
+#   2. SQL 寫入成功 → 即時更新指紋基準並清空差量備份檔 (SQL 已是完整數據)；
+#      SQL 寫入失敗 → 基準不變，GitHub/差量備份後備照常運作 (三層保護)。
+#   3. 側邊欄警示分級：SQL 已連接且寫入成功時，GitHub 同步失敗降為藍色
+#      提示 (「數據已即時儲存於 SQL，不影響數據安全」)，不再誤導性紅色警告。
+#
+#   載入優先順序不變：SQL → GitHub → 本地。設定 DB_URL 後首次儲存會自動
+#   把 GitHub 雲端現有全部數據遷移入 SQL，毋須人手操作。
+#
+#   風險評估：低。SQL 路徐為既有代碼 (load_db/save_db 第 1 步) 的寫入方式
+#   優化，讀取路徑零改動；學習引擎、結算、風控、投注建議計算零改動。
+# ==============================================================================
+# ==============================================================================
 # V15.12 同步合併保護與差量備份 — 2026-11-16
 #
 #   背景 (2026-11-16 事故)：11-15 全日 84 場自動輸入完成，但 42MB 主資料庫
@@ -784,6 +808,46 @@ def _v1512_clear_pending():
     except Exception:
         pass
 
+def _v1512_save_sql_main(df, table_name):
+    """V15.13：主資料庫 SQL 增量寫入。表不存在 → 一次性整檔遷移；之後每次只
+    DELETE+INSERT 有變動的列 (新增/結算/修改) 及已被清理的列 — 幾 KB 級流量，
+    秒級完成。任何例外 → 回傳 False (上層顯示錯誤，GitHub/差量備份後備照常)。"""
+    try:
+        from sqlalchemy import text, bindparam
+        from sqlalchemy import inspect as _sa_inspect
+        engine = create_engine(st.secrets["DB_URL"])
+        if not _sa_inspect(engine).has_table(table_name):
+            # 首次遷移：整檔寫入
+            df_to_db = df.copy()
+            for col in df_to_db.columns:
+                if df_to_db[col].dtype == 'object':
+                    df_to_db[col] = df_to_db[col].apply(lambda x: str(x) if pd.notna(x) else None)
+            df_to_db.to_sql(table_name, engine, if_exists='replace', index=False)
+            return True
+        base = st.session_state.get('_v1512_base') or {}
+        cur_ids = set(df['ID'].astype(str))
+        deleted_ids = [r for r in base if r not in cur_ids]
+        changed = _v1512_changed_rows(df)
+        _chg_ids = sorted({str(x) for x in changed['ID'].tolist()}) if (changed is not None and not changed.empty) else []
+        _write_ids = sorted(set(deleted_ids) | set(_chg_ids))
+        if not _write_ids:
+            return True   # 本 session 無變更，毋須寫入
+        _del_stmt = text(f'DELETE FROM "{table_name}" WHERE "ID" IN :ids').bindparams(
+            bindparam('ids', expanding=True))
+        with engine.begin() as conn:
+            for i in range(0, len(_write_ids), 500):
+                conn.execute(_del_stmt, {"ids": _write_ids[i:i+500]})
+        if _chg_ids:
+            changed_df = df[df['ID'].astype(str).isin(set(_chg_ids))].copy()
+            for col in changed_df.columns:
+                if changed_df[col].dtype == 'object':
+                    changed_df[col] = changed_df[col].apply(lambda x: str(x) if pd.notna(x) else None)
+            changed_df.to_sql(table_name, engine, if_exists='append', index=False)
+        return True
+    except Exception as e:
+        st.error(f"SQL 資料庫儲存失敗: {e}")
+        return False
+
 def _v1512_merge_pending_on_load():
     """V15.12：載入主資料庫後自動合併差量備份檔 (如有)：ID 聯集、已結算優先，
     合併結果回寫雲端並清空備份檔，同時記下指紋基準。回傳合併列數 (0 = 無備份)。"""
@@ -812,7 +876,9 @@ def save_db_github(df, repo, path, token):
     timestamp = int(get_hkt_now().timestamp())
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
     _big159 = _gh_is_big_file(path)
-    _to159 = GITHUB_TIMEOUT_DB if _big159 else GITHUB_TIMEOUT
+    # V15.13.1：差量備份檔會隨累積增長 (今晚實測：長至 2.5MB 後在弱網絡下
+    # 15 秒超時開始失敗)，同樣改用 120 秒長超時
+    _to159 = GITHUB_TIMEOUT_DB if (_big159 or str(path).endswith('football_betting_db_pending.csv')) else GITHUB_TIMEOUT
     res_get = _gh_request("GET", f"{url}?t={timestamp}", token, timeout=_to159)
     sha = res_get.json().get("sha") if (res_get is not None and res_get.status_code == 200) else None
 
@@ -930,17 +996,30 @@ def load_db(filename, columns, table_name, force_cloud=False):
     return df
 
 def save_db(df, filename, table_name):
-    # 1. 寫入 SQL 雲端資料庫
+    # 1. 寫入 SQL 雲端資料庫 (V15.13：主資料庫增量寫入 — 只寫變動列、刪清理列；
+    #    小表維持整檔覆寫)
+    _sql_ok1513 = False
     if HAS_SQLALCHEMY and _has_secret("DB_URL") and st.secrets["DB_URL"]:
         try:
-            engine = create_engine(st.secrets["DB_URL"])
-            df_to_db = df.copy()
-            for col in df_to_db.columns:
-                if df_to_db[col].dtype == 'object':
-                    df_to_db[col] = df_to_db[col].apply(lambda x: str(x) if pd.notna(x) else None)
-            df_to_db.to_sql(table_name, engine, if_exists='replace', index=False)
+            if _v1512_is_main_db(filename):
+                _sql_ok1513 = _v1512_save_sql_main(df, table_name)
+            else:
+                engine = create_engine(st.secrets["DB_URL"])
+                df_to_db = df.copy()
+                for col in df_to_db.columns:
+                    if df_to_db[col].dtype == 'object':
+                        df_to_db[col] = df_to_db[col].apply(lambda x: str(x) if pd.notna(x) else None)
+                df_to_db.to_sql(table_name, engine, if_exists='replace', index=False)
+                _sql_ok1513 = True
         except Exception as e:
             st.error(f"SQL 資料庫儲存失敗: {e}")
+        st.session_state['_v1512_sql_ok'] = _sql_ok1513
+        if _sql_ok1513 and _v1512_is_main_db(filename):
+            # SQL 已完整保存 → 更新指紋基準；差量備份檔內容已過時，順帶清空
+            _v1512_capture_base(df)
+            if st.session_state.get('_v1512_pending_used'):
+                _v1512_clear_pending()
+                st.session_state['_v1512_pending_used'] = False
 
     # 2. 寫入 GitHub 雲端倉庫
     _gh_ok1512 = False
@@ -9414,12 +9493,17 @@ def main():
     # V15.9：雲端同步失敗醒目警告 (成功後自動消失) — 過去失敗只顯示一行錯誤，
     # 自動輸入照常推進，注單/結算默默只存在容器本地，刷新頁面就「消失」。
     _fail159 = int(st.session_state.get('_gh_sync_fail', 0) or 0)
-    if _fail159 > 0:
+    # V15.13：警示分級 — SQL 已連接且寫入成功時，GitHub 備份失敗不影響數據安全
+    _sql_safe1513 = bool(has_sql and st.session_state.get('_v1512_sql_ok'))
+    if _fail159 > 0 and _sql_safe1513:
+        st.sidebar.info(f"✅ 數據已即時儲存於 SQL 雲端資料庫 (每次寫入秒級同步)；"
+                        f"GitHub 備份同步已連續失敗 {_fail159} 次，不影響數據安全。")
+    elif _fail159 > 0:
         st.sidebar.error(f"⚠️ 雲端同步已連續失敗 {_fail159} 次 — 最新注單/結算只存在本容器！"
                          "請立即到「📊 數據庫即時線上預覽與管理」下載報表備份，並保持此分頁開啟；"
                          "同步成功後此警告會自動消失。")
     # V15.12：主檔同步失敗但差量備份已上傳成功 → 數據其實已安全，補充說明
-    if _fail159 > 0 and st.session_state.get('_v1512_pending_used'):
+    if _fail159 > 0 and not _sql_safe1513 and st.session_state.get('_v1512_pending_used'):
         st.sidebar.info("🛡 V15.12 差量備份已生效：最新變更已同步上傳到備份小檔，"
                         "即使容器重啟，下次開啟程式會自動恢復 — 但仍建議下載報表備份。")
     _mrg159 = int(st.session_state.get('_gh_merge_count', 0) or 0)
