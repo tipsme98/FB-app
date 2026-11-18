@@ -10,6 +10,78 @@ import itertools
 from datetime import datetime, timedelta, timezone
 
 # ==============================================================================
+# V16.2 主裝置模式 + 用家跟投分頁 — 2026-11-18
+#
+#   背景 (用家需求)：主電腦分頁 24 小時開啟負責全自動運行 (CLV 快照/下注/
+#   每日結算)；其他裝置 (手機/平板) 開啟程式只為查看進度 — 但舊機制下任何
+#   分頁都可能啟動或接手批次 (2026-11-17 首晚 7 對重複下注的溫床)。另外，
+#   用家想在系統注單基礎上自行跟投 (自行決定注碼或觀望)，但「賽前建檔與
+#   投注」分頁在自動輸入期間由執行器驅動，不宜手動干預。
+#
+#   V16.2 內容：
+#   1. 主裝置模式 (雲端設定 runner_mode，預設關閉=沿用舊行為)：
+#      - 開啟後，只有「主裝置」會啟動/接手自動批次 (CLV 下注、每日結算、
+#        快照)。主裝置由用家在 V16 面板勾選，標記存於網址參數 (書籤/重新
+#        整理均保留)；主裝置分頁每 10 秒寫心跳 (容器共用檔)。
+#      - 其他裝置 = 唯讀查看：顯示主裝置進度 (V15.3 橫幅)、系統注單及分析，
+#        永不自動啟動/接手批次；唯讀裝置仍可操作「👤 用家跟投」分頁及所有
+#        手動功能 (明確的人工操作)。
+#      - 安全網：主裝置離線逾 12 分鐘 (心跳過期) 時，其他裝置可補位維持
+#        每日結算運作 (不會令系統靜默停擺)。
+#   2. 「👤 用家跟投」新分頁：顯示所有待結算比賽的系統注單 + 賽前分析結果
+#      (模型概率/市場概率/Edge/閘門/近況/排名，全部來自資料庫，毋須執行
+#      分析)，用家逐注勾選跟投、自訂注碼 → 寫入待結算注單，與系統注單
+#      同一場自動結算 (沿用既有結算路徑，結算「該場所有注單」)。
+#      用家跟投注單以 Note='用家跟投' 標記，**不供系統學習及分析**
+#      (v9_get_engine / v10_get_engine / v11_get_arena 訓練數據一律剔除)。
+#   3. 資料庫新增 Note 欄位 (DB_COLUMNS)：用家跟投標記隨主資料庫持久化
+#      (SQL 表自動 ALTER TABLE 補欄，GitHub CSV / 本地檔同步)；既有注單
+#      Note=空白，行為不變。
+#
+#   風險評估：低。主裝置模式預設關閉 (不開=行為與 V16.1 完全一致)；唯讀
+#   裝置寫入用家注前會先從 SQL 刷新快照 (沿用 V16.1 _v161_refresh_db_from_sql)
+#   並做重複檢查；學習剔除只影響帶標記的注單。
+# ==============================================================================
+# ==============================================================================
+# V16.1 開賽前 CLV 記錄器修復版 — 2026-11-18
+#
+#   背景 (V16 首晚 2026-11-17/18 實測發現的 4 個問題，本手冊式修復逐項對應)：
+#   1. 跨裝置重複下注 ×7 對 (23:33-23:54 兩波寫入)：接手裝置的 session 快照
+#      過舊 (載入時 SQL 失敗退回 GitHub 舊 CSV，或載入早於第一波寫入)，看不到
+#      剛寫入的注單 → 「已記錄跳過」失效 → 重複下注。V15.7 互斥只防「同時跑」
+#      不防「接手後重跑」。
+#   2. 無隊名注單 ×3 (02:32 盧頓 vs 彼德堡)：Tipsme API 回傳空白隊名時填充
+#      仍「成功」，寫出 Home_Team/Away_Team 全空的注單 (Match = " vs ")，結算
+#      永遠配不到，4 分鐘後重試又以正確隊名再寫同樣 3 注 → 同場雙份。
+#   3. Match_Date = 0001-01-01 ×71：API 回傳 fullMatchTimeUtc = '0001-01-01...'
+#      (空日期的編碼) 時，填充把 0001-01-01 當真實開賽日寫進注單。
+#   4. 修復前臨時對策「夜間只開一部裝置」仍建議沿用，但機制上已雙保險。
+#
+#   V16.1 修復內容 (全部在「觸發/填充/寫入」層，學習引擎、結算、風控零改動)：
+#   1. SQL 即時去重 (雙保險)：
+#      (a) clv 批次每場 FILL 前 → _v161_refresh_db_from_sql() 從 SQL 強制刷新
+#          session 快照 (ID 聯集合併 _v159_merge_db，本機獨有列全保留) —
+#          「已記錄跳過」檢查從此用 SQL 即時數據，不受舊快照影響；
+#      (b) clv 接手時 (狀態檔逾 5 分鐘無更新即將接手) → 同樣先刷新；
+#      (c) 自動模式寫入前 (BET 分支) → _v161_sql_read_bets() 再查一次 SQL，
+#          同 Tipsme_Match_ID + 同盤口 + 同選項 + 同盤口線已存在即跳過。
+#   2. 空隊名防護：tipsme_auto_fill 讀取後若 home/away 去空白後為空 →
+#      視為填充失敗 (回 False)，整場不寫注 → 杜絕 " vs " 記錄；批次稍後
+#      自動重試 (同場最多 2 次機制不變)。
+#   3. Match_Date 三重防護：
+#      (a) 填充時 kickoff 年份 < 2000 (0001-01-01 等) → 不寫入 date_input，
+#          沿用今天作預設 (與 kickoff 缺失同一處理)；
+#      (b) clv 批次 FILL 成功後 → 強制以賽程表 match_time (HKT) 填
+#          match_date_input — 賽程表的開賽時間永遠正確；
+#      (c) 載入時一次性回填 v161_backfill_match_dates()：Match_Date 為
+#          0001-01-01 的既有注單，按「記錄時間+35 分鐘」的日期回填 (T-30
+#          批次寫入距開賽約 25-35 分鐘)，並同步雲端。
+#
+#   風險評估：低。修復 1 只影響 clv 模式及自動模式的「寫入前檢查」(手動
+#   投注路徑零改動)；修復 2/3 在填充層加防護，令填充結果更嚴謹；回填函式
+#   冪等 (回填後不再觸發)。SQL 讀取失敗時一切照舊 (best-effort，絕不攔截)。
+# ==============================================================================
+# ==============================================================================
 # V15.13 SQL 雲端資料庫即時同步 (Supabase PostgreSQL) — 2026-11-16
 #
 #   背景：42MB 主資料庫整檔上傳 GitHub 在用家網絡環境下持續失敗 (11-15 18:32
@@ -658,7 +730,8 @@ DB_COLUMNS = [
     'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner', 
     'Home_Goal_Conversion', 'Away_Goal_Conversion', 'Home_Firepower', 'Away_Firepower',
     'Home_Corner_Eff', 'Away_Corner_Eff',
-    'Result_Label', 'System_Profit', 'User_Profit', 'Unit_Profit', 'System_Payout', 'User_Payout'
+    'Result_Label', 'System_Profit', 'User_Profit', 'Unit_Profit', 'System_Payout', 'User_Payout',
+    'Note'   # V16.2：用家跟投標記 ('用家跟投' = 不供系統學習；空白 = 一般注單)
 ]
 CAPITAL_COLUMNS = ['ID', 'Date', 'Type', 'Account', 'Amount', 'Note']
 CATEGORY_OPTIONS = ["國內聯賽 (Domestic League)", "國際聯賽 (International League)", "國際盃賽 (Cup)", "國內盃賽 (Domestic Cup)", "友誼賽 (Friendly)"]
@@ -865,6 +938,17 @@ def _v1512_save_sql_main(df, table_name):
             df_to_db.to_sql(table_name, engine, if_exists='replace', index=False)
             return True
         base = st.session_state.get('_v1512_base') or {}
+        # V16.2：df 新增欄位 (如 Note=用家跟投標記) 而雲端表尚未有該欄時，
+        # 先冪等 ALTER TABLE 補欄 (TEXT)，避免 to_sql append 因欄位不符失敗
+        try:
+            _tbl_cols = set(c.get('name') for c in _sa_inspect(engine).get_columns(table_name))
+            _missing_cols = [c for c in df.columns if c not in _tbl_cols]
+            if _missing_cols:
+                with engine.begin() as conn:
+                    for c in _missing_cols:
+                        conn.execute(text(f'ALTER TABLE "{table_name}" ADD COLUMN "{c}" TEXT'))
+        except Exception:
+            pass
         cur_ids = set(df['ID'].astype(str))
         deleted_ids = [r for r in base if r not in cur_ids]
         changed = _v1512_changed_rows(df)
@@ -1104,6 +1188,71 @@ def save_db(df, filename, table_name):
         df.to_csv(filename, index=False)
     except Exception:
         pass
+
+# ==========================================
+# V16.1 SQL 即時讀取與快照刷新 (2026-11-18)
+# ==========================================
+def _v161_sql_read_bets():
+    """V16.1：即時讀取 SQL 主資料庫 (football_bets) 全表。
+    用途：clv 批次「已記錄跳過」檢查及自動模式寫入前去重 — 不再依賴可能過舊的
+    session 快照。無 SQL 設定或讀取失敗 → 回傳 None (上層照舊用 session 快照，
+    best-effort 絕不攔截)。"""
+    try:
+        if not (HAS_SQLALCHEMY and _has_secret('DB_URL') and st.secrets['DB_URL']):
+            return None
+        engine = create_engine(st.secrets['DB_URL'])
+        df = pd.read_sql_table('football_bets', engine)
+        if df is None or df.empty:
+            return None
+        return process_legacy_columns(df)
+    except Exception:
+        return None
+
+def _v161_refresh_db_from_sql():
+    """V16.1：批次開始前從 SQL 強制刷新 session df_db。
+    背景 (2026-11-17 首晚事故)：接手裝置的 session 快照過舊，看不到其他裝置剛
+    寫入的注單 → 「已記錄跳過」失效 → 7 對重複下注。刷新後快照與 SQL 一致
+    (合併策略沿用 V15.9.2 _v159_merge_db：ID 聯集、已結算優先、本機獨有列全
+    保留 — 絕不因刷新而丟失本 session 數據)。回傳 True 表示已刷新。"""
+    try:
+        cloud = _v161_sql_read_bets()
+        if cloud is None:
+            return False
+        ours = st.session_state.get('df_db')
+        if ours is None or ours.empty:
+            merged = cloud
+        else:
+            merged = _v159_merge_db(cloud, ours)
+        st.session_state['df_db'] = enforce_columns(merged, DB_COLUMNS)
+        return True
+    except Exception:
+        return False
+
+def v161_backfill_match_dates(df):
+    """V16.1：一次性回填 Match_Date 為 0001-01-01 的注單 (V16 clv 填充 bug 產生，
+    2026-11-17/18 隔夜共 71 筆)。回填規則：T-30 批次寫入距開賽約 25–35 分鐘 →
+    Match_Date ≈ 記錄時間 (Date 欄) + 35 分鐘的日期 (與項目手冊記載的回填規則
+    一致)。冪等：回填後不再觸發。回傳 (新 df, 回填筆數)；任何例外回傳 (原 df, 0)。"""
+    if df is None or df.empty or 'Match_Date' not in df.columns or 'Date' not in df.columns:
+        return df, 0
+    try:
+        _md = pd.to_datetime(df['Match_Date'], errors='coerce')
+        _mask = _md.isna() | (_md.dt.year < 2000)
+        if not _mask.any():
+            return df, 0
+        _dt = pd.to_datetime(df['Date'], errors='coerce')
+        _fill = (_dt + pd.Timedelta(minutes=35)).dt.strftime('%Y-%m-%d')
+        out = df.copy()
+        n = 0
+        for _idx in out.index[_mask]:
+            _fd = _fill.get(_idx)
+            # 只接受 YYYY-MM-DD 格式 (Date 欄無效/NaT 時不回填，留待質素檢查處理)
+            if _fd is not None and re.fullmatch(r'\d{4}-\d{2}-\d{2}', str(_fd)) and str(_fd) >= '2000-01-01':
+                out.at[_idx, 'Match_Date'] = str(_fd)
+                n += 1
+        return out, n
+    except Exception:
+        return df, 0
 
 # ==========================================
 # 2. 資金、風控與累計算式 (分離系統與真實資金)
@@ -3501,6 +3650,12 @@ def v9_history_tables_cached(df_input):
 
 
 def v9_get_engine(df_db):
+    # V16.2：用家跟投注單不供系統學習 (Note='用家跟投' 的注單是覆製系統預測，
+    # 若納入會重複計算同一場證據)；先剔除再訓練
+    try:
+        df_db = _v162_excl_user_bets(df_db)
+    except Exception:
+        pass
     df_settled = df_db[df_db['Status'] == 'Settled'].copy() if not df_db.empty else df_db.copy()
     if df_settled.empty:
         return {'trained': False, 'msg': '尚無已結算數據。', 'w': 0.0, 'bt_type': {}, 'models': None}, pd.DataFrame(), pd.DataFrame()
@@ -4474,6 +4629,11 @@ def v10_train_engine_cached(df_input):
 
 
 def v10_get_engine(df_db):
+    # V16.2：用家跟投注單不供系統學習 (與 v9_get_engine 同一排除規則)
+    try:
+        df_db = _v162_excl_user_bets(df_db)
+    except Exception:
+        pass
     df_settled = df_db[df_db['Status'] == 'Settled'].copy() if not df_db.empty else df_db.copy()
     if df_settled.empty:
         return {'trained': False, 'msg': '尚無已結算數據。', 'rules': [], 'bt': {}, 'bt_type': {}, 'compare': [], 'coef': {}}
@@ -5576,6 +5736,11 @@ def v11_arena_cached(df_input):
 
 
 def v11_get_arena(df_db):
+    # V16.2：用家跟投注單不供系統學習/競技場評估 (與 v9_get_engine 同一排除規則)
+    try:
+        df_db = _v162_excl_user_bets(df_db)
+    except Exception:
+        pass
     df_settled = df_db[df_db['Status'] == 'Settled'].copy() if not df_db.empty else df_db.copy()
     if df_settled.empty:
         return {'trained': False, 'msg': '尚無已結算數據。', 'active': {}, 'league': {}, 'summary': [], 'by_type': [], 'by_league': []}
@@ -7164,6 +7329,15 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams):
     if not info:
         return False, "讀取比賽資料失敗 (網絡或網站問題)，請稍後再試或改為手動輸入。", None
 
+    # V16.1 空隊名防護 (2026-11-18 02:32 盧頓 vs 彼德堡事故)：Tipsme API 回傳
+    # 空白隊名 (如全空白字串) 時，舊版仍當「填充成功」寫出 " vs " 無名注單，
+    # 結算永遠配不到。此處直接視為填充失敗 → 整場不寫注；clv 批次稍後自動
+    # 重試 (同場最多 2 次機制不變)，重試成功時隊名齊全才會寫入。
+    _v161_h = str(info.get('home') or '').strip()
+    _v161_a = str(info.get('away') or '').strip()
+    if not _v161_h or not _v161_a:
+        return False, "比賽資料不完整 (隊伍名稱缺失)，已取消填充以免寫入無隊名注單；稍後會自動重試或請改為手動輸入。", None
+
     warnings = []
     # --- 1. 賽事名稱 ---
     league = info['league']
@@ -7177,7 +7351,10 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams):
     if cat in CATEGORY_OPTIONS:
         st.session_state['sel_cat'] = cat
     # --- 3. 比賽日期 ---
-    if info['kickoff'] is not None:
+    # V16.1 (2026-11-18)：kickoff 年份 < 2000 (即 0001-01-01 — Tipsme API 對
+    # 無開賽時間的編碼) 一律當「缺失」處理，不寫入 date_input，沿用今天的
+    # 預設值；clv 批次另會在 FILL 後以賽程表開賽時間強制覆蓋 (見執行器)。
+    if info['kickoff'] is not None and info['kickoff'].year >= 2000:
         st.session_state['match_date_input'] = info['kickoff'].date()
     # --- 4. 主客隊 ---
     for side, sel_key, txt_key, name in (('h', 'sh', 'txt_h_team', info['home']), ('a', 'sa', 'txt_a_team', info['away'])):
@@ -7296,7 +7473,7 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams):
         ctx['Tipsme_Match_ID'] = str(mid)
     # V14.4：重複比賽警告 — 資料庫已有同一場比賽 (同隊伍+同日期) 的記錄時提示，避免重複記錄
     _dup = v14_find_duplicate_match(df_db, info.get('home'), info.get('away'),
-                                    info['kickoff'].date() if info.get('kickoff') is not None else None,
+                                    info['kickoff'].date() if (info.get('kickoff') is not None and info['kickoff'].year >= 2000) else None,
                                     tipsme_id=mid)
     if _dup is not None and not _dup.empty:
         _dup_ids = ', '.join(_dup['ID'].astype(str).head(5))
@@ -7853,6 +8030,16 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
             st.session_state.pop(_k, None)
         st.session_state['show_analysis'] = False
         st.session_state.pop('analysis_result', None)
+        # V16.1：clv 批次每場填充前，先從 SQL 強制刷新 session 快照 —
+        # 修正 2026-11-17 首晚跨裝置重複下注事故：接手裝置舊快照看不到其他
+        # 裝置剛寫入的注單，令「已記錄跳過」失效。刷新後此檢查用 SQL 即時
+        # 數據。非 clv 模式 (每日結算/輪次) 零改動。
+        if str(a.get('mode')) == 'clv':
+            try:
+                if _v161_refresh_db_from_sql():
+                    df_db = st.session_state.get('df_db') or df_db
+            except Exception:
+                pass
         _dt = _v15_sched_date(m)
         _dup = v14_find_duplicate_match(df_db, m['home'], m['away'], _dt, tipsme_id=m.get('hkjc_match_id'))
         if _dup is not None and not _dup.empty:
@@ -7892,6 +8079,14 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
             return
         a['err'] = 0
         _v15_log(f"✅ 已填充 ({a['idx'] + 1}/{len(q)})：{_v15_mlabel(m)} {m['home']} vs {m['away']}")
+        # V16.1：clv 批次強制以「賽程表開賽時間」填比賽日期 — Tipsme 比賽頁
+        # API 的 fullMatchTimeUtc 可能回傳 0001-01-01 (空日期編碼) 或缺失，
+        # 賽程表 matchSchedules 的時間則永遠正確 (HKT)。杜絕 0001-01-01 注單。
+        if str(a.get('mode')) == 'clv' and m.get('match_time'):
+            try:
+                st.session_state['match_date_input'] = datetime.fromtimestamp(m['match_time'], HKT).date()
+            except Exception:
+                pass
         a['step'] = 'ANALYZE'
         a['tries'] = 0
         st.rerun()
@@ -8023,8 +8218,13 @@ def _v15_render_remote_body():
         st.warning("⚠️ 逾 5 分鐘無更新 — 啟動裝置的分頁可能已關閉或網站故障，進度可能已中斷。")
         # V15.7：一鍵接手 — 在本裝置重建佇列續傳 (已記錄/已結算的比賽自動略過)；
         # 接手後原裝置偵測到狀態檔 sid 不符會自動停止，兩邊不會同時寫入
-        if st.button("▶️ 本裝置接手續傳 (從中斷處繼續)", key="v15_takeover_btn"):
-            _v15_takeover(_s)
+        # V16.2：主裝置模式下唯讀分頁不提供接手 (主分頁在線時)；主分頁離線逾 12 分鐘
+        # 例外開放 (唯讀裝置補位，維持 09:30 結算與 T-n 下注不會靜默停擺)
+        if _v162_can_automate():
+            if st.button("▶️ 本裝置接手續傳 (從中斷處繼續)", key="v15_takeover_btn"):
+                _v15_takeover(_s)
+        else:
+            st.caption("🔒 主裝置模式開啟中且主分頁在線 — 本裝置唯讀查看，不會啟動或接手批次。")
     if _log:
         with st.container(height=150):
             for _ts, _lvl, _msg in (_log or [])[-8:]:
@@ -8034,7 +8234,10 @@ def _v15_render_remote_body():
                     st.markdown(f"`{_ts}` {_msg}")
 
 def v15_render_remote_status():
-    """V15.3：在頁面頂部顯示遠端進度 (本 session 沒有進行中的自動輸入時)。"""
+    """V15.3：在頁面頂部顯示遠端進度 (本 session 沒有進行中的自動輸入時)。
+    V16.2：主分頁 (runner=1) 每次渲染同時輸出主裝置心跳檔。"""
+    if _v162_is_runner():
+        _v162_hb_write()
     _a = st.session_state.get('v15_auto') or {}
     if _a.get('active'):
         return
@@ -8099,9 +8302,14 @@ def _v1511_mark_done(yday):
 
 def _v1511_sched_try_start(df_db):
     """V15.11 排程觸發檢查：已啟用 + 到達觸發時間 + 前一天賽果未輸入 →
-    自動啟動日期模式自動輸入 (V15.10 既有路徑)。回傳 True 表示已啟動。"""
+    自動啟動日期模式自動輸入 (V15.10 既有路徑)。
+    V16.2：主裝置模式開啟時，唯讀分頁不自動啟動 (主裝置離線逾 12 分鐘時
+    例外補位 — 確保每日結算不會靜默停擺)。回傳 True 表示已啟動。"""
     cfg = _v1511_sched_load()
     if str(cfg.get('enabled')) != '1':
+        return False
+    # V16.2 主裝置模式閘門
+    if not _v162_can_automate():
         return False
     now = get_hkt_now()
     yday = (now - timedelta(days=1)).strftime('%Y-%m-%d')
@@ -8179,21 +8387,23 @@ def _v1511_sched_body():
 
 CLV_FILE = 'football_clv_db.csv'
 CLV_TABLE = 'football_clv_settings'
-CLV_COLUMNS = ['enabled', 'bet_lead_min', 'snap_hours', 'updated_ts']
+CLV_COLUMNS = ['enabled', 'bet_lead_min', 'snap_hours', 'runner_mode', 'updated_ts']
 
 def _v16_clv_load():
-    """V16：讀取 CLV 記錄器設定 (本地優先、雲端後備；無檔案回預設值)。"""
+    """V16：讀取 CLV 記錄器設定 (本地優先、雲端後備；無檔案回預設值)。
+    V16.2：新增 runner_mode (主裝置模式，預設 '0' 關閉=沿用舊行為)。"""
     now = get_hkt_now()
     cfg = {'enabled': '1', 'bet_lead_min': '30', 'snap_hours': '2',
-           'updated_ts': str(int(now.timestamp()))}
+           'runner_mode': '0', 'updated_ts': str(int(now.timestamp()))}
     try:
         df_c = load_db(CLV_FILE, CLV_COLUMNS, CLV_TABLE)
         if not df_c.empty:
             cfg = {k: (str(v) if v is not None else '') for k, v in df_c.iloc[0].to_dict().items()}
     except Exception:
         pass
-    for k in ('enabled', 'bet_lead_min', 'snap_hours'):
-        cfg.setdefault(k, {'enabled': '1', 'bet_lead_min': '30', 'snap_hours': '2'}[k])
+    for k in ('enabled', 'bet_lead_min', 'snap_hours', 'runner_mode'):
+        cfg.setdefault(k, {'enabled': '1', 'bet_lead_min': '30', 'snap_hours': '2',
+                           'runner_mode': '0'}[k])
     return cfg
 
 def _v16_clv_save(cfg):
@@ -8339,8 +8549,12 @@ def v16_try_start_auto_bet(df_db, cfg):
     """V16 開賽前自動下注觸發：任何 isHkjc、將於「開賽前 N 分鐘」內開賽、
     資料庫未記錄的比賽 → 啟動 v15_auto 執行器 (mode='clv'，只做 填充→分析→
     投注，不結算)。跨裝置互斥沿用 V15.7 狀態檔 (5 分鐘內有活動不搶)。
+    V16.2：主裝置模式開啟時，唯讀分頁不自動觸發 (主裝置離線逾 12 分鐘除外)。
     回傳 True 表示已啟動。"""
     if str(cfg.get('enabled')) != '1':
+        return False
+    # V16.2 主裝置模式閘門：唯讀分頁不自動啟動批次
+    if not _v162_can_automate():
         return False
     try:
         lead = int(float(cfg.get('bet_lead_min') or 0))
@@ -8363,6 +8577,15 @@ def v16_try_start_auto_bet(df_db, cfg):
         if _s and str(_s.get('active')) == '1':
             if (now.timestamp() - float(_s.get('updated_ts') or 0)) < 300:
                 return False
+            # V16.1：狀態檔逾 5 分鐘無更新 → 本裝置即將接手。接手前先從 SQL
+            # 強制刷新 session 快照，確保「已記錄跳過」看得到原裝置剛寫入的
+            # 注單 (2026-11-17 首晚 7 對重複下注的根因修復；FILL 步驟另有
+            # 每場刷新作第二重保險)。
+            try:
+                if _v161_refresh_db_from_sql():
+                    df_db = st.session_state.get('df_db') or df_db
+            except Exception:
+                pass
     except Exception:
         pass
     tried = st.session_state.get('_v16_bet_tried') or {}
@@ -8414,21 +8637,25 @@ def v16_try_start_auto_bet(df_db, cfg):
 
 def _v16_clv_body():
     """V16 背景 fragment 主體 (每 5 分鐘 + 每次頁面載入)：
-    (a) 開賽前賠率快照 (b) T-n 自動下注觸發 (c) 狀態顯示。"""
+    (a) 開賽前賠率快照 (b) T-n 自動下注觸發 (c) 狀態顯示。
+    V16.2：主裝置模式下，唯讀分頁略過 (a) 快照 (v15 心跳亦由主分頁輸出)，
+    (b) 已在 v16_try_start_auto_bet 內閘門；唯讀分頁只顯示狀態。"""
     cfg = _v16_clv_load()
     if str(cfg.get('enabled')) != '1':
         return
     df_db = st.session_state.get('df_db')
     if df_db is None or df_db.empty:
         return
+    _v162_viewer_view = _v162_runner_mode_on() and not _v162_is_runner() and _v162_hb_fresh()
     # (a) 開賽前賠率快照 — 例外不外洩 (背景檢查絕不令程式崩潰)
-    try:
-        added, updated_matches = v16_snapshot_open_bets(df_db, cfg)
-        if added > 0:
-            save_db(df_db, 'football_betting_db.csv', 'football_bets')
-            st.toast(f"📸 V16 CLV 快照：{len(updated_matches)} 場新增 {added} 個賠率快照", icon="📸")
-    except Exception:
-        pass
+    if not _v162_viewer_view:
+        try:
+            added, updated_matches = v16_snapshot_open_bets(df_db, cfg)
+            if added > 0:
+                save_db(df_db, 'football_betting_db.csv', 'football_bets')
+                st.toast(f"📸 V16 CLV 快照：{len(updated_matches)} 場新增 {added} 個賠率快照", icon="📸")
+        except Exception:
+            pass
     # (b) T-n 自動下注 — v15_auto 執行器會在主流程逐場推進 (每步一次 rerun)
     try:
         if v16_try_start_auto_bet(df_db, cfg):
@@ -8457,7 +8684,7 @@ def _v16_clv_body():
             _n0 = upcoming[0]
             _nxt = (f" · 下一場 {_n0.get('home')} vs {_n0.get('away')} "
                     f"{datetime.fromtimestamp(_n0['match_time'], HKT).strftime('%H:%M')}")
-        st.caption(f"🎯 V16 開賽前 CLV 記錄器運作中：今日 {len(matches)} 場 (馬會盤 {len(hkjc)})，"
+        st.caption(f"🎯 V16.2 開賽前 CLV 記錄器運作中：今日 {len(matches)} 場 (馬會盤 {len(hkjc)})，"
                    f"未開賽 {len(upcoming)} 場{_nxt} · "
                    f"自動下注：{'開賽前 ' + str(lead) + ' 分鐘' if lead > 0 else '只快照不下注'} · "
                    f"快照窗口：開賽前 {hours:g} 小時 · 背景 check 每 5 分鐘一次 (保持分頁開啟)")
@@ -8493,9 +8720,36 @@ def v16_render_clv_config():
                                  min_value=0, max_value=180, value=_lv, step=5, key="v16_lead")
         _hrs = _c2.number_input("快照監察窗口 (開賽前 X 小時內的未結算注單)",
                                 min_value=0.0, max_value=12.0, value=_hv, step=0.5, key="v16_hrs")
+
+        # --- V16.2 主裝置模式 ---
+        _rmode = st.checkbox("🔒 主裝置模式（其他裝置唯讀查看，不自動運行批次）",
+                             value=str(_cc.get('runner_mode') or '') == '1', key="v162_rmode")
+        if _rmode:
+            _is_run = _v162_is_runner()
+            _run_ck = st.checkbox("🖥️ 本裝置為主裝置（自動運行由本分頁負責，請保持開啟）",
+                                  value=_is_run, key="v162_runner")
+            if _run_ck != _is_run:
+                try:
+                    if _run_ck:
+                        st.query_params['runner'] = '1'
+                        st.toast("🖥️ 本裝置已標記為主裝置 — 此標記存在網址中，重新整理/書籤均保留。"
+                                 "請把此頁加到書籤，日後由書籤開啟。", icon="🖥️")
+                    else:
+                        try:
+                            del st.query_params['runner']
+                        except Exception:
+                            st.query_params['runner'] = ''
+                except Exception:
+                    pass
+            if _v162_hb_fresh():
+                st.caption("🟢 主裝置心跳：正常 (最近 12 分鐘內) — 其他裝置現為唯讀查看模式。")
+            else:
+                st.caption("🔴 主裝置心跳：未偵測到 — 其他裝置若開啟逾 12 分鐘仍無心跳，將自動補位維持每日結算。")
+
         if st.button("💾 儲存 CLV 記錄器設定", key="v16_save", use_container_width=True):
             _new = {'enabled': '1' if _cen else '0', 'bet_lead_min': str(int(_lead)),
-                    'snap_hours': str(float(_hrs)), 'updated_ts': ''}
+                    'snap_hours': str(float(_hrs)),
+                    'runner_mode': '1' if _rmode else '0', 'updated_ts': ''}
             if _v16_clv_save(_new):
                 st.toast("✅ V16 CLV 記錄器設定已儲存到雲端，所有裝置同步生效。", icon="🎯")
                 st.rerun()
@@ -8512,6 +8766,253 @@ def v16_render_clv_config():
                    f"目前狀態：{'✅ 已啟用' if str(_cc.get('enabled')) == '1' else '未啟用'} · "
                    f"下注時點：{'開賽前 ' + str(_cc.get('bet_lead_min') or '30') + ' 分鐘' if str(_cc.get('bet_lead_min') or '0') not in ('0', '') else '只快照不下注'} · "
                    f"快照窗口：開賽前 {str(_cc.get('snap_hours') or '2')} 小時")
+
+# =============================================================================
+# V16.2 主裝置模式 (runner mode) + 用家跟投 — 2026-11-18
+# =============================================================================
+V162_RUNNER_HB_FILE = 'v16_runner_hb.csv'
+V162_USER_BET_NOTE = '用家跟投'
+
+def _v162_runner_mode_on():
+    """V16.2：主裝置模式是否開啟 (雲端設定 runner_mode，預設 '0' 關閉=沿用舊行為)。"""
+    try:
+        return str(_v16_clv_load().get('runner_mode') or '') == '1'
+    except Exception:
+        return False
+
+def _v162_is_runner():
+    """V16.2：本分頁是否為主裝置 (網址參數 runner=1，書籤/重新整理均保留)。"""
+    try:
+        return str(st.query_params.get('runner') or '') == '1'
+    except Exception:
+        return False
+
+def _v162_hb_write():
+    """V16.2：主裝置心跳 — 寫入時間戳到容器共用檔 (所有瀏覽器 session 共用)。
+    由 v15_render_remote_status 每 10 秒呼叫 (主裝置分頁開著 = 心跳持續)。"""
+    try:
+        with open(V162_RUNNER_HB_FILE, 'w', encoding='utf-8') as f:
+            f.write(str(int(get_hkt_now().timestamp())))
+    except Exception:
+        pass
+
+def _v162_hb_fresh(max_min=12):
+    """V16.2：主裝置心跳是否新鮮 (預設 12 分鐘 = 逾 70 個 10 秒週期無心跳)。"""
+    try:
+        if not os.path.exists(V162_RUNNER_HB_FILE):
+            return False
+        with open(V162_RUNNER_HB_FILE, encoding='utf-8') as f:
+            _ts = int(float((f.read() or '0').strip() or 0))
+        return (get_hkt_now().timestamp() - _ts) < max_min * 60
+    except Exception:
+        return False
+
+def _v162_can_automate():
+    """V16.2：本分頁可否「自動」啟動/接手批次 (CLV 下注、每日結算、快照)。
+    - 主裝置模式關閉 → True (沿用 V16.1 行為，任何分頁均可)；
+    - 主裝置模式開啟 → 只有主裝置 True；唯讀分頁只有當主裝置離線
+      (心跳逾 12 分鐘) 時才 True (安全網：維持每日結算運作)。
+    手動操作 (用家親手按按鈕) 不受此限 — 此函式只管「自動」觸發。"""
+    try:
+        if not _v162_runner_mode_on():
+            return True
+        if _v162_is_runner():
+            return True
+        return not _v162_hb_fresh()
+    except Exception:
+        return True
+
+def _v162_excl_user_bets(df):
+    """V16.2：從訓練/分析數據剔除「用家跟投」注單 (不供系統學習及分析)。
+    用家跟投注單 Note 欄 = V162_USER_BET_NOTE；其餘注單 (含既有用家注) 不變。"""
+    try:
+        if df is None or df.empty or 'Note' not in df.columns:
+            return df
+        return df[df['Note'].astype(str).str.strip() != V162_USER_BET_NOTE]
+    except Exception:
+        return df
+
+def v162_render_follow_tab():
+    """V16.2「👤 用家跟投」分頁：監察系統待結算注單 + 賽前分析結果，
+    用家自行決定跟投 (自訂注碼) 或觀望。任何裝置可用 (含唯讀查看裝置)。"""
+    st.subheader("👤 用家跟投 — 監察系統注單與分析，自行決定跟投或觀望")
+    st.caption("💡 此分頁的數據全部來自雲端資料庫 (毋須執行賽前分析)：系統注單的"
+               "模型概率 / 市場概率 / Edge / 閘門 / 近況 / 排名一目了然。勾選跟投並輸入"
+               "注碼後寫入待結算注單，與系統注單**同一場自動結算**。用家跟投注單只作"
+               "你的記錄參考，**不供系統學習及分析** (已從模型訓練數據剔除)。")
+
+    # --- 主裝置狀態 ---
+    try:
+        if _v162_runner_mode_on():
+            if _v162_is_runner():
+                st.success("🖥️ **本分頁為主裝置** — 自動運行 (CLV 快照/下注/每日結算) 由本分頁負責，請保持開啟。")
+            elif _v162_hb_fresh():
+                st.info("👁️ **唯讀查看模式** — 主裝置在線中，本裝置不會啟動或接手任何自動批次。")
+            else:
+                st.warning("⚠️ 主裝置離線逾 12 分鐘 — 自動運行暫停中。如需本裝置接手，請到「📝 賽前建檔與投注」"
+                           "的 V16 面板勾選「本裝置為主裝置」。")
+    except Exception:
+        pass
+
+    df_db = st.session_state.get('df_db')
+    if df_db is None or df_db.empty:
+        st.info("數據庫尚未載入完成，請稍後再試。")
+        return
+    try:
+        open_df = df_db[df_db['Status'].astype(str) == 'Open'].copy()
+    except Exception:
+        st.info("數據庫尚未載入完成，請稍後再試。")
+        return
+    if open_df.empty:
+        st.info("📭 目前沒有待結算 (Open) 注單。系統會在每場開賽前 30 分鐘自動下注，"
+                "翌晨 09:30 自動結算。")
+        return
+
+    groups = v10_match_groups(open_df)
+    if groups is None or groups.empty:
+        st.info("📭 目前沒有待結算注單。")
+        return
+
+    # 實注比賽排前 (用家關注優先)，其餘 ($0 模擬注) 其後
+    def _has_real(g):
+        try:
+            _m = v10_match_mask(open_df, g['Tournament_Name'], g['Match'], g['_md'])
+            _rows = open_df[_m]
+            return int((pd.to_numeric(_rows['System_Stake'], errors='coerce').fillna(0) > 0).sum())
+        except Exception:
+            return 0
+    groups = groups.to_dict('records')
+    for _g in groups:
+        _g['_real'] = _has_real(_g)
+    groups.sort(key=lambda g: (-g.get('_real', 0), str(g.get('_md') or '')))
+
+    _n_shown = 0
+    for g in groups:
+        _md = str(g.get('_md') or '')[:10]
+        _tourn = str(g.get('Tournament_Name') or '')
+        _match = str(g.get('Match') or '')
+        _rows = open_df[v10_match_mask(open_df, _tourn, _match, g['_md'])]
+        if _rows is None or _rows.empty:
+            continue
+        _sys_stake = pd.to_numeric(_rows['System_Stake'], errors='coerce').fillna(0)
+        _usr_stake = pd.to_numeric(_rows['User_Stake'], errors='coerce').fillna(0)
+        _real_n = int((_sys_stake > 0).sum())
+        _sim_n = int((len(_rows) - _real_n))
+        _followed = int((_usr_stake > 0).sum())
+        _badge = ("💰 系統實注" if _real_n else "🧪 模擬注 ($0)")
+        _ttl = f"{_md} · {_tourn} · {_match} — 系統 {_real_n} 實注 + {_sim_n} 模擬 · 用家已跟投 {_followed} 注"
+        with st.expander(f"{_badge}｜{_ttl}"):
+            _r0 = _rows.iloc[0]
+            _c1, _c2, _c3, _c4 = st.columns(4)
+            try:
+                _c1.metric("主隊排名", str(_r0.get('Home_Rating') or 'NA'))
+                _c2.metric("客隊排名", str(_r0.get('Away_Rating') or 'NA'))
+                _c3.metric("主隊近5場", str(_r0.get('Home_Form') or '—'))
+                _c4.metric("客隊近5場", str(_r0.get('Away_Form') or '—'))
+            except Exception:
+                pass
+            _disp_cols = [c for c in ['ID', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds',
+                                      'Model_Prob', 'Market_Prob', 'Edge', 'Gate',
+                                      'System_Stake', 'User_Stake'] if c in _rows.columns]
+            st.markdown("**系統注單及賽前分析：**")
+            st.dataframe(_rows[_disp_cols], use_container_width=True, hide_index=True)
+            if _followed:
+                st.markdown(f"**你已跟投的注單 ({_followed} 注)：**")
+                st.dataframe(_rows[_usr_stake > 0][_disp_cols], use_container_width=True, hide_index=True)
+
+            # --- 跟投表單 ---
+            st.markdown("**跟投：**勾選要跟的注項並輸入你的注碼，然後按寫入。")
+            _picks = []
+            for _i, (_rid, _rr) in enumerate(_rows.iterrows()):
+                _bid = str(_rr.get('ID') or '')            # 注單 ID (跨分頁唯一，作 widget key)
+                if not _bid or _bid.lower() == 'nan':
+                    continue
+                _bt = str(_rr.get('Bet_Type') or '')
+                _sel = str(_rr.get('Selection') or '')
+                _line = _rr.get('Initial_Line')
+                _odds = _rr.get('Initial_Odds')
+                _cc1, _cc2 = st.columns([3, 2])
+                _ck = _cc1.checkbox(f"{_bt} · {_sel} @{_odds}" + (f" (線 {_line})" if _line not in (None, '') else ''),
+                                     key=f"v162_ck_{_bid}", value=False)
+                _stk = _cc2.number_input("你的注碼 ($)", min_value=0.0, max_value=1000000.0,
+                                         value=100.0, step=10.0, key=f"v162_stk_{_bid}")
+                if _ck and float(_stk or 0) > 0:
+                    _picks.append((_bid, float(_stk)))
+            if st.button("✅ 寫入用家跟投注單", key=f"v162_go_{_md}_{_match}", use_container_width=True):
+                if not _picks:
+                    st.warning("請先勾選注項並輸入大於 0 的注碼。")
+                else:
+                    _ok_n, _skip_n, _skip_msg = 0, 0, []
+                    try:
+                        _v161_refresh_db_from_sql()   # V16.1：寫入前從 SQL 刷新最新數據
+                    except Exception:
+                        pass
+                    _dfw = st.session_state.get('df_db')
+                    _new_recs = []
+                    for _rid, _stk in _picks:
+                        try:
+                            _src = _dfw[_dfw['ID'] == _rid] if _dfw is not None else pd.DataFrame()
+                            if _src.empty:
+                                _skip_n += 1
+                                _skip_msg.append(f"{_rid} 找不到")
+                                continue
+                            _rec = dict(_src.iloc[0])
+                            # 重複檢查：同一場同盤口同選項同線已有用家跟投注 → 跳過
+                            _dup = None
+                            try:
+                                _dup = _dfw[(_dfw['Note'].astype(str).str.strip() == V162_USER_BET_NOTE) &
+                                            (_dfw['Status'].astype(str) == 'Open') &
+                                            (v10_match_mask(_dfw, _rec.get('Tournament_Name'), _rec.get('Match'),
+                                                            str(_rec.get('Match_Date') or '')[:10])) &
+                                            (_dfw['Bet_Type'].astype(str) == str(_rec.get('Bet_Type') or '')) &
+                                            (_dfw['Selection'].astype(str) == str(_rec.get('Selection') or '')) &
+                                            ((pd.to_numeric(_dfw['Initial_Line'], errors='coerce') -
+                                              float(_rec.get('Initial_Line') or 0)).abs() < 1e-6)]
+                            except Exception:
+                                _dup = None
+                            if _dup is not None and not _dup.empty:
+                                _skip_n += 1
+                                _skip_msg.append(f"{str(_rec.get('Bet_Type') or '')} "
+                                                 f"{str(_rec.get('Selection') or '')} "
+                                                 f"已有跟投注單 {_dup['ID'].astype(str).iloc[0]}")
+                                continue
+                            _rec.update({
+                                'ID': f"B{get_hkt_now().strftime('%Y%m%d%H%M%S')}{len(_new_recs)}F",
+                                'Date': get_hkt_now().strftime('%Y-%m-%d %H:%M'),
+                                'Status': 'Open',
+                                'System_Stake': 0.0,
+                                'User_Stake': float(_stk),
+                                'Note': V162_USER_BET_NOTE,
+                                'Result_Label': '', 'System_Profit': '', 'User_Profit': '',
+                                'Unit_Profit': '', 'System_Payout': '', 'User_Payout': '',
+                                'Half_Score': '', 'Home_Goal': '', 'Away_Goal': '',
+                                'Home_Corner': '', 'Away_Corner': '',
+                                'InPlay_Minute': '', 'Home_DA': '', 'Away_DA': '',
+                                'Home_SoT': '', 'Away_SoT': '', 'Home_SoFF': '', 'Away_SoFF': '',
+                                'Home_Red': '', 'Away_Red': '', 'Home_Yellow': '', 'Away_Yellow': '',
+                                'Home_Sub': '', 'Away_Sub': '', 'Home_Possession': '', 'Away_Possession': '',
+                                'Home_Goal_Conversion': '', 'Away_Goal_Conversion': '',
+                                'Home_Firepower': '', 'Away_Firepower': '',
+                                'Home_Corner_Eff': '', 'Away_Corner_Eff': '',
+                            })
+                            _new_recs.append(_rec)
+                            _ok_n += 1
+                        except Exception:
+                            _skip_n += 1
+                    if _new_recs:
+                        st.session_state.df_db = pd.concat(
+                            [st.session_state.df_db, pd.DataFrame(_new_recs)], ignore_index=True)
+                        save_db(st.session_state.df_db, "football_betting_db.csv", "football_bets")
+                    if _ok_n:
+                        st.toast(f"✅ 已寫入 {_ok_n} 注用家跟投注單 (待結算，與系統注同一場自動結算)", icon="📝")
+                    if _skip_n:
+                        st.warning("已略過 " + str(_skip_n) + " 注：" + "；".join(_skip_msg[:5]))
+                    if _ok_n:
+                        st.rerun()
+        _n_shown += 1
+    if _n_shown == 0:
+        st.info("📭 目前沒有待結算注單。")
+
 
 def v1511_render_sched_status():
     """在頁面頂部渲染排程背景檢查 fragment (與 V15.3 遠端進度橫幅同一模式)。"""
@@ -9969,6 +10470,21 @@ def main():
                    f"並已同步至雲端資料庫。下載的 Excel 報表亦會自動反映正確數據。")
         st.toast(f"🔧 已自動修復 {_rep_n} 筆錯誤賽果注單", icon="✅")
 
+    # --- V16.1 比賽日期自動回填：V16 clv 填充 bug 產生的 0001-01-01 注單 ---
+    # (2026-11-17/18 隔夜共 71 筆；回填規則 = 記錄時間+35 分鐘的日期，冪等 —
+    #  回填一次後不會再觸發，新注單已由填充層防護不再產生 0001-01-01)
+    try:
+        _bf161_df, _bf161_n = v161_backfill_match_dates(st.session_state.df_db)
+        if _bf161_n > 0:
+            st.session_state.df_db = _bf161_df
+            save_db(_bf161_df, db_file, db_table)
+            st.success(f"🔧 V16.1 已自動回填 {_bf161_n} 筆注單的比賽日期 (原為 0001-01-01，"
+                       f"按記錄時間+35 分鐘推算開賽日 — T-30 批次寫入距開賽約 25-35 分鐘)，"
+                       f"並已同步至雲端資料庫。此回填只會執行一次，之後不再觸發。")
+            st.toast(f"🔧 V16.1 已回填 {_bf161_n} 筆比賽日期", icon="✅")
+    except Exception:
+        pass
+
     # --- V15.1 K-League 待結算注單自動修復：2026-11-11 自動導入中斷遺留 ---
     # (FC首爾 vs FC安養 05-05 兩張 Open 模擬注；真實賽果經 Tipsme API 105841 核實)
     _kl_df, _kl_n = apply_kleague_open_repair(st.session_state.df_db)
@@ -10118,7 +10634,7 @@ def main():
     v1511_render_sched_status()   # V15.11：每日排程背景檢查 (每 5 分鐘)
     v16_render_clv_recorder()     # V16：開賽前 CLV 記錄器背景檢查 (每 5 分鐘)
 
-    t_pre, t_inplay, t_settle, t_ai, t_time_pnl, t_clv = st.tabs(["📝 賽前建檔與投注", "⏱️ 即場賽事與預測", "⚖ 賽果結算與管理", "🤖 全局模型", "📅 時間維度盈虧記錄分析", "🎯 CLV 與本金模擬"])
+    t_pre, t_follow, t_inplay, t_settle, t_ai, t_time_pnl, t_clv = st.tabs(["📝 賽前建檔與投注", "👤 用家跟投", "⏱️ 即場賽事與預測", "⚖ 賽果結算與管理", "🤖 全局模型", "📅 時間維度盈虧記錄分析", "🎯 CLV 與本金模擬"])
 
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
@@ -10776,6 +11292,11 @@ def main():
                         _dbx = st.session_state.df_db
                         _dbx_m = _dbx['Match'].astype(str).map(v11_clean_name) if not _dbx.empty else pd.Series(dtype=str)
                         _dbx_md = v10_md_series(_dbx) if not _dbx.empty else pd.Series(dtype=str)
+                        # V16.1：自動模式下注前，再讀取 SQL 即時數據作重複檢查
+                        # (第二重保險 — session 快照即使過舊，SQL 查到同場同盤
+                        # 同選項同盤口線已存在即跳過，杜絕跨裝置重複寫入)。
+                        # 手動投注路徑零改動 (只用 session 檢查，行為不變)。
+                        _sql161 = _v161_sql_read_bets() if _v15_on('BET') else None
                         for i, sel in enumerate(all_keys):
                             cand = option_map[sel]
                             s_stk = sys_stakes.get(sel, 0.0)
@@ -10790,7 +11311,26 @@ def main():
                                 if not _same.empty:
                                     _dup_skipped.append(f"{sel} (已存在注單 {', '.join(_same['ID'].astype(str))})")
                                     continue
-                        
+                            # V16.1：SQL 即時重複檢查 (只限自動模式) —
+                            # 同 Tipsme 比賽 ID + 同盤口 + 同選項 + 同盤口線已在
+                            # SQL 資料庫 → 跳過，杜絕跨裝置重複寫入。
+                            if _sql161 is not None and not _sql161.empty:
+                                _smid161 = str(st.session_state.get('tipsme_fill_mid') or '')
+                                if _smid161:
+                                    try:
+                                        _nid161 = lambda x: (str(int(float(x))) if _v14_is_num(x) else str(x or '').strip())
+                                        _sq161 = _sql161[_sql161['Tipsme_Match_ID'].map(_nid161) == _smid161] if 'Tipsme_Match_ID' in _sql161.columns else _sql161.iloc[0:0]
+                                        if not _sq161.empty:
+                                            _bt161 = str(cand['bet_type']).replace(' (即場)', '')
+                                            _sq161 = _sq161[(_sq161['Bet_Type'].astype(str).str.replace(' (即場)', '', regex=False) == _bt161) &
+                                                           (_sq161['Selection'].astype(str) == str(cand['selection'])) &
+                                                           ((pd.to_numeric(_sq161['Initial_Line'], errors='coerce') - float(cand['line'])).abs() < 1e-6)]
+                                            if not _sq161.empty:
+                                                _dup_skipped.append(f"{sel} (SQL 已存在注單 {', '.join(_sq161['ID'].astype(str).head(5))})")
+                                                continue
+                                    except Exception:
+                                        pass
+
                             # 修改模式下：對應原本項目的注單沿用原 ID；
                             # 若用家改變了投注方向/盤口 (無法對應原本項目) 而只選了一項，
                             # 該項目仍視為對原注單的覆寫 (沿用原 ID 及原有其他欄位)
@@ -10907,6 +11447,9 @@ def main():
                     if _v15_is_control_exc(_v15e) or not (st.session_state.get('v15_auto') or {}).get('active'):
                         raise
                     _v15_step_crash('BET', _v15e)
+    # --- V16.2 用家跟投分頁 ---
+    with t_follow:
+        v162_render_follow_tab()
     with t_inplay:
         st.subheader("⏱ 即場賽事實時更新與智慧火力分析")
         
