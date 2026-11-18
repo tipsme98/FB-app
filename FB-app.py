@@ -9,6 +9,9 @@ import requests
 import itertools
 from datetime import datetime, timedelta, timezone
 # ==============================================================================
+# V16.4.1 (2026-11-18)：主表增量寫入和墓碑/Undo 同一事務；只按明示 ID 刪除。
+# 保留差量備份，不再把「本次某些列成功」當作全份備份可清空的證據。
+FB_APP_RELEASE = 'V16.4.1'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -829,49 +832,6 @@ def _v164_tomb_read():
     except Exception:
         return set()
 
-def _v164_tomb_add(ids):
-    """V16.4：寫入刪除墓碑 (冪等，ON CONFLICT DO NOTHING)。由
-    _v1512_save_sql_main 在同一事務內呼叫 (刪注 + 墓碑原子生效)。"""
-    try:
-        if not ids:
-            return
-        engine = _v163_sql_engine()
-        if engine is None:
-            return
-        from sqlalchemy import text, bindparam
-        _ids = [str(i) for i in ids if str(i).strip()]
-        if not _ids:
-            return
-        with engine.begin() as conn:
-            conn.execute(text(f'CREATE TABLE IF NOT EXISTS "{V164_TOMB_TABLE}" '
-                              f'("id" TEXT PRIMARY KEY, "deleted_at" TEXT)'))
-            _ins = text(f'INSERT INTO "{V164_TOMB_TABLE}" ("id", "deleted_at") '
-                        f'VALUES (:i, :t) ON CONFLICT ("id") DO NOTHING')
-            _now = get_hkt_now().strftime('%Y-%m-%d %H:%M:%S')
-            conn.execute(_ins, [{'i': i, 't': _now} for i in _ids])
-    except Exception:
-        pass
-
-def _v164_tomb_remove(ids):
-    """V16.4：移除墓碑 (僅供 Undo 復原 — 復原的注單重新可寫入/載入)。"""
-    try:
-        if not ids:
-            return
-        engine = _v163_sql_engine()
-        if engine is None:
-            return
-        from sqlalchemy import text, bindparam
-        _ids = [str(i) for i in ids if str(i).strip()]
-        if not _ids:
-            return
-        _del = text(f'DELETE FROM "{V164_TOMB_TABLE}" WHERE "id" IN :ids').bindparams(
-            bindparam('ids', expanding=True))
-        with engine.begin() as conn:
-            for i in range(0, len(_ids), 500):
-                conn.execute(_del, {"ids": _ids[i:i+500]})
-    except Exception:
-        pass
-
 def _v164_drop_tombs(df):
     """V16.4：從 df 過濾已墓碑化的列 (任何載入/合併/刷新點統一使用)。"""
     try:
@@ -1024,12 +984,12 @@ def _v159_merge_db(cloud_df, ours_df):
 # =============================================================================
 PENDING_DB_FILE = "football_betting_db_pending.csv"
 
-# 指紋欄位：偵測「本 session 改過的列」。刻意不含龐大 JSON 欄位 (Recent_Matches/
-# H2H_Records/Odds_History 等 — 這些建檔時一次寫入，不會事後修改)，令指紋計算在
-# 2,800+ 列上只需毫秒級，自動輸入每場 4-8 次儲存零負擔。
+# 指紋包含確實會在事後改寫的 Odds_History 與 Match_Date。
 V1512_FP_COLS = ['ID', 'Status', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds',
                  'System_Stake', 'User_Stake', 'Result_Label', 'System_Profit',
-                 'User_Profit', 'Unit_Profit', 'Note']
+                 'User_Profit', 'Unit_Profit', 'Note', 'Match_Date', 'Odds_History',
+                 'Date', 'Match', 'Home_Team', 'Away_Team', 'Half_Score',
+                 'System_Payout', 'User_Payout']
 
 def _v1512_is_main_db(filename):
     """V15.12：是否主資料庫檔 (需要差量備份保護)。"""
@@ -1039,8 +999,19 @@ def _v1512_fp(df):
     """V15.12：計算每列指紋 {ID: md5} — 偵測新增列與被修改列 (結算/改注)。"""
     try:
         import hashlib
+        from decimal import Decimal, InvalidOperation
         cols = [c for c in V1512_FP_COLS if c in df.columns]
-        d = df[cols].astype(str)
+        d = df[cols].astype('object').where(df[cols].notna(), '').astype(str)
+        def number_string(v):
+            try:
+                n = Decimal(v)
+                return str(n.normalize()) if n else '0'
+            except InvalidOperation:
+                return v
+        for col in ('Initial_Line', 'Initial_Odds', 'System_Stake', 'User_Stake', 'System_Profit',
+                    'User_Profit', 'Unit_Profit', 'System_Payout', 'User_Payout'):
+            if col in d:
+                d[col] = d[col].map(number_string)
         ids = df['ID'].astype(str).tolist()
         vals = d.values.tolist()
         fp = {}
@@ -1101,17 +1072,9 @@ def _v1512_backup_pending(df):
         changed = _v1512_changed_rows(df)
         if changed is None or changed.empty:
             return
-        cloud_pend = _v1512_load_pending()
-        if cloud_pend is not None and not cloud_pend.empty:
-            changed = _v159_merge_db(cloud_pend, changed)
-        _deleted_v1631 = _v1512_session_deleted_ids(df)
-        # V16.4：連 SQL 墓碑 (其他裝置刪的) 一併剔除 — 備份檔從此不再
-        # 收留任何已刪注單，殭屍備份隨每次上傳自然萎縮
-        _tomb_all164 = _v164_tomb_read()
-        if _tomb_all164:
-            _deleted_v1631 = (set(_deleted_v1631) | _tomb_all164) if _deleted_v1631 else _tomb_all164
-        if _deleted_v1631 and changed is not None and not changed.empty:
-            changed = changed[~changed['ID'].astype(str).isin(_deleted_v1631)]
+        tombs = _v164_tomb_read()
+        if tombs and changed is not None and not changed.empty:
+            changed = changed[~changed['ID'].astype(str).isin(tombs)]
             if changed.empty:
                 return
         if save_db_github(changed, st.secrets["GITHUB_REPO"], PENDING_DB_FILE, st.secrets["GITHUB_TOKEN"]):
@@ -1120,143 +1083,98 @@ def _v1512_backup_pending(df):
     except Exception:
         pass
 
-def _v1512_clear_pending():
-    """V15.13.1 修正：主檔「已確認」持久化 (SQL 或 GitHub 上傳成功) 後才清空差量備份檔。
-    V15.12 缺陷：merge_pending_on_load 無條件 save_db + clear —— 若主檔上傳失敗，
-    備份列只存在容器，下次容器重建即全部遺失。此函式由 save_db 的成功分支呼叫
-    (SQL 成功 _sql_ok1513 或 GitHub 成功 _gh_ok1512)，確保數據已持久化。"""
-    try:
-        if _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO"):
-            save_db_github(pd.DataFrame(columns=DB_COLUMNS),
-                           st.secrets["GITHUB_REPO"], PENDING_DB_FILE, st.secrets["GITHUB_TOKEN"])
-    except Exception:
-        pass
-
-
-def _v1512_session_deleted_ids(df):
-    """V16.3.1：本 session 刪除的注單 ID 清單 (載入基準 base 有、現 df 無)。
-    用家刪注後，這些 ID 必須從差量備份檔剔除，否則下次載入時備份檔會把
-    已刪注單「復活」回 session 並回寫 SQL (2026-11-18 用家實測：V16.2 刪了
-    8 對重複注單，部署 V16.3 後全部再出現的機制之一)。"""
-    try:
-        base = st.session_state.get('_v1512_base') or {}
-        if df is None or df.empty or not base:
-            return set()
-        cur_ids = set(df['ID'].astype(str))
-        return {r for r in base if r not in cur_ids}
-    except Exception:
-        return set()
-
-
-def _v1512_prune_pending_deleted(df):
-    """V16.3.1：把本 session 已刪除的 ID 從差量備份檔移除。
-    必須在 _v1512_capture_base(df) 之前呼叫 (capture 後 base 已更新，
-    刪除的 ID 不再可辨)。任何失敗靜默跳過 (best-effort)。"""
-    try:
-        deleted = _v1512_session_deleted_ids(df)
-        # V16.4：連 SQL 墓碑 (其他裝置刪的) 一併剔除 — 備份檔上傳成功一次
-        # 就少一批殭屍列，長遠自然乾淨 (即使上傳失敗，載入端亦有墓碑過濾
-        # 雙保險，殭屍列無法再進任何 session)
-        _tomb164 = _v164_tomb_read()
-        if _tomb164:
-            deleted = (set(deleted) | _tomb164) if deleted else _tomb164
-        if not deleted:
-            return
-        pend = _v1512_load_pending()
-        if pend is None or pend.empty:
-            return
-        kept = pend[~pend['ID'].astype(str).isin(deleted)]
-        if len(kept) == len(pend):
-            return
-        if kept.empty:
-            _v1512_clear_pending()
-        else:
-            if _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO"):
-                save_db_github(kept, st.secrets["GITHUB_REPO"], PENDING_DB_FILE, st.secrets["GITHUB_TOKEN"])
-    except Exception:
-        pass
-
-def _v1512_save_sql_main(df, table_name):
-    """V15.13：主資料庫 SQL 增量寫入。表不存在 → 一次性整檔遷移；之後每次只
-    DELETE+INSERT 有變動的列 (新增/結算/修改) 及已被清理的列 — 幾 KB 級流量，
-    秒級完成。任何例外 → 回傳 False (上層顯示錯誤，GitHub/差量備份後備照常)。"""
+def _v1512_save_sql_main(df, table_name, *, delete_ids=(), restore_ids=()):
+    """主表安全寫入：缺列不是刪除；所有列替換、墓碑及 Undo 同一 PostgreSQL 交易。"""
     try:
         from sqlalchemy import text, bindparam
         from sqlalchemy import inspect as _sa_inspect
-        # V16.3.1：共用單例引擎 (見 _v163_sql_engine docstring)
         engine = _v163_sql_engine()
         if engine is None:
             return False
-        if not _sa_inspect(engine).has_table(table_name):
-            # 首次遷移：整檔寫入
-            df_to_db = df.copy()
-            for col in df_to_db.columns:
-                if df_to_db[col].dtype == 'object':
-                    df_to_db[col] = df_to_db[col].apply(lambda x: str(x) if pd.notna(x) else None)
-            df_to_db.to_sql(table_name, engine, if_exists='replace', index=False)
-            return True
-        base = st.session_state.get('_v1512_base') or {}
-        # V16.2：df 新增欄位 (如 Note=用家跟投標記) 而雲端表尚未有該欄時，
-        # 先冪等 ALTER TABLE 補欄 (TEXT)，避免 to_sql append 因欄位不符失敗
-        try:
-            _tbl_cols = set(c.get('name') for c in _sa_inspect(engine).get_columns(table_name))
-            _missing_cols = [c for c in df.columns if c not in _tbl_cols]
-            if _missing_cols:
-                with engine.begin() as conn:
-                    for c in _missing_cols:
-                        conn.execute(text(f'ALTER TABLE "{table_name}" ADD COLUMN "{c}" TEXT'))
-        except Exception:
-            pass
-        cur_ids = set(df['ID'].astype(str))
-        deleted_ids = [r for r in base if r not in cur_ids]
-        # V16.4：同 ID 重複列一次性清理 + 唯一索引 (堵住兩裝置並發儲存的
-        # DELETE+INSERT 競態 — 競態曾令 SQL 出現同 ID 兩列，用家跟投分頁
-        # checkbox key 重複而整頁崩潰)。索引建成後並發插入會被數據庫拒絕
-        # (整次儲存回報失敗、下注自動重試)，同 ID 重複列從此不可能再出現。
-        try:
-            if not st.session_state.get('_v164_uidx_ok'):
-                with engine.begin() as conn:
-                    conn.execute(text(f'DELETE FROM "{table_name}" a USING "{table_name}" b '
-                                      f'WHERE a."ID" = b."ID" AND a.ctid > b.ctid'))
-                    conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_{table_name}_id" '
-                                      f'ON "{table_name}" ("ID")'))
-                st.session_state['_v164_uidx_ok'] = True
-        except Exception:
-            pass   # 索引未成 (可能有殘餘重複) — 下次儲存重試；不影響本路徑
-        changed = _v1512_changed_rows(df)
-        _chg_ids = sorted({str(x) for x in changed['ID'].tolist()}) if (changed is not None and not changed.empty) else []
-        _write_ids = sorted(set(deleted_ids) | set(_chg_ids))
-        if not _write_ids:
-            return True   # 本 session 無變更，毋須寫入
-        # V16.4：刪注墓碑 — 與主表 DELETE 同一事務 (原子)：任一半失敗則整個
-        # 回滾，墓碑與刪除永遠一致。刪除一旦成功，差量備份檔/其他裝置記憶體/
-        # 並發寫入都無法再令它復活
-        _del_stmt = text(f'DELETE FROM "{table_name}" WHERE "ID" IN :ids').bindparams(
-            bindparam('ids', expanding=True))
+        if table_name != 'football_bets':
+            raise ValueError('主表名稱不符')
+        deleted = {str(i) for i in delete_ids}
+        restored = {str(i) for i in restore_ids}
+        from_fallback = bool(st.session_state.get('_v1641_fallback_base'))
+        if deleted and from_fallback:
+            raise RuntimeError('正在使用備份快照；請先重開頁面並確認已讀到 SQL 主表')
+        fp = _v1512_fp(df)
+        if fp is None or deleted & set(fp) or not restored.issubset(fp):
+            raise ValueError('刪除／復原 ID 與資料列不符')
+        base = st.session_state.get('_v1641_sql_base', {})
+        changed_ids = {i for i, h in fp.items() if base.get(i) != h} | restored
+        ids = df['ID'].astype(str)
+        changed = df.loc[ids.isin(changed_ids)].copy()
+        if changed['ID'].astype(str).duplicated().any():
+            raise ValueError('待寫入注單包含重複 ID；原資料未變更')
+        def batched(conn, query, values):
+            values = sorted(values)
+            stmt = text(query).bindparams(bindparam('ids', expanding=True))
+            for i in range(0, len(values), 500):
+                conn.execute(stmt, {'ids': values[i:i+500]})
+
         with engine.begin() as conn:
-            if deleted_ids:
-                conn.execute(text(f'CREATE TABLE IF NOT EXISTS "{V164_TOMB_TABLE}" '
-                                  f'("id" TEXT PRIMARY KEY, "deleted_at" TEXT)'))
-                _ins164 = text(f'INSERT INTO "{V164_TOMB_TABLE}" ("id", "deleted_at") '
-                               f'VALUES (:i, :t) ON CONFLICT ("id") DO NOTHING')
-                _now164 = get_hkt_now().strftime('%Y-%m-%d %H:%M:%S')
-                conn.execute(_ins164, [{'i': str(i), 't': _now164} for i in deleted_ids])
-            for i in range(0, len(_write_ids), 500):
-                conn.execute(_del_stmt, {"ids": _write_ids[i:i+500]})
-        if _chg_ids:
-            # V16.4：寫入前過濾墓碑 ID — 已刪注單即使被備份檔/舊 session
-            # 混入 changed 集亦絕不回寫 SQL
-            changed_df = df[df['ID'].astype(str).isin(set(_chg_ids))].copy()
-            if deleted_ids:
-                changed_df = changed_df[~changed_df['ID'].astype(str).isin(set(deleted_ids))]
-            _tomb_all164 = _v164_tomb_read()
-            if _tomb_all164:
-                changed_df = changed_df[~changed_df['ID'].astype(str).isin(_tomb_all164)]
-            if not changed_df.empty:
-                for col in changed_df.columns:
-                    if changed_df[col].dtype == 'object':
-                        changed_df[col] = changed_df[col].apply(lambda x: str(x) if pd.notna(x) else None)
-                changed_df.to_sql(table_name, engine, if_exists='append', index=False)
+            if not _sa_inspect(conn).has_table(table_name, schema='public'):
+                raise RuntimeError('主表不存在；請先核對 Supabase 備份，禁止用舊快照自動重建')
+            # 先取同一張表的寫入鎖；逾時回滾，而不是在不同交易刪後再插。
+            conn.execute(text("SET LOCAL lock_timeout = '8s'"))
+            conn.execute(text('LOCK TABLE public."football_bets" IN SHARE ROW EXCLUSIVE MODE'))
+            if not changed_ids and not deleted:
+                return True
+            conn.execute(text(f'CREATE TABLE IF NOT EXISTS public."{V164_TOMB_TABLE}" '
+                              '("id" TEXT PRIMARY KEY, "deleted_at" TEXT)'))
+            conn.execute(text(f'ALTER TABLE public."{V164_TOMB_TABLE}" ENABLE ROW LEVEL SECURITY'))
+            if deleted:
+                now = get_hkt_now().strftime('%Y-%m-%d %H:%M:%S')
+                conn.execute(text(f'INSERT INTO public."{V164_TOMB_TABLE}" ("id", "deleted_at") '
+                                  'VALUES (:i, :t) ON CONFLICT ("id") DO NOTHING'),
+                             [{'i': i, 't': now} for i in sorted(deleted)])
+            if restored:
+                batched(conn, f'DELETE FROM public."{V164_TOMB_TABLE}" WHERE "id" IN :ids', restored)
+            tombs = {str(r[0]) for r in conn.execute(
+                text(f'SELECT "id" FROM public."{V164_TOMB_TABLE}"'))}
+            changed = changed.loc[~changed['ID'].astype(str).isin(tombs)]
+            write_ids = set(changed['ID'].astype(str))
+            if write_ids:
+                tbl_cols = {c['name'] for c in _sa_inspect(conn).get_columns(table_name, schema='public')}
+                for c in changed.columns:
+                    if c not in tbl_cols:
+                        if c not in DB_COLUMNS:
+                            raise ValueError(f'非主表欄位：{c}')
+                        conn.execute(text(f'ALTER TABLE public."football_bets" ADD COLUMN "{c}" TEXT'))
+                # 未知或只在舊快照出現的 ID 不能覆蓋當前 SQL；已結算不能被其他
+                # session 的舊 Open 覆蓋（只有明示的原注單編輯可將其重開）。
+                lookup = text('SELECT "ID", "Status" FROM public."football_bets" WHERE "ID" IN :ids'
+                              ).bindparams(bindparam('ids', expanding=True))
+                states = {}
+                ordered = sorted(write_ids)
+                for i in range(0, len(ordered), 500):
+                    for rid, state in conn.execute(lookup, {'ids': ordered[i:i+500]}):
+                        rid = str(rid)
+                        if rid in states:
+                            raise ValueError(f'SQL 存在同 ID 多列，須先核對：{rid}')
+                        states[rid] = state
+                edit_id = str(st.session_state.get('editing_bet_id') or '')
+                blocked = {str(row.ID) for row in changed[['ID', 'Status']].itertuples(index=False)
+                           if str(row.ID) in states and (str(row.ID) in restored
+                               or from_fallback or str(row.ID) not in base
+                               or (states[str(row.ID)] == 'Settled' and row.Status == 'Open'
+                                   and str(row.ID) != edit_id))}
+                blocked -= restored   # Undo 對已存在的 ID 不覆蓋
+                if blocked:
+                    raise RuntimeError('雲端已存在較新或未知的同 ID 注單；請先重新載入核對')
+                keep = write_ids - (restored & states.keys())
+                changed = changed.loc[changed['ID'].astype(str).isin(keep)]
+                write_ids = keep
+            batched(conn, 'DELETE FROM public."football_bets" WHERE "ID" IN :ids', deleted | write_ids)
+            if write_ids:
+                for col in changed.columns:
+                    if changed[col].dtype == 'object':
+                        changed[col] = changed[col].map(lambda x: str(x) if pd.notna(x) else None)
+                changed.to_sql(table_name, conn, schema='public', if_exists='append', index=False)
+        # 僅在 COMMIT 成功後記錄 SQL 基準；備份成功不能推進 SQL 基準。
+        st.session_state['_v1641_sql_base'] = {**{i:h for i,h in base.items() if i not in deleted},
+                                             **{i:fp[i] for i in write_ids}}
         return True
     except Exception as e:
         st.error(f"SQL 資料庫儲存失敗: {e}")
@@ -1289,17 +1207,10 @@ def _v1512_merge_pending_on_load():
             else:
                 merged = enforce_columns(_v159_merge_db(pend, df), DB_COLUMNS)
             st.session_state.df_db = merged
-            n = int(len(pend))
-            save_db(merged, "football_betting_db.csv", "football_bets")
-            # 主檔已確認持久化 → 才清空備份 (SQL 成功即代表已進 SQL 資料庫)
-            _persisted = bool(st.session_state.get('_v1512_sql_ok') or
-                             st.session_state.get('_gh_sync_ok_main'))
-            if _persisted:
-                _v1512_clear_pending()
-                st.session_state['_v1512_pending_used'] = False
-            else:
-                st.warning(f"⚠️ 主檔持久化未確認，差量備份檔保留 {n} 列不清空，下次載入將重試合併。")
-        _v1512_capture_base(st.session_state.df_db)
+            before, after = _v1512_fp(df) or {}, _v1512_fp(merged) or {}
+            n = sum(before.get(i) != h for i, h in after.items())
+            if n:
+                save_db(merged, "football_betting_db.csv", "football_bets")
         return n
     except Exception:
         return 0
@@ -1313,6 +1224,18 @@ def save_db_github(df, repo, path, token):
     _to159 = GITHUB_TIMEOUT_DB if (_big159 or str(path).endswith('football_betting_db_pending.csv')) else GITHUB_TIMEOUT
     res_get = _gh_request("GET", f"{url}?t={timestamp}", token, timeout=_to159)
     sha = res_get.json().get("sha") if (res_get is not None and res_get.status_code == 200) else None
+    if path == PENDING_DB_FILE:
+        if res_get is None or res_get.status_code not in (200, 404):
+            return False
+        if res_get.status_code == 200:
+            if not sha:
+                return False
+            cloud_pending = load_db_github(repo, path, token, timeout=_to159)
+            if cloud_pending is None:
+                return False
+            df = _v159_merge_db(cloud_pending, df)
+        # PUT 帶上最初 GET 的 SHA；並發更新造成 SHA 不符時 GitHub 拒絕覆蓋。
+        df = _v164_drop_tombs(df)
 
     # V15.9 覆蓋保護 (主資料庫)：上傳前先偵測雲端是否已被其他 session 寫入
     # (雲端 sha ≠ 本 session 載入時記下的 sha，或本 session 來源不明/本地後備載入)，
@@ -1326,6 +1249,8 @@ def save_db_github(df, repo, path, token):
         except Exception:
             pass
 
+    if _big159:
+        df = _v164_drop_tombs(df)
     csv_content = df.to_csv(index=False)
     if len(csv_content) > 2_000_000:
         _to159 = GITHUB_TIMEOUT_DB
@@ -1385,6 +1310,7 @@ def load_db(filename, columns, table_name, force_cloud=False):
     ]
     
     df = pd.DataFrame()
+    sql_loaded = False
     # 優先從雲端 SQL 資料庫讀取
     if HAS_SQLALCHEMY and _has_secret("DB_URL") and st.secrets["DB_URL"]:
         try:
@@ -1392,6 +1318,7 @@ def load_db(filename, columns, table_name, force_cloud=False):
             if engine is not None:
                 df = pd.read_sql_table(table_name, engine)
                 df = process_legacy_columns(df)
+                sql_loaded = True
                 # V16.4：主資料庫載入即過濾刪除墓碑 — 已刪注單絕不回 session
                 # (涵蓋「刪除成功但其他裝置稍後又寫回」等一切殘留情況)
                 if table_name == 'football_bets':
@@ -1400,7 +1327,8 @@ def load_db(filename, columns, table_name, force_cloud=False):
             pass
 
     # 其次從 GitHub 雲端倉庫讀取
-    if df.empty and _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO"):
+    sql_empty_authoritative = sql_loaded and table_name == 'football_bets'
+    if not sql_empty_authoritative and df.empty and _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO"):
         try:
             # V15.9：主資料庫用 120 秒超時下載，並記下雲端 sha 供覆蓋保護比對
             _big159 = _gh_is_big_file(filename)
@@ -1413,7 +1341,7 @@ def load_db(filename, columns, table_name, force_cloud=False):
             pass
 
     # 最後退回本地 CSV (僅作為備用)
-    if df.empty and os.path.exists(filename):
+    if not sql_empty_authoritative and df.empty and os.path.exists(filename):
         try:
             df = pd.read_csv(filename)
             if 'League' in df.columns and 'Tournament_Name' not in df.columns:
@@ -1427,19 +1355,25 @@ def load_db(filename, columns, table_name, force_cloud=False):
         df = pd.DataFrame(columns=columns)
         
     df = enforce_columns(df, columns)
+    if table_name == 'football_bets':
+        if not sql_loaded:
+            df = _v164_drop_tombs(df)
+        st.session_state['_v1641_last_load_sql'] = sql_loaded
     for col in string_cols:
         if col in df.columns: df[col] = df[col].astype('object')
         
     return df
 
-def save_db(df, filename, table_name):
-    # 1. 寫入 SQL 雲端資料庫 (V15.13：主資料庫增量寫入 — 只寫變動列、刪清理列；
-    #    小表維持整檔覆寫)
+def save_db(df, filename, table_name, *, delete_ids=(), restore_ids=()):
+    main_db = _v1512_is_main_db(filename)
+    explicit_change = bool(delete_ids or restore_ids)
     _sql_ok1513 = False
-    if HAS_SQLALCHEMY and _has_secret("DB_URL") and st.secrets["DB_URL"]:
+    sql_configured = bool(_has_secret("DB_URL") and st.secrets["DB_URL"])
+    if HAS_SQLALCHEMY and sql_configured:
         try:
-            if _v1512_is_main_db(filename):
-                _sql_ok1513 = _v1512_save_sql_main(df, table_name)
+            if main_db:
+                _sql_ok1513 = _v1512_save_sql_main(df, table_name, delete_ids=delete_ids,
+                                                   restore_ids=restore_ids)
             else:
                 engine = _v163_sql_engine()   # V16.3.1：共用單例引擎
                 if engine is None:
@@ -1455,19 +1389,16 @@ def save_db(df, filename, table_name):
         st.session_state['_v1512_sql_ok'] = _sql_ok1513
         if _sql_ok1513:
             st.session_state.pop('_v163_sql_err', None)   # V16.3.1：成功後清除錯誤顯示
-        if _sql_ok1513 and _v1512_is_main_db(filename):
-            # V16.3.1：先剔除本 session 已刪 ID 的差量備份 (必須在 capture_base
-            # 之前 — capture 後 base 已更新，刪除的 ID 不再可辨)
-            _v1512_prune_pending_deleted(df)
-            # SQL 已完整保存 → 更新指紋基準；差量備份檔內容已過時，順帶清空
+        if _sql_ok1513 and main_db:
             _v1512_capture_base(df)
-            if st.session_state.get('_v1512_pending_used'):
-                _v1512_clear_pending()
-                st.session_state['_v1512_pending_used'] = False
+    if explicit_change and not _sql_ok1513:
+        st.error('刪除／復原未獲 SQL 確認；不更改備份或目前畫面。')
+        return False
 
     # 2. 寫入 GitHub 雲端倉庫
     _gh_ok1512 = False
-    if _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO"):
+    can_sync_main = _sql_ok1513 and not st.session_state.get('_v1641_fallback_base')
+    if (not main_db or not sql_configured or can_sync_main) and _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO"):
         try:
             _ok159 = save_db_github(df, st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
             _gh_ok1512 = bool(_ok159)
@@ -1480,16 +1411,10 @@ def save_db(df, filename, table_name):
         except Exception as e:
             st.session_state['_gh_sync_fail'] = int(st.session_state.get('_gh_sync_fail', 0) or 0) + 1
             st.error(f"GitHub 雲端同步失敗: {e}")
-    # V15.12 差量備份：主資料庫上傳失敗 → 即時把本 session 新增/修改的列上傳到
-    # 小檔 football_betting_db_pending.csv；上傳成功 → 清空備份檔 (記錄已在主檔)。
-    # 效果：即使 42MB 主檔從此一次都上傳不成功，數據也不會再「只存在容器」。
-    if _v1512_is_main_db(filename):
+    if main_db:
         if _gh_ok1512:
-            if st.session_state.get('_v1512_pending_used'):
-                _v1512_clear_pending()
-                st.session_state['_v1512_pending_used'] = False
             _v1512_capture_base(df)
-        else:
+        elif not _sql_ok1513:
             _v1512_backup_pending(df)
 
     # 3. 寫入本地 CSV
@@ -1497,6 +1422,7 @@ def save_db(df, filename, table_name):
         df.to_csv(filename, index=False)
     except Exception:
         pass
+    return _sql_ok1513 if sql_configured or explicit_change else _gh_ok1512
 
 # ==========================================
 # V16.1 SQL 即時讀取與快照刷新 (2026-11-18)
@@ -1540,6 +1466,8 @@ def _v161_refresh_db_from_sql():
         else:
             merged = _v159_merge_db(cloud, ours)
         st.session_state['df_db'] = enforce_columns(merged, DB_COLUMNS)
+        for rid, fp in (_v1512_fp(cloud) or {}).items():
+            st.session_state.setdefault('_v1641_sql_base', {}).setdefault(rid, fp)
         return True
     except Exception:
         return False
@@ -5774,13 +5702,16 @@ def v11_clear_model_caches():
 
 
 def _v11_commit_db(df_new, msg, undo_rows=None):
+    df_new = enforce_columns(df_new.reset_index(drop=True), DB_COLUMNS)
+    delete_ids = undo_rows['ID'].astype(str).tolist() if undo_rows is not None and len(undo_rows) else []
+    if not save_db(df_new, V11_DB_FILE, V11_DB_TABLE, delete_ids=delete_ids) and delete_ids:
+        return
     if undo_rows is not None and len(undo_rows):
         st.session_state.setdefault('undo_stack', [])
         st.session_state.undo_stack.append({'id': f"U{get_hkt_now().strftime('%Y%m%d%H%M%S%f')}", 'target': 'bets',
                                             'data': undo_rows.copy(), 'timestamp': get_hkt_now().strftime('%Y-%m-%d %H:%M:%S')})
         st.session_state.undo_stack = st.session_state.undo_stack[-10:]
-    st.session_state.df_db = enforce_columns(df_new.reset_index(drop=True), DB_COLUMNS)
-    save_db(st.session_state.df_db, V11_DB_FILE, V11_DB_TABLE)
+    st.session_state.df_db = df_new
     v14_clear_model_caches()
     st.toast(msg, icon="🧹")
     st.rerun()
@@ -6896,6 +6827,9 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
                 if selected_to_delete:
                     ids_to_delete = [x.split(" | ")[0] for x in selected_to_delete]
                     df_to_delete = df_target[df_target['ID'].isin(ids_to_delete)]
+                    kept_bets = df_db[~df_db['ID'].isin(ids_to_delete)] if target_name == 'bets' else None
+                    if target_name == 'bets' and not save_db(kept_bets, db_file, db_table, delete_ids=ids_to_delete):
+                        return
                     
                     st.session_state.undo_stack.append({
                         'id': f"U{get_hkt_now().strftime('%Y%m%d%H%M%S%f')}",
@@ -6906,8 +6840,7 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
                     st.session_state.undo_stack = st.session_state.undo_stack[-10:]
                     
                     if target_name == 'bets':
-                        st.session_state.df_db = df_db[~df_db['ID'].isin(ids_to_delete)]
-                        save_db(st.session_state.df_db, db_file, db_table)
+                        st.session_state.df_db = kept_bets
                     else:
                         st.session_state.df_cap = df_cap[~df_cap['ID'].isin(ids_to_delete)]
                         save_db(st.session_state.df_cap, capital_file, cap_table)
@@ -6922,6 +6855,10 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
                 st.caption("此操作會將當前資料表所有紀錄移除，點擊下方確認執行。")
                 if st.button("⚠️ 確認清空全部", type="primary", use_container_width=True):
                     if not df_target.empty:
+                        cleared_bets = pd.DataFrame(columns=DB_COLUMNS)
+                        if target_name == 'bets' and not save_db(cleared_bets, db_file, db_table,
+                                                                delete_ids=df_target['ID'].astype(str).tolist()):
+                            return
                         st.session_state.undo_stack.append({
                             'id': f"U{get_hkt_now().strftime('%Y%m%d%H%M%S%f')}",
                             'target': target_name,
@@ -6931,8 +6868,7 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
                         st.session_state.undo_stack = st.session_state.undo_stack[-10:]
                         
                         if target_name == 'bets':
-                            st.session_state.df_db = pd.DataFrame(columns=DB_COLUMNS)
-                            save_db(st.session_state.df_db, db_file, db_table)
+                            st.session_state.df_db = cleared_bets
                         else:
                             st.session_state.df_cap = pd.DataFrame(columns=CAPITAL_COLUMNS)
                             save_db(st.session_state.df_cap, capital_file, cap_table)
@@ -6956,23 +6892,22 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
             
             if st.button("↩️ 復原所選的刪除紀錄 (Undo)", type="primary"):
                 real_idx = sel_undo[0]
-                action = st.session_state.undo_stack.pop(real_idx)
+                action = st.session_state.undo_stack[real_idx]
                 
                 if action['target'] == 'bets':
-                    st.session_state.df_db = pd.concat([st.session_state.df_db, action['data']], ignore_index=True)
-                    # V16.4：復原 = 移除這些 ID 的刪除墓碑，復原注單才可重新
-                    # 寫入 SQL 及被其他裝置載入 (墓碑不除的話載入/寫入過濾
-                    # 會把它們永久擋住)
-                    try:
-                        _v164_tomb_remove([str(x) for x in action['data']['ID'].tolist()])
-                    except Exception:
-                        pass
-                    save_db(st.session_state.df_db, db_file, db_table)
+                    existing = set(st.session_state.df_db['ID'].astype(str))
+                    rows = action['data'][~action['data']['ID'].astype(str).isin(existing)]
+                    restored_bets = pd.concat([st.session_state.df_db, rows], ignore_index=True)
+                    if not rows.empty and not save_db(restored_bets, db_file, db_table,
+                                                      restore_ids=rows['ID'].astype(str).tolist()):
+                        return
+                    st.session_state.df_db = restored_bets
                 else:
                     st.session_state.df_cap = pd.concat([st.session_state.df_cap, action['data']], ignore_index=True)
                     save_db(st.session_state.df_cap, capital_file, cap_table)
                     
-                st.toast(f"✅ 已成功復原 {len(action['data'])} 筆資料！系統資金池已自動重構。", icon="↩️")
+                st.session_state.undo_stack.pop(real_idx)
+                st.toast(f"✅ 已成功復原刪除操作。系統資金池已自動重構。", icon="↩️")
                 st.rerun()
 
 def parse_dt_for_comparison(dt_str, fallback_idx, fmt=None, ref=None):
@@ -10775,6 +10710,7 @@ def main():
         st.session_state.last_bet_id = None
         
     st.sidebar.header("⚙ 系統設定與資金管理")
+    st.sidebar.caption(FB_APP_RELEASE)
     v10_load_settings_into_state()
     
     db_file = "football_betting_db.csv"
@@ -10823,6 +10759,9 @@ def main():
     #  本機的 84 場記錄整批沖走。現在本機獨有的注單一律保留並即時回寫雲端。)
     if st.sidebar.button("🔄 即時從雲端同步最新數據", use_container_width=True):
         _cloud_db1512 = load_db(db_file, DB_COLUMNS, db_table, force_cloud=True)
+        if st.session_state.get('_v1641_last_load_sql') and not st.session_state.get('_v1641_fallback_base'):
+            for _rid, _fp in (_v1512_fp(_cloud_db1512) or {}).items():
+                st.session_state.setdefault('_v1641_sql_base', {}).setdefault(_rid, _fp)
         _local_db1512 = st.session_state.get('df_db')
         _has_local1512 = _local_db1512 is not None and not _local_db1512.empty
         _has_cloud1512 = _cloud_db1512 is not None and not _cloud_db1512.empty
@@ -10854,6 +10793,9 @@ def main():
 
     if 'df_db' not in st.session_state:
         st.session_state.df_db = load_db(db_file, DB_COLUMNS, db_table)
+        st.session_state['_v1641_sql_base'] = _v1512_fp(st.session_state.df_db) or {}
+        st.session_state['_v1641_fallback_base'] = not st.session_state.get('_v1641_last_load_sql')
+        _v1512_capture_base(st.session_state.df_db)
         # V15.12：載入後自動檢查差量備份檔 — 上次雲端同步失敗時保存在小檔的
         # 記錄會自動合併回主資料庫並回寫雲端，任何裝置開啟即恢復
         _pend_n1512 = _v1512_merge_pending_on_load()
@@ -10902,9 +10844,9 @@ def main():
     # (浦項制鐵 vs 濟州SK 2026-11-01：用家已記錄 Under 2.5，導入再寫入 Over 2.5 $0 模擬注；
     #  根因為賽程頁譯名 (浦项铁人/濟州聯SK FC) 與資料庫譯名不同，比對不到而誤判未記錄)
     _dup_df, _dup_n = apply_kleague_dup_cleanup(st.session_state.df_db)
-    if _dup_n > 0:
+    _cleanup_ids = (set(st.session_state.df_db['ID'].astype(str)) - set(_dup_df['ID'].astype(str))) if _dup_n else set()
+    if _dup_n > 0 and save_db(_dup_df, db_file, db_table, delete_ids=_cleanup_ids):
         st.session_state.df_db = _dup_df
-        save_db(_dup_df, db_file, db_table)
         st.success(f"🗑️ V15.2 已自動刪除 {_dup_n} 筆 2026-11-11 導入重複寫入的注單 "
                    f"(B202611111218360 浦項制鐵 vs 濟州SK 2026-11-01 入球大小 Over 2.5 $0 模擬注；"
                    f"該場已有用家注單 B202611012256560 Under 2.5)，並已同步至雲端資料庫。")
@@ -11864,9 +11806,11 @@ def main():
                         v11_save_league_size(res['t_name'], int(league_size), silent=True)
                         
                         st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame(new_records)], ignore_index=True)
-                        st.toast("✅ 投注紀錄雲端同步成功！", icon="📝")
                         st.session_state.last_bet_id = new_records[-1]['ID']
-                        save_db(st.session_state.df_db, db_file, db_table)
+                        if save_db(st.session_state.df_db, db_file, db_table):
+                            st.toast("✅ 投注紀錄雲端同步成功！", icon="📝")
+                        else:
+                            st.warning("投注紀錄未獲主儲存確認；請先保留本頁並匯出備份，勿重新提交相同注單。")
                     
                         # V14.12：自動模式 — 投注已寫入，自動切換至賽果結算
                         if _v15_on('BET'):
