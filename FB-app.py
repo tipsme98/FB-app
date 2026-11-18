@@ -9,6 +9,40 @@ import requests
 import itertools
 from datetime import datetime, timedelta, timezone
 # ==============================================================================
+# V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
+#
+#   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
+#   重複幾次都無法完全刪除」；V10 設定又自己變回舊值 (保護開關被自動剔除)；
+#   用家跟投分頁 StreamlitDuplicateElementKey 整頁崩潰。
+#
+#   根因 (三個獨立殭屍鏈路，逐一堵死)：
+#   1. 刪注復活主鏈路 — 差量備份檔殭屍：GitHub 上傳在用家網絡長期失敗
+#      (實測連續 5 次)，備份檔 football_betting_db_pending.csv 以 ID 聯集
+#      合併、永不遺忘已刪 ID → 每次載入 merge_pending_on_load 把已刪注單
+#      合併回 session 並回寫 SQL。V16.3.1 的備份剔除靠 GitHub 上傳 (必失敗)
+#      → 等於沒堵。修復：刪注寫入 SQL 墓碑表 (football_bets_deleted)，與
+#      主表 DELETE 同一事務；載入/合併/刷新/備份上傳一律過濾墓碑 — 備份檔
+#      上傳成不成功都無法再復活已刪注單。墓碑只增不減 (Undo 復原時顯式移除)。
+#   2. 主裝置記憶體殭屍：主裝置 24 小時長開 session 記憶體仍留有已刪注單，
+#      _v161_refresh_db_from_sql 的「本機獨有列全保留」令它們永不消失。
+#      修復：刷新時雲端與本機兩側都先過濾墓碑。
+#   3. 同 ID 重複列 → 跟投分頁崩潰：兩裝置並發儲存同一批變動列時，
+#      DELETE+INSERT 競態令 SQL 出現同 ID 兩列 (用家跟投分頁 checkbox key
+#      重複 → StreamlitDuplicateElementKey)。修復：save_sql_main 一次性
+#      清理重複列 + 建 ID 唯一索引 (並發插入從此被數據庫拒絕)；跟投分頁
+#      顯示層按 ID 去重 + widget key 加序號雙保險。
+#   4. V10 設定又變回舊值 — GitHub 設定檔殭屍：v10_save_settings 的 V15.9
+#      合併保護讀 GitHub 設定檔作「雲端現值」，但 GitHub 檔長期停留在舊
+#      年代值 (上傳失敗) → 任何一次正常儲存都把舊值拉回來覆蓋 SQL，連
+#      V16.3 schema 遷移的重置也被沖銷 (舊值+schema=2 標記 = 永久舊值)。
+#      修復：合併保護改讀 load_db (SQL 優先，與載入來源一致)；schema
+#      2→3 一次性治癒損壞快照 (重置為最佳預設並強制回寫)。
+#
+#   風險評估：低。墓碑表獨立於主表 (新增表，零既有數據風險)；過濾只影響
+#   「已刪 ID」；唯一索引只拒絕同 ID 重複插入 (本 app ID 唯一)；設定合併
+#   改讀 SQL 令合併與載入看同一份數據。學習引擎照舊讀 df_db — 已刪注單
+#   從此真正離開數據集，訓練/分析數據更乾淨。
+# ==============================================================================
 # V16.3.1 雲端同步修復 + 刪注復活修復 — 2026-11-18
 #
 #   背景 (用家 V16.3 部署後實測兩個問題)：
@@ -765,6 +799,91 @@ def _v163_sql_engine():
     except Exception:
         return None
 
+# =============================================================================
+# V16.4 刪除墓碑 (tombstone) — 刪注持久化的統一修復 — 2026-11-18
+# =============================================================================
+V164_TOMB_TABLE = 'football_bets_deleted'
+
+def _v164_tomb_read():
+    """V16.4：讀取全部刪除墓碑 ID (SQL 表，每次即時讀取 — 任何裝置的刪除
+    即時對所有裝置生效)。表不存在/讀取失敗 → 空集 (不影響任何既有行為)。
+
+    背景：刪注復活有三條獨立鏈路，V16.3.1 只堵了一條 —
+    1. 差量備份檔 (GitHub) 以 ID 聯集合併、永不遺忘已刪 ID；GitHub 上傳在
+       用家網絡長期失敗 (實測連續 5 次) → 備份檔成為「殭屍」：每次載入
+       merge_pending_on_load 把已刪注單合併回 session 並回寫 SQL → 復活；
+    2. 主裝置長開 session 記憶體仍留有已刪注單，_v161_refresh_db_from_sql
+       的 ID 聯集合併「本機獨有列全保留」令它們永不消失；
+    3. 兩裝置同時儲存同一批變動列時 DELETE+INSERT 競態令 SQL 出現同 ID
+       重複列 (用家跟投分頁 StreamlitDuplicateElementKey 崩潰的源頭)。
+    墓碑 = 已刪 ID 的持久清單 (SQL 表，冪等)：載入/合併/刷新一律過濾，
+    寫入一律過濾 — 三條鏈路一次堵死。"""
+    try:
+        engine = _v163_sql_engine()
+        if engine is None:
+            return set()
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            _rows = conn.execute(text(f'SELECT "id" FROM "{V164_TOMB_TABLE}"')).fetchall()
+        return {str(r[0]) for r in _rows if r[0] is not None and str(r[0]).strip()}
+    except Exception:
+        return set()
+
+def _v164_tomb_add(ids):
+    """V16.4：寫入刪除墓碑 (冪等，ON CONFLICT DO NOTHING)。由
+    _v1512_save_sql_main 在同一事務內呼叫 (刪注 + 墓碑原子生效)。"""
+    try:
+        if not ids:
+            return
+        engine = _v163_sql_engine()
+        if engine is None:
+            return
+        from sqlalchemy import text, bindparam
+        _ids = [str(i) for i in ids if str(i).strip()]
+        if not _ids:
+            return
+        with engine.begin() as conn:
+            conn.execute(text(f'CREATE TABLE IF NOT EXISTS "{V164_TOMB_TABLE}" '
+                              f'("id" TEXT PRIMARY KEY, "deleted_at" TEXT)'))
+            _ins = text(f'INSERT INTO "{V164_TOMB_TABLE}" ("id", "deleted_at") '
+                        f'VALUES (:i, :t) ON CONFLICT ("id") DO NOTHING')
+            _now = get_hkt_now().strftime('%Y-%m-%d %H:%M:%S')
+            conn.execute(_ins, [{'i': i, 't': _now} for i in _ids])
+    except Exception:
+        pass
+
+def _v164_tomb_remove(ids):
+    """V16.4：移除墓碑 (僅供 Undo 復原 — 復原的注單重新可寫入/載入)。"""
+    try:
+        if not ids:
+            return
+        engine = _v163_sql_engine()
+        if engine is None:
+            return
+        from sqlalchemy import text, bindparam
+        _ids = [str(i) for i in ids if str(i).strip()]
+        if not _ids:
+            return
+        _del = text(f'DELETE FROM "{V164_TOMB_TABLE}" WHERE "id" IN :ids').bindparams(
+            bindparam('ids', expanding=True))
+        with engine.begin() as conn:
+            for i in range(0, len(_ids), 500):
+                conn.execute(_del, {"ids": _ids[i:i+500]})
+    except Exception:
+        pass
+
+def _v164_drop_tombs(df):
+    """V16.4：從 df 過濾已墓碑化的列 (任何載入/合併/刷新點統一使用)。"""
+    try:
+        if df is None or df.empty or 'ID' not in df.columns:
+            return df
+        _t = _v164_tomb_read()
+        if not _t:
+            return df
+        return df[~df['ID'].astype(str).isin(_t)]
+    except Exception:
+        return df
+
 # 選配套件：XGBoost / LightGBM (延遲載入：僅在真正訓練時才 import，加快啟動速度並降低記憶體)
 def get_xgb_classifier():
     try:
@@ -986,6 +1105,11 @@ def _v1512_backup_pending(df):
         if cloud_pend is not None and not cloud_pend.empty:
             changed = _v159_merge_db(cloud_pend, changed)
         _deleted_v1631 = _v1512_session_deleted_ids(df)
+        # V16.4：連 SQL 墓碑 (其他裝置刪的) 一併剔除 — 備份檔從此不再
+        # 收留任何已刪注單，殭屍備份隨每次上傳自然萎縮
+        _tomb_all164 = _v164_tomb_read()
+        if _tomb_all164:
+            _deleted_v1631 = (set(_deleted_v1631) | _tomb_all164) if _deleted_v1631 else _tomb_all164
         if _deleted_v1631 and changed is not None and not changed.empty:
             changed = changed[~changed['ID'].astype(str).isin(_deleted_v1631)]
             if changed.empty:
@@ -1030,6 +1154,12 @@ def _v1512_prune_pending_deleted(df):
     刪除的 ID 不再可辨)。任何失敗靜默跳過 (best-effort)。"""
     try:
         deleted = _v1512_session_deleted_ids(df)
+        # V16.4：連 SQL 墓碑 (其他裝置刪的) 一併剔除 — 備份檔上傳成功一次
+        # 就少一批殭屍列，長遠自然乾淨 (即使上傳失敗，載入端亦有墓碑過濾
+        # 雙保險，殭屍列無法再進任何 session)
+        _tomb164 = _v164_tomb_read()
+        if _tomb164:
+            deleted = (set(deleted) | _tomb164) if deleted else _tomb164
         if not deleted:
             return
         pend = _v1512_load_pending()
@@ -1079,22 +1209,54 @@ def _v1512_save_sql_main(df, table_name):
             pass
         cur_ids = set(df['ID'].astype(str))
         deleted_ids = [r for r in base if r not in cur_ids]
+        # V16.4：同 ID 重複列一次性清理 + 唯一索引 (堵住兩裝置並發儲存的
+        # DELETE+INSERT 競態 — 競態曾令 SQL 出現同 ID 兩列，用家跟投分頁
+        # checkbox key 重複而整頁崩潰)。索引建成後並發插入會被數據庫拒絕
+        # (整次儲存回報失敗、下注自動重試)，同 ID 重複列從此不可能再出現。
+        try:
+            if not st.session_state.get('_v164_uidx_ok'):
+                with engine.begin() as conn:
+                    conn.execute(text(f'DELETE FROM "{table_name}" a USING "{table_name}" b '
+                                      f'WHERE a."ID" = b."ID" AND a.ctid > b.ctid'))
+                    conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_{table_name}_id" '
+                                      f'ON "{table_name}" ("ID")'))
+                st.session_state['_v164_uidx_ok'] = True
+        except Exception:
+            pass   # 索引未成 (可能有殘餘重複) — 下次儲存重試；不影響本路徑
         changed = _v1512_changed_rows(df)
         _chg_ids = sorted({str(x) for x in changed['ID'].tolist()}) if (changed is not None and not changed.empty) else []
         _write_ids = sorted(set(deleted_ids) | set(_chg_ids))
         if not _write_ids:
             return True   # 本 session 無變更，毋須寫入
+        # V16.4：刪注墓碑 — 與主表 DELETE 同一事務 (原子)：任一半失敗則整個
+        # 回滾，墓碑與刪除永遠一致。刪除一旦成功，差量備份檔/其他裝置記憶體/
+        # 並發寫入都無法再令它復活
         _del_stmt = text(f'DELETE FROM "{table_name}" WHERE "ID" IN :ids').bindparams(
             bindparam('ids', expanding=True))
         with engine.begin() as conn:
+            if deleted_ids:
+                conn.execute(text(f'CREATE TABLE IF NOT EXISTS "{V164_TOMB_TABLE}" '
+                                  f'("id" TEXT PRIMARY KEY, "deleted_at" TEXT)'))
+                _ins164 = text(f'INSERT INTO "{V164_TOMB_TABLE}" ("id", "deleted_at") '
+                               f'VALUES (:i, :t) ON CONFLICT ("id") DO NOTHING')
+                _now164 = get_hkt_now().strftime('%Y-%m-%d %H:%M:%S')
+                conn.execute(_ins164, [{'i': str(i), 't': _now164} for i in deleted_ids])
             for i in range(0, len(_write_ids), 500):
                 conn.execute(_del_stmt, {"ids": _write_ids[i:i+500]})
         if _chg_ids:
+            # V16.4：寫入前過濾墓碑 ID — 已刪注單即使被備份檔/舊 session
+            # 混入 changed 集亦絕不回寫 SQL
             changed_df = df[df['ID'].astype(str).isin(set(_chg_ids))].copy()
-            for col in changed_df.columns:
-                if changed_df[col].dtype == 'object':
-                    changed_df[col] = changed_df[col].apply(lambda x: str(x) if pd.notna(x) else None)
-            changed_df.to_sql(table_name, engine, if_exists='append', index=False)
+            if deleted_ids:
+                changed_df = changed_df[~changed_df['ID'].astype(str).isin(set(deleted_ids))]
+            _tomb_all164 = _v164_tomb_read()
+            if _tomb_all164:
+                changed_df = changed_df[~changed_df['ID'].astype(str).isin(_tomb_all164)]
+            if not changed_df.empty:
+                for col in changed_df.columns:
+                    if changed_df[col].dtype == 'object':
+                        changed_df[col] = changed_df[col].apply(lambda x: str(x) if pd.notna(x) else None)
+                changed_df.to_sql(table_name, engine, if_exists='append', index=False)
         return True
     except Exception as e:
         st.error(f"SQL 資料庫儲存失敗: {e}")
@@ -1115,6 +1277,12 @@ def _v1512_merge_pending_on_load():
             return 0
         pend = _v1512_load_pending()
         n = 0
+        if pend is not None and not pend.empty:
+            # V16.4：差量備份檔先過濾刪除墓碑 — GitHub 上傳長期失敗時備份檔
+            # 會永遠留著已刪 ID (殭屍備份)，不過濾的話每次載入都會把已刪
+            # 注單合併回 session 並回寫 SQL (2026-11-18 用家實測反覆復活
+            # 的主鏈路)
+            pend = _v164_drop_tombs(pend)
         if pend is not None and not pend.empty:
             if df.empty:
                 merged = enforce_columns(pend, DB_COLUMNS)
@@ -1224,6 +1392,10 @@ def load_db(filename, columns, table_name, force_cloud=False):
             if engine is not None:
                 df = pd.read_sql_table(table_name, engine)
                 df = process_legacy_columns(df)
+                # V16.4：主資料庫載入即過濾刪除墓碑 — 已刪注單絕不回 session
+                # (涵蓋「刪除成功但其他裝置稍後又寫回」等一切殘留情況)
+                if table_name == 'football_bets':
+                    df = _v164_drop_tombs(df)
         except Exception:
             pass
 
@@ -1357,7 +1529,12 @@ def _v161_refresh_db_from_sql():
         cloud = _v161_sql_read_bets()
         if cloud is None:
             return False
+        # V16.4：刷新亦過濾刪除墓碑 — 主裝置長開 session 記憶體中的已刪
+        # 注單 (「本機獨有列全保留」原本令它們永不消失) 在此統一清除
+        cloud = _v164_drop_tombs(cloud)
         ours = st.session_state.get('df_db')
+        if ours is not None and not ours.empty:
+            ours = _v164_drop_tombs(ours)
         if ours is None or ours.empty:
             merged = cloud
         else:
@@ -4995,7 +5172,10 @@ V10_SETTING_DEFAULTS = {
     # V16.3：設定檔 schema 版本 — 載入時以此判斷雲端快照是否屬「未標記版本的舊年代」
     # (舊值：最低 EV 0%、Kelly 0.1、讓球最低注碼 $10、多個保護開關被關)。bump 此值
     # 即可在日後升級預設時自動遷移已儲存設定。
-    'v10_schema': 2,
+    # V16.4：2 → 3 — 一次性治癒「舊值 + schema=2」的損壞快照 (V16.4 修復前，
+    # GitHub 殭屍檔曾把舊值寫回 SQL 且帶著 schema=2 標記，令 V16.3 遷移不再
+    # 觸發)。bump 後下次載入即重置為目前最佳預設並強制回寫 (一次性)。
+    'v10_schema': 3,
 }
 V10_MODE_OPTIONS = [V11_MODE_AUTO, '看盤規則', V11_MODE_STRICT, '看盤規則 + V9', '只用 V9 模型']
 V11_LS_PREFIX = 'LS|'
@@ -5091,8 +5271,14 @@ def v10_save_settings(silent=False, force=False):
     # V16.3：force=True 時跳過整段合併 (schema 遷移強制寫入新預設，見函式 docstring)。
     if not force:
         try:
-            if _has_secret('GITHUB_TOKEN') and _has_secret('GITHUB_REPO'):
-                _cloud_s = load_db_github(st.secrets['GITHUB_REPO'], SETTINGS_FILE, st.secrets['GITHUB_TOKEN'])
+            # V16.4 修復：合併保護的「雲端現值」改讀 load_db (SQL 優先)。
+            # 舊代碼讀 GitHub 設定檔 — 用家網絡 GitHub 上傳長期失敗 (實測連續
+            # 5 次)，GitHub 檔永遠停在舊年代值，於是任何一次正常儲存都把
+            # 舊值從 GitHub 拉回來覆蓋 SQL →「設定又自己變回舊值」反覆發生
+            # (V16.3 schema 遷移重置後又被沖銷的根因)。讀取來源與載入來源
+            # (load_db SQL 優先) 一致後，合併比較的才是真正的雲端現值。
+            if _has_secret('DB_URL') or (_has_secret('GITHUB_TOKEN') and _has_secret('GITHUB_REPO')):
+                _cloud_s = load_db(SETTINGS_FILE, SETTINGS_COLUMNS, SETTINGS_TABLE)
                 if _cloud_s is not None and not _cloud_s.empty:
                     _cloud_map = {str(r.get('Key', '')): str(r.get('Value', ''))
                                   for _, r in _cloud_s.iterrows() if str(r.get('Key', ''))}
@@ -6774,6 +6960,13 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
                 
                 if action['target'] == 'bets':
                     st.session_state.df_db = pd.concat([st.session_state.df_db, action['data']], ignore_index=True)
+                    # V16.4：復原 = 移除這些 ID 的刪除墓碑，復原注單才可重新
+                    # 寫入 SQL 及被其他裝置載入 (墓碑不除的話載入/寫入過濾
+                    # 會把它們永久擋住)
+                    try:
+                        _v164_tomb_remove([str(x) for x in action['data']['ID'].tolist()])
+                    except Exception:
+                        pass
                     save_db(st.session_state.df_db, db_file, db_table)
                 else:
                     st.session_state.df_cap = pd.concat([st.session_state.df_cap, action['data']], ignore_index=True)
@@ -9090,6 +9283,13 @@ def v162_render_follow_tab():
         _rows = open_df[v10_match_mask(open_df, _tourn, _match, g['_md'])]
         if _rows is None or _rows.empty:
             continue
+        # V16.4：同 ID 重複列防護 — 萬一任何來源仍產生同 ID 兩列 (歷史競態
+        # 殘留)，顯示層按 ID 去重，checkbox/注碼欄 key 亦加序號，杜絕
+        # StreamlitDuplicateElementKey 整頁崩潰 (2026-11-18 用家實測事故)
+        try:
+            _rows = _rows.drop_duplicates(subset=['ID'], keep='first')
+        except Exception:
+            pass
         _sys_stake = pd.to_numeric(_rows['System_Stake'], errors='coerce').fillna(0)
         _usr_stake = pd.to_numeric(_rows['User_Stake'], errors='coerce').fillna(0)
         _real_n = int((_sys_stake > 0).sum())
@@ -9129,9 +9329,9 @@ def v162_render_follow_tab():
                 _odds = _rr.get('Initial_Odds')
                 _cc1, _cc2 = st.columns([3, 2])
                 _ck = _cc1.checkbox(f"{_bt} · {_sel} @{_odds}" + (f" (線 {_line})" if _line not in (None, '') else ''),
-                                     key=f"v162_ck_{_bid}", value=False)
+                                     key=f"v162_ck_{_i}_{_bid}", value=False)
                 _stk = _cc2.number_input("你的注碼 ($)", min_value=0.0, max_value=1000000.0,
-                                         value=100.0, step=10.0, key=f"v162_stk_{_bid}")
+                                         value=100.0, step=10.0, key=f"v162_stk_{_i}_{_bid}")
                 if _ck and float(_stk or 0) > 0:
                     _picks.append((_bid, float(_stk)))
             if st.button("✅ 寫入用家跟投注單", key=f"v162_go_{_md}_{_match}", use_container_width=True):
@@ -10629,7 +10829,9 @@ def main():
         _kept1512 = 0
         if _has_local1512 and _has_cloud1512:
             # 雲端與本機做 ID 聯集合併 (已結算優先、雙方獨有列全保留)
+            # V16.4：合併後過濾刪除墓碑 — 已刪注單絕不經同步按鈕回 session
             _merged1512 = enforce_columns(_v159_merge_db(_cloud_db1512, _local_db1512), DB_COLUMNS)
+            _merged1512 = _v164_drop_tombs(_merged1512)
             _kept1512 = int(len(_merged1512)) - int(len(_cloud_db1512))
             st.session_state.df_db = _merged1512
         elif _has_cloud1512:
