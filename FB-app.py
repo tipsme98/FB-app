@@ -13,7 +13,8 @@ from datetime import datetime, timedelta, timezone
 # 保留差量備份，不再把「本次某些列成功」當作全份備份可清空的證據。
 # V16.4.2 (2026-11-18)：保留復原資料的未知比賽日期；不在載入時按記錄時間推算並覆寫。
 # 已配置 Supabase 時，注單主檔及差量檔不得同步到公開的程式碼倉庫。
-FB_APP_RELEASE = 'V16.4.2'
+# V16.4.3：V10 設定使用獨立來源及逐鍵交易；明示回復預設。
+FB_APP_RELEASE = 'V16.4.3'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -5090,10 +5091,10 @@ def v10_apply_to_candidates(cands, kp_map, mode, settings, kp_engine, arena=None
     return cands
 
 
-# ---------- 設定永久儲存 (與數據庫同步到 GitHub / SQL / 本地) ----------
+# ---------- V10 設定儲存：SQL / GitHub / 本地三選一，絕不跨來源補寫 ----------
 SETTINGS_FILE = "football_settings_db.csv"
-SETTINGS_TABLE = "football_settings"
 SETTINGS_COLUMNS = ['Key', 'Value']
+_V10_SQL_TABLE = 'public.football_settings'
 V11_MODE_AUTO = '🛡 自動 (只用已驗證策略)'
 V11_MODE_STRICT = '看盤嚴格規則 (z≥1.5)'
 V10_SETTING_DEFAULTS = {
@@ -5105,145 +5106,285 @@ V10_SETTING_DEFAULTS = {
     'v11_corner_off': True,
     'v11_corner_tracker': True, 'v11_corner_track_gap': 1.0,
     'v158_gate': True,
-    # V16.3：設定檔 schema 版本 — 載入時以此判斷雲端快照是否屬「未標記版本的舊年代」
-    # (舊值：最低 EV 0%、Kelly 0.1、讓球最低注碼 $10、多個保護開關被關)。bump 此值
-    # 即可在日後升級預設時自動遷移已儲存設定。
-    # V16.4：2 → 3 — 一次性治癒「舊值 + schema=2」的損壞快照 (V16.4 修復前，
-    # GitHub 殭屍檔曾把舊值寫回 SQL 且帶著 schema=2 標記，令 V16.3 遷移不再
-    # 觸發)。bump 後下次載入即重置為目前最佳預設並強制回寫 (一次性)。
+    # 保留相容標記；開頁時不按舊標記自動覆寫可能是用家刻意儲存的值。
     'v10_schema': 3,
 }
 V10_MODE_OPTIONS = [V11_MODE_AUTO, '看盤規則', V11_MODE_STRICT, '看盤規則 + V9', '只用 V9 模型']
 V11_LS_PREFIX = 'LS|'
+_V10_META_KEYS = {'v10_schema', 'v11_migrated'}
+_V10_LIMITS = {
+    'v9_min_ev': (0, 20), 'v9_max_pct': (0.5, 10), 'v9_max_picks': (1, 3),
+    'v9_min_hd': (10, 5000), 'v9_min_other': (0, 5000),
+    'v11_act_min_n': (10, 500), 'v11_act_roi': (0, 20),
+    'v11_trial_min_n': (5, 500), 'v11_trial_roi': (0, 20),
+    'v11_corner_track_gap': (0, float('inf')),
+}
 
 
-def _v10_cast(key, val):
-    d = V10_SETTING_DEFAULTS[key]
-    try:
-        if isinstance(d, bool):
-            return str(val).strip().lower() in ('true', '1', 'yes')
-        if isinstance(d, int):
-            return int(float(val))
-        if isinstance(d, float):
-            return float(val)
-        return str(val)
-    except (TypeError, ValueError):
-        return d
+class _V10SettingsConflict(Exception):
+    pass
 
 
-def v10_load_settings_into_state():
-    """啟動時讀取已儲存的設定 (只在本次瀏覽工作階段第一次執行)"""
-    if st.session_state.get('_v10_settings_loaded'):
-        return
-    saved = {}
-    ls_map = {}
-    ign = set()
-    try:
-        df_s = load_db(SETTINGS_FILE, SETTINGS_COLUMNS, SETTINGS_TABLE)
-        for _, r in df_s.iterrows():
-            k = str(r.get('Key', ''))
-            if k in V10_SETTING_DEFAULTS and pd.notna(r.get('Value')):
-                saved[k] = _v10_cast(k, r.get('Value'))
-            elif k.startswith('IGN|'):
-                ign.add(k[4:])
-            elif k.startswith(V11_LS_PREFIX) and pd.notna(r.get('Value')):
-                try:
-                    ls_map[k[len(V11_LS_PREFIX):]] = int(float(r.get('Value')))
-                except (TypeError, ValueError):
-                    pass
-    except Exception:
-        saved = {}
-    # V16.3：schema 遷移 — 雲端快照沒有 v10_schema 標記 (= 舊年代寫入，從未經新版
-    # 預設值洗牌) 時，整份重置為目前最佳預設。舊快照正是「設定自己變回舊值」的
-    # 根因：各版本升級預設值後，已儲存設定永遠停留在舊值，且 V15.9 合併保護令
-    # 未動過的鍵繼續跟隨雲端舊值。重置後立即強制回寫雲端 (force=True 繞過合併
-    # 保護)，並標記 _v10_settings_reset_now 供側邊欄顯示一次性提示。
-    if saved and int(saved.get('v10_schema', 0) or 0) < int(V10_SETTING_DEFAULTS['v10_schema']):
-        saved = {}
-        st.session_state['_v10_settings_reset_now'] = True
+def _v10_cast(key, value):
+    """不把壞值當作 False 或悄悄寫回預設。"""
+    import math
+
+    default = V10_SETTING_DEFAULTS[key]
+    if isinstance(default, bool):
+        lowered = str(value).strip().lower()
+        if lowered in ('true', '1', 'yes', 'false', '0', 'no'):
+            return lowered in ('true', '1', 'yes')
+    elif key == 'v10_mode':
+        if value in V10_MODE_OPTIONS:
+            return value
+    else:
+        number = float(value)
+        lo, hi = _V10_LIMITS.get(key, (0, float('inf')))
+        if (math.isfinite(number) and lo <= number <= hi
+                and (key != 'v9_kelly' or number in (0.1, 0.15, 0.2, 0.25, 0.33, 0.5))):
+            if not isinstance(default, int):
+                return number
+            if number.is_integer():
+                return int(number)
+    raise ValueError(key)
+
+
+def _v10_settings_source():
+    if _has_secret('DB_URL') and str(st.secrets['DB_URL'] or '').strip():
+        return 'Supabase'
+    if _has_secret('GITHUB_TOKEN') and _has_secret('GITHUB_REPO'):
+        return 'GitHub'
+    return '本機'
+
+
+def _v10_key_values(rows, key):
+    return tuple(value for name, value in rows if name == key)
+
+
+def _v10_patch_rows(rows, changes, expected):
+    for key, observed in expected.items():
+        if _v10_key_values(rows, key) != observed:
+            raise _V10SettingsConflict(key)
+    return [(k, v) for k, v in rows if k not in changes] + [
+        (k, v) for k, v in changes.items() if v is not None
+    ]
+
+
+def _v10_csv_rows(content):
+    import csv
+
+    reader = csv.reader(io.StringIO(content), strict=True)
+    if next(reader, None) != SETTINGS_COLUMNS:
+        raise ValueError('Unexpected settings CSV header')
+    rows = [tuple(r) for r in reader if r]
+    if any(len(r) != 2 for r in rows):
+        raise ValueError('Unexpected settings CSV row')
+    return rows
+
+
+def _v10_csv_content(rows):
+    import csv
+
+    out = io.StringIO(newline='')
+    csv.writer(out, lineterminator='\r\n').writerows([SETTINGS_COLUMNS, *rows])
+    return out.getvalue()
+
+
+def _v10_settings_store(source, changes=None, expected=None):
+    """讀取或原子地套用明示變更。None 值代表刪除該鍵；不重建既有 SQL 表。"""
+    expected = expected or {}
+    if source == 'Supabase':
+        engine = _v163_sql_engine()
+        if engine is None:
+            raise RuntimeError('Supabase settings engine unavailable')
+        txt = sqlalchemy.text
+        with engine.begin() as conn:
+            conn.execute(txt("SET LOCAL statement_timeout = '8000ms'"))
+            if changes:
+                conn.execute(txt("SET LOCAL lock_timeout = '5000ms'"))
+                conn.execute(txt(f"LOCK TABLE {_V10_SQL_TABLE} IN SHARE ROW EXCLUSIVE MODE"))
+            rows = [tuple(r) for r in conn.execute(txt(f'SELECT "Key", "Value" FROM {_V10_SQL_TABLE}'))]
+            if not changes:
+                return rows
+            _v10_patch_rows(rows, changes, expected)  # 在同一鎖及交易內核對舊分頁
+            for key, value in changes.items():
+                conn.execute(txt(f'DELETE FROM {_V10_SQL_TABLE} WHERE "Key" = :key'), {'key': key})
+                if value is not None:
+                    conn.execute(txt(f'INSERT INTO {_V10_SQL_TABLE} ("Key", "Value") VALUES (:key, :value)'),
+                                 {'key': key, 'value': value})
+            confirmed = [tuple(r) for r in conn.execute(txt(f'SELECT "Key", "Value" FROM {_V10_SQL_TABLE}'))]
+            for key, value in changes.items():
+                if _v10_key_values(confirmed, key) != (() if value is None else (value,)):
+                    raise RuntimeError('Settings write verification failed')
+        return confirmed  # 離開交易（提交成功）才可在 UI 宣稱已儲存
+
+    if source == 'GitHub':
+        url = f"https://api.github.com/repos/{st.secrets['GITHUB_REPO']}/contents/{SETTINGS_FILE}"
+        token = st.secrets['GITHUB_TOKEN']
+        res = _gh_request('GET', f'{url}?t={get_hkt_now().timestamp()}', token)
+        sha = None
+        if res is not None and res.status_code == 200:
+            data = res.json()
+            sha = data.get('sha')
+            if not sha or data.get('encoding') != 'base64':
+                raise ValueError('GitHub settings snapshot incomplete')
+            rows = _v10_csv_rows(base64.b64decode(data['content']).decode('utf-8-sig'))
+        elif res is not None and res.status_code == 404:
+            rows = []
+        else:
+            raise RuntimeError('GitHub settings read unconfirmed')
+        if not changes:
+            return rows
+        patched = _v10_patch_rows(rows, changes, expected)
+        payload = {'message': f'Auto-update {SETTINGS_FILE} via Streamlit App',
+                   'content': base64.b64encode(_v10_csv_content(patched).encode('utf-8')).decode('ascii')}
+        if sha:
+            payload['sha'] = sha
+        res = _gh_request('PUT', url, token, json_body=payload)
+        if res is not None and res.status_code in (409, 422):
+            raise _V10SettingsConflict('GitHub settings changed or rejected')
+        if res is None or res.status_code not in (200, 201):
+            raise RuntimeError('GitHub settings write unconfirmed')
+        return patched
+
+    # 本機只在未配置雲端時使用。原子改名讓讀取只會看到完整檔案。
+    def local_rows():
+        try:
+            with open(SETTINGS_FILE, encoding='utf-8-sig', newline='') as file:
+                return _v10_csv_rows(file.read())
+        except FileNotFoundError:
+            return []
+
+    if not changes:
+        return local_rows()
+    import fcntl
+    import tempfile
+
+    with open(f'{SETTINGS_FILE}.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        patched = _v10_patch_rows(local_rows(), changes, expected)
+        dest = os.path.abspath(SETTINGS_FILE)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', newline='',
+                                             dir=os.path.dirname(dest), delete=False) as file:
+                temp_path = file.name
+                file.write(_v10_csv_content(patched))
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temp_path, dest)
+            temp_path = None
+        finally:
+            if temp_path:
+                os.unlink(temp_path)
+    return patched
+
+
+def _v10_apply_aux(rows):
+    ls_map, ign = {}, set()
+    for key, value in rows:
+        if isinstance(key, str) and key.startswith(V11_LS_PREFIX):
+            try:
+                n = float(value)
+                if n.is_integer() and 2 <= n <= 40:
+                    ls_map[key[len(V11_LS_PREFIX):]] = int(n)
+            except (TypeError, ValueError):
+                pass
+        elif isinstance(key, str) and key.startswith('IGN|'):
+            ign.add(key[4:])
     st.session_state['_v11_ls_map'] = ls_map
     st.session_state['_v11_ign'] = ign
-    # V11 升級：舊版儲存的建議引擎改為新的自動保護模式 (只執行一次，之後用家可自行更改)
-    if saved and 'v11_migrated' not in saved:
-        saved['v10_mode'] = V11_MODE_AUTO
-        saved['v11_migrated'] = True
-        st.session_state['_v11_migrated_now'] = True
-    for k, d in V10_SETTING_DEFAULTS.items():
-        v = saved.get(k, d)
-        if k == 'v9_kelly' and v not in [0.1, 0.15, 0.2, 0.25, 0.33, 0.5]:
-            v = 0.25
-        if k == 'v10_mode' and v not in V10_MODE_OPTIONS:
-            v = d
-        st.session_state[k] = v
-    st.session_state['_v10_settings_loaded'] = True
-    st.session_state['_v10_settings_saved'] = bool(saved)
-    # V15.9：記下載入時的設定快照 — v10_save_settings 只把「本 session 真正改過的鍵」
-    # 寫回雲端，未動過的鍵跟隨雲端現值，避免舊分頁把其他裝置剛儲存的設定沖走
-    # (2026-11-15「改了又自己變回去」事故的根因)。
-    st.session_state['_v10_settings_base'] = {k: str(st.session_state.get(k, d))
-                                              for k, d in V10_SETTING_DEFAULTS.items()}
-    # V16.3：剛重置的話，立即強制回寫雲端 (force=True 繞過 V15.9 合併保護 —
-    # 否則未動過的鍵會跟隨雲端舊值，重置會被合併邏輯沖銷)，讓所有裝置下次
-    # 載入時直接看到新預設，不再「自己變回舊值」。
-    if st.session_state.get('_v10_settings_reset_now', False):
-        try:
-            v10_save_settings(silent=True, force=True)
-        except Exception:
-            pass
-        # 保留旗標給側邊欄顯示一次性提示 (側邊欄會 pop)
-        st.session_state['_v10_settings_reset_now'] = True
 
 
-def v10_save_settings(silent=False, force=False):
-    """force=True (V16.3 schema 遷移用)：跳過 V15.9 雲端合併保護，整份強制寫入。
-    只用於「重置舊年代快照為最佳預設」— 合併保護會令未動過的鍵跟隨雲端舊值，
-    正好把重置沖銷，故必須繞過。"""
-    rows = [{'Key': k, 'Value': str(st.session_state.get(k, d))} for k, d in V10_SETTING_DEFAULTS.items()]
-    rows += [{'Key': f"{V11_LS_PREFIX}{t}", 'Value': str(int(n))} for t, n in (st.session_state.get('_v11_ls_map', {}) or {}).items()]
-    rows += [{'Key': f"IGN|{k}", 'Value': '1'} for k in sorted(st.session_state.get('_v11_ign', set()) or set())]
-    # V15.9 覆蓋保護（設定檔）：其他裝置/session 可能已寫入較新設定。本 session
-    # 未修改過的鍵跟隨雲端現值 (避免舊快照把別人剛改的設定沖走)；LS|/IGN| 累積
-    # 型資料與雲端取聯集。任何失敗都按舊行為整份寫入 (與 V15.8 相容)。
-    # V16.3：force=True 時跳過整段合併 (schema 遷移強制寫入新預設，見函式 docstring)。
-    if not force:
+def _v10_apply_settings(rows):
+    state = st.session_state
+    values, invalid = V10_SETTING_DEFAULTS.copy(), []
+    for key in values.keys() - _V10_META_KEYS:
+        raw = _v10_key_values(rows, key)
+        if not raw:
+            continue
         try:
-            # V16.4 修復：合併保護的「雲端現值」改讀 load_db (SQL 優先)。
-            # 舊代碼讀 GitHub 設定檔 — 用家網絡 GitHub 上傳長期失敗 (實測連續
-            # 5 次)，GitHub 檔永遠停在舊年代值，於是任何一次正常儲存都把
-            # 舊值從 GitHub 拉回來覆蓋 SQL →「設定又自己變回舊值」反覆發生
-            # (V16.3 schema 遷移重置後又被沖銷的根因)。讀取來源與載入來源
-            # (load_db SQL 優先) 一致後，合併比較的才是真正的雲端現值。
-            if _has_secret('DB_URL') or (_has_secret('GITHUB_TOKEN') and _has_secret('GITHUB_REPO')):
-                _cloud_s = load_db(SETTINGS_FILE, SETTINGS_COLUMNS, SETTINGS_TABLE)
-                if _cloud_s is not None and not _cloud_s.empty:
-                    _cloud_map = {str(r.get('Key', '')): str(r.get('Value', ''))
-                                  for _, r in _cloud_s.iterrows() if str(r.get('Key', ''))}
-                    _base159 = st.session_state.get('_v10_settings_base') or {}
-                    _ours159 = {r['Key']: r['Value'] for r in rows}
-                    _out159 = []
-                    for r in rows:
-                        k = r['Key']
-                        if (k in V10_SETTING_DEFAULTS and k in _cloud_map and k in _base159
-                                and _ours159[k] == str(_base159[k])):
-                            r = {'Key': k, 'Value': _cloud_map[k]}   # 本 session 沒改過 → 跟雲端現值
-                        _out159.append(r)
-                    _ours_keys159 = {r['Key'] for r in _out159}
-                    for k, v in _cloud_map.items():
-                        if (k.startswith(V11_LS_PREFIX) or k.startswith('IGN|')) and k not in _ours_keys159:
-                            _out159.append({'Key': k, 'Value': v})  # 雲端獨有的聯賽/忽略紀錄 → 保留
-                    rows = _out159
-        except Exception:
-            pass
+            if len(raw) != 1:
+                raise ValueError(key)
+            values[key] = _v10_cast(key, raw[0])
+        except (TypeError, ValueError, OverflowError):
+            invalid.append(key)
+            values[key] = (state.get('_v10_confirmed') or {}).get(key, values[key])
+    state['_v10_rows'] = rows
+    if not invalid:
+        state['_v10_confirmed'] = values
+    state['_v10_settings_invalid'] = sorted(invalid)
+    state['_v10_settings_read_ok'] = True
+    for key, value in values.items():
+        if state.get(key) != value:
+            state[key] = value
+    _v10_apply_aux(rows)
+
+
+def v10_load_settings_into_state(force=False):
+    """在建立 widget 前讀取。失聯時保留上次已驗證值，僅作顯示，禁止跨來源補寫。"""
+    state = st.session_state
+    source = _v10_settings_source()
+    if not force and source == 'GitHub' and state.get('_v10_settings_read_ok'):
+        return  # GitHub-only 不在每次 rerun 打 API；另有手動刷新及寫入比對
     try:
-        save_db(pd.DataFrame(rows, columns=SETTINGS_COLUMNS), SETTINGS_FILE, SETTINGS_TABLE)
-        st.session_state['_v10_settings_saved'] = True
-        # V15.9：儲存成功後更新基準快照，之後的比對以本次寫入值為準
-        st.session_state['_v10_settings_base'] = {r['Key']: r['Value'] for r in rows
-                                                  if r['Key'] in V10_SETTING_DEFAULTS}
-        if not silent:
-            st.toast("✅ 投注策略設定已永久儲存，下次開啟程式會自動載入。", icon="💾")
-    except Exception as e:
-        st.toast(f"設定儲存失敗: {e}", icon="⚠")
+        _v10_apply_settings(_v10_settings_store(source))
+    except Exception:
+        state['_v10_settings_read_ok'] = False
+        for key, default in V10_SETTING_DEFAULTS.items():
+            prior = (state.get('_v10_confirmed') or {}).get(key, default)
+            if state.get(key) != prior:
+                state[key] = prior
+
+
+def _v10_settings_write(changes, expected=None, *, reset=False, auxiliary=False):
+    """只由明示操作呼叫。失敗時保留原值並提供錯誤，不作自動重試。"""
+    state = st.session_state
+    source = _v10_settings_source()
+    try:
+        if not state.get('_v10_settings_read_ok') or (
+                state.get('_v10_settings_invalid') and not (reset or auxiliary)):
+            raise RuntimeError('Settings not readable')
+        rows = _v10_settings_store(source, changes, expected)
+    except _V10SettingsConflict:
+        state['_v10_notice'] = ('warning', '設定未儲存：版本已改變或未獲確認，請核對最新值後再改。')
+    except Exception:
+        state['_v10_notice'] = ('error', f'未能確認{source}設定已寫入。請重新讀取核對，不會改寫其他來源。')
+    else:
+        if auxiliary:
+            _v10_apply_aux(rows)
+        else:
+            _v10_apply_settings(rows)  # callback 在建立 widget 前執行
+        return True
+    return False
+
+
+def v10_save_settings(key):
+    """每一個 widget 只可儲存自己的一鍵，亦不可覆蓋另一分頁同鍵的新值。"""
+    state = st.session_state
+    if key not in V10_SETTING_DEFAULTS or key in _V10_META_KEYS:
+        return
+    value = str(_v10_cast(key, state[key]))
+    expected = {key: _v10_key_values(state.get('_v10_rows', []), key)}
+    if _v10_settings_write({key: value}, expected):
+        state['_v10_notice'] = ('success', f'已儲存至{_v10_settings_source()}。')
+    else:
+        state[key] = (state.get('_v10_confirmed') or {}).get(key, V10_SETTING_DEFAULTS[key])
+        v10_load_settings_into_state(force=True)
+
+
+def v10_reset_settings():
+    if _v10_settings_write({k: str(v) for k, v in V10_SETTING_DEFAULTS.items()}, reset=True):
+        st.session_state['_v10_notice'] = ('success', f'已回復預設並儲存至{_v10_settings_source()}。')
+    else:
+        v10_load_settings_into_state(force=True)
+
+
+def _v10_settings_allow_automation():
+    """只對已配置 Supabase 的部署，在設定不可核對時暫停自動導入。"""
+    return _v10_settings_source() != 'Supabase' or (
+        st.session_state.get('_v10_settings_read_ok') and not st.session_state.get('_v10_settings_invalid')
+    )
 
 
 def v10_md_series(df):
@@ -5404,10 +5545,8 @@ def v11_save_league_size(tourn, n, silent=False):
     m = v11_ls_map()
     if m.get(t) == n:
         return
-    m[t] = n
-    st.session_state['_v11_ls_map'] = m
-    v10_save_settings(silent=True)
-    if not silent:
+    saved = _v10_settings_write({f'{V11_LS_PREFIX}{t}': str(n)}, auxiliary=True)
+    if saved and not silent:
         st.toast(f"💾 已記住「{t}」有 {n} 支隊伍，下次選擇此賽事會自動填寫。", icon="📝")
 
 
@@ -5668,8 +5807,10 @@ def v11_ignored_keys():
 
 
 def v11_set_ignored(keys):
-    st.session_state['_v11_ign'] = set(keys)
-    v10_save_settings(silent=True)
+    old, new = v11_ignored_keys(), set(keys)
+    changes = {f'IGN|{key}': '1' for key in new - old}
+    changes.update({f'IGN|{key}': None for key in old - new})
+    return not changes or _v10_settings_write(changes, auxiliary=True)
 
 
 def v11_issues_active(issues):
@@ -5772,12 +5913,14 @@ def render_v11_data_quality():
                     else:
                         new_ign.discard(r['編號'])
                 new_ign &= set(all_issues['編號'])  # 清走已不存在的舊編號
-                v11_set_ignored(new_ign)
-                st.toast(f"✅ 已儲存：{len(new_ign)} 項標記為確認無誤。", icon="💾")
-                st.rerun()
+                if v11_set_ignored(new_ign):
+                    st.toast(f"✅ 已儲存：{len(v11_ignored_keys())} 項標記為確認無誤。", icon="💾")
+                    st.rerun()
+                st.warning("未能確認標記已儲存，請重新整理後核對。")
             if b2.button("↩ 取消全部確認", key="v11_dq_clear_ign", use_container_width=True, disabled=not ign):
-                v11_set_ignored(set())
-                st.rerun()
+                if v11_set_ignored(set()):
+                    st.rerun()
+                st.warning("未能確認已取消標記，請重新整理後核對。")
         st.caption("注單 ID 可在「⚖ 賽果結算與管理 → 已完成注單資料修改」搜尋並修改。修改後模型會自動重新訓練。")
         issues = all_issues
 
@@ -8329,7 +8472,7 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
     只設定 widget 狀態然後「放行」，讓同一 rerun 內稍後渲染的按鈕分支自動執行
     (與手動點擊同一程式碼路徑)。"""
     a = st.session_state.get('v15_auto')
-    if not a or not a.get('active'):
+    if not a or not a.get('active') or not _v10_settings_allow_automation():
         return
     # V15.7：跨裝置互斥 — 狀態檔已被另一 session 接手 (sid 不符) 時自動停止本裝置，
     # 避免兩邊同時寫入 (不寫回狀態檔，以免覆蓋接手裝置的進度)
@@ -8637,6 +8780,8 @@ def _v1511_sched_try_start(df_db):
     自動啟動日期模式自動輸入 (V15.10 既有路徑)。
     V16.2：主裝置模式開啟時，唯讀分頁不自動啟動 (主裝置離線逾 12 分鐘時
     例外補位 — 確保每日結算不會靜默停擺)。回傳 True 表示已啟動。"""
+    if not _v10_settings_allow_automation():
+        return False
     cfg = _v1511_sched_load()
     if str(cfg.get('enabled')) != '1':
         return False
@@ -8883,7 +9028,7 @@ def v16_try_start_auto_bet(df_db, cfg):
     投注，不結算)。跨裝置互斥沿用 V15.7 狀態檔 (5 分鐘內有活動不搶)。
     V16.2：主裝置模式開啟時，唯讀分頁不自動觸發 (主裝置離線逾 12 分鐘除外)。
     回傳 True 表示已啟動。"""
-    if str(cfg.get('enabled')) != '1':
+    if str(cfg.get('enabled')) != '1' or not _v10_settings_allow_automation():
         return False
     # V16.2 主裝置模式閘門：唯讀分頁不自動啟動批次
     if not _v162_can_automate():
@@ -10877,69 +11022,84 @@ def main():
     st.sidebar.metric("用家當前真實可用資金 (Bankroll)", f"${usr_bankroll:,.2f}")
 
 
+    if not _v10_settings_allow_automation():
+        st.sidebar.warning("未能核對 Supabase 的 V10 設定，程式暫停自動導入。請勿按畫面暫存值記錄投注。")
     with st.sidebar.expander("🎯 V10 投注策略與風控設定", expanded=False):
-        st.caption("✅ 已載入上次儲存的設定" if st.session_state.get('_v10_settings_saved') else "目前為預設設定 (更改後會自動永久儲存)")
-        if st.session_state.pop('_v10_settings_reset_now', False):
-            st.info("🔧 V16.3：偵測到雲端設定檔是舊年代快照 (從未標記版本)，已自動重置為目前最佳預設值並回寫雲端：最低 EV 3%、Kelly 0.25、單注上限 3%、讓球最低注碼 $200、其他 $10、保護開關全開、樣本外驗證 50 注 + ROI 2%。日後改動會正常保存，不會再「自己變回舊值」。")
-        if st.session_state.pop('_v11_migrated_now', False):
-            st.info("V11 已把建議引擎升級為「🛡 自動 (只用已驗證策略)」。如想沿用舊模式可在下方更改。")
-        st.selectbox("建議引擎", V10_MODE_OPTIONS, key="v10_mode", on_change=v10_save_settings,
+        _v10_source = _v10_settings_source()
+        _v10_read_ok = st.session_state.get('_v10_settings_read_ok', False)
+        _v10_invalid = st.session_state.get('_v10_settings_invalid') or []
+        _v10_disabled = not _v10_read_ok or bool(_v10_invalid)
+        if not _v10_read_ok:
+            st.error(f"未能讀取 {_v10_source} 設定。畫面值未獲確認；已停用設定寫入。")
+        elif _v10_invalid:
+            st.error("以下鍵在設定來源的值無效或重複：" + '、'.join(_v10_invalid) +
+                     "。核對後可選「回復預設」覆寫 V10 策略鍵。")
+        else:
+            _v10_diff = [k for k, v in V10_SETTING_DEFAULTS.items()
+                         if k not in _V10_META_KEYS and st.session_state.get(k) != v]
+            st.caption(f"設定來源：{_v10_source}｜" +
+                       (f"{len(_v10_diff)} 項與程式預設不同。"
+                        if _v10_diff else "目前值與程式預設一致。") +
+                       " 改動會逐項儲存。")
+        if _v10_notice := st.session_state.pop('_v10_notice', None):
+            getattr(st, _v10_notice[0])(_v10_notice[1])
+        st.selectbox("建議引擎", V10_MODE_OPTIONS, key="v10_mode", on_change=v10_save_settings, args=('v10_mode',), disabled=_v10_disabled,
                      help="🛡 自動 (預設)：只有在『模型擂台』通過樣本外驗證 (≥50 注、ROI ≥ +2%、前後兩段都賺錢) 的策略 × 盤口類型才實際落注，其餘只顯示模擬注 ($0)。"
                           "看盤規則：V10 邏輯。看盤嚴格規則：只用 z ≥ 1.5 (統計上較可信) 的看盤規則。看盤規則 + V9：有看盤訊號用看盤估計 EV，否則用 V9。只用 V9 模型：舊版 V9 邏輯。")
-        st.checkbox("新聯賽觀察期 (已結算 < 15 場只作模擬注)", key="v11_new_league_paper", on_change=v10_save_settings,
+        st.checkbox("新聯賽觀察期 (已結算 < 15 場只作模擬注)", key="v11_new_league_paper", on_change=v10_save_settings, args=('v11_new_league_paper',), disabled=_v10_disabled,
                     help="新加入的聯賽未有足夠數據，模型對其特性一無所知；先記錄賽果讓系統學習，再實際落注。")
-        st.checkbox("聯賽熔斷 (某聯賽樣本外 ≥15 注且 ROI ≤ −15% 暫停實注)", key="v11_league_breaker", on_change=v10_save_settings)
-        st.checkbox("系統自動預選每種盤口 (讓球 / 入球 / 角球各一注)", key="v11_auto_sys", on_change=v10_save_settings,
+        st.checkbox("聯賽熔斷 (某聯賽樣本外 ≥15 注且 ROI ≤ −15% 暫停實注)", key="v11_league_breaker",
+                    on_change=v10_save_settings, args=('v11_league_breaker',), disabled=_v10_disabled)
+        st.checkbox("系統自動預選每種盤口 (讓球 / 入球 / 角球各一注)", key="v11_auto_sys", on_change=v10_save_settings, args=('v11_auto_sys',), disabled=_v10_disabled,
                     help="每種盤口類型在莊家最新仍提供的盤口線中，自動選出系統認為最合適的一邊：通過驗證的 ✅ 建議用 Kelly 注碼實注，其餘為 $0 模擬注。"
                          "確保每場輸入的比賽都會存入數據庫供學習，並追蹤系統每種盤口的真實表現。舊盤口及同方向的相關盤口線 (例如 2.5 小之外再加 2.75 小) 不會重複預選。"
                          "V15.5：自動導入歷史賽事 (V14.12 自動輸入) 時此開關一律視為開啟 — 自動導入的目的就是記錄 $0 模擬注供學習，關閉此開關只影響手動模式。")
-        st.checkbox("🚫 停用角球大小 (不建議、不作模擬注記錄)", key="v11_corner_off", value=V10_SETTING_DEFAULTS['v11_corner_off'], on_change=v10_save_settings,
+        st.checkbox("🚫 停用角球大小 (不建議、不作模擬注記錄)", key="v11_corner_off", on_change=v10_save_settings, args=('v11_corner_off',), disabled=_v10_disabled,
                     help="角球大小樣本已達統計顯著虧損 (580 注、每注 −15.3 單位，95% 區間全為負)，繼續記錄只會令模型學到雜訊。"
                          "開啟後角球完全不參與自動預選、模擬注及記錄 (分析表中仍會顯示「⏸ 角球已停用」供參考)；日後想恢復記錄隨時可關閉此選項。")
-        st.checkbox("📡 角球訊號追蹤 (模型預期與盤口線差距 ≥ 門檻時記錄 $0 模擬注)", key="v11_corner_tracker", value=V10_SETTING_DEFAULTS['v11_corner_tracker'], on_change=v10_save_settings,
+        st.checkbox("📡 角球訊號追蹤 (模型預期與盤口線差距 ≥ 門檻時記錄 $0 模擬注)", key="v11_corner_tracker", on_change=v10_save_settings, args=('v11_corner_tracker',), disabled=_v10_disabled,
                     help="實測發現球隊角球攻防數據有預測能力，且馬會角球盤口線系統性偏高：模型預期總角球與盤口線差距 ≥1.0 角時，"
                          "歷史 64 注全贏率 65.6%。此模式在角球停用下仍會於差距達門檻時記錄一注 $0 模擬注 (方向跟隨模型偏離)，"
                          "零成本累積樣本驗證訊號；差距不足則完全不記錄。永遠 $0，絕不實注。")
-        st.checkbox("🎯 V15.8 LR 落注閘門 (讓球 Edge ≤ 2% 系統注碼 $0)", key="v158_gate", value=V10_SETTING_DEFAULTS['v158_gate'], on_change=v10_save_settings,
+        st.checkbox("🎯 V15.8 LR 落注閘門 (讓球 Edge ≤ 2% 系統注碼 $0)", key="v158_gate", on_change=v10_save_settings, args=('v158_gate',), disabled=_v10_disabled,
                     help="凍結邏輯回歸模型 (2026-11-15 凍結，與前向驗證追蹤器完全一致) 比較模型概率與去水市場概率：讓球注單 Edge (模型概率 − 市場概率) ≤ 2% 時系統注碼強制 $0，只作記錄供學習。"
                          "所有注單 (包括被攔截的) 仍完整記錄 — 學習、結算、前向驗證對照組全部照常運作。非讓球盤口不受影響。前向驗證期間門檻固定 2%，模型不會自動重訓。")
-        st.number_input("最低 EV 門檻 (%)", min_value=0.0, max_value=20.0, step=0.5, key="v9_min_ev", on_change=v10_save_settings,
+        st.number_input("最低 EV 門檻 (%)", min_value=0.0, max_value=20.0, step=0.5, key="v9_min_ev", on_change=v10_save_settings, args=('v9_min_ev',), disabled=_v10_disabled,
                         help="只有估計期望值 ≥ 此門檻的盤口才會被建議。0% = 注數多但包含大量優勢極薄、估計誤差內的投注；3% = 注數少但每注質素較高。")
-        st.select_slider("Kelly 分數", options=[0.1, 0.15, 0.2, 0.25, 0.33, 0.5], key="v9_kelly", on_change=v10_save_settings,
+        st.select_slider("Kelly 分數", options=[0.1, 0.15, 0.2, 0.25, 0.33, 0.5], key="v9_kelly", on_change=v10_save_settings, args=('v9_kelly',), disabled=_v10_disabled,
                          help="注碼 = 本金 × Kelly 分數 × EV ÷ (賠率 − 1)。高於 0.25 時注碼隨估計優勢急升，估計誤差會令回撤急劇放大，建議 0.25 或以下。")
-        st.number_input("單注上限 (% 系統本金)", min_value=0.5, max_value=10.0, step=0.5, key="v9_max_pct", on_change=v10_save_settings)
-        st.number_input("每場最多建議注數", min_value=1, max_value=3, step=1, key="v9_max_picks", on_change=v10_save_settings,
+        st.number_input("單注上限 (% 系統本金)", min_value=0.5, max_value=10.0, step=0.5, key="v9_max_pct",
+                        on_change=v10_save_settings, args=('v9_max_pct',), disabled=_v10_disabled)
+        st.number_input("每場最多建議注數", min_value=1, max_value=3, step=1, key="v9_max_picks", on_change=v10_save_settings, args=('v9_max_picks',), disabled=_v10_disabled,
                         help="同一場比賽的多個盤口高度相關，建議每場只下 1 注。")
         st.number_input("讓球最低注碼 ($) (馬會規定 $200)", min_value=10.0, max_value=5000.0, step=10.0, key="v9_min_hd",
-                        on_change=v10_save_settings,
+                        on_change=v10_save_settings, args=('v9_min_hd',), disabled=_v10_disabled,
                         help="馬會讓球 (單場及過關) 最低投注 $200。此數值只作「下限過濾」：Kelly 注碼達到此數才建議實注，"
                              "低於此數 = 值博率不足以支持 $200 注碼 → 建議 $0 模擬注 (絕不強制湊大)。"
                              "若經常出現讓球 $0，代表本金不足以支撐讓球盤，應加大本金或提高 EV 門檻。")
         st.number_input("其他盤口最低注碼 ($) (馬會規定 $10)", min_value=0.0, max_value=5000.0, step=10.0, key="v9_min_other",
-                        on_change=v10_save_settings,
+                        on_change=v10_save_settings, args=('v9_min_other',), disabled=_v10_disabled,
                         help="入球大小 / 角球大小等馬會最低投注 $10。同樣只作下限過濾：Kelly 注碼 (四捨五入至 $10) 達 $10 即實注，"
                              "不足 $10 → $0 模擬注。設 0 = 停用過濾。")
-        st.checkbox("啟用試注層 (半注 Kelly)", key="v11_trial", on_change=v10_save_settings,
+        st.checkbox("啟用試注層 (半注 Kelly)", key="v11_trial", on_change=v10_save_settings, args=('v11_trial',), disabled=_v10_disabled,
                     help="策略未完全通過樣本外驗證，但該『策略 × 盤口類型』已有初步正回報 (注數及 ROI 達下方試注門檻、前後兩段未同時虧損) 時，"
                          "以半注 Kelly 實注並顯示「✅ 試注」。讓正 ROI 的盤口能真正落注累積數據，同時用減半注碼控制風險。")
-        st.number_input("通過驗證：最少樣本外注數", min_value=10, max_value=500, step=5, key="v11_act_min_n", on_change=v10_save_settings,
+        st.number_input("通過驗證：最少樣本外注數", min_value=10, max_value=500, step=5, key="v11_act_min_n", on_change=v10_save_settings, args=('v11_act_min_n',), disabled=_v10_disabled,
                         help="該『策略 × 盤口類型』樣本外注數達此數 (且 ROI 達標、前後兩段都賺錢) 才用全 Kelly 實注。預設 50。")
-        st.number_input("通過驗證：樣本外 ROI 下限 (%)", min_value=0.0, max_value=20.0, step=0.5, key="v11_act_roi", on_change=v10_save_settings,
+        st.number_input("通過驗證：樣本外 ROI 下限 (%)", min_value=0.0, max_value=20.0, step=0.5, key="v11_act_roi", on_change=v10_save_settings, args=('v11_act_roi',), disabled=_v10_disabled,
                         help="該『策略 × 盤口類型』樣本外 ROI 達此數才用全 Kelly 實注。預設 2%。")
-        st.number_input("試注層：最少樣本外注數", min_value=5, max_value=500, step=5, key="v11_trial_min_n", on_change=v10_save_settings,
+        st.number_input("試注層：最少樣本外注數", min_value=5, max_value=500, step=5, key="v11_trial_min_n", on_change=v10_save_settings, args=('v11_trial_min_n',), disabled=_v10_disabled,
                         help="未完全通過驗證但注數達此數且 ROI 達試注下限時，以半注 Kelly 試注。預設 30。")
-        st.number_input("試注層：樣本外 ROI 下限 (%)", min_value=0.0, max_value=20.0, step=0.5, key="v11_trial_roi", on_change=v10_save_settings,
+        st.number_input("試注層：樣本外 ROI 下限 (%)", min_value=0.0, max_value=20.0, step=0.5, key="v11_trial_roi", on_change=v10_save_settings, args=('v11_trial_roi',), disabled=_v10_disabled,
                         help="試注層要求的樣本外 ROI 下限。預設 1%。")
-        st.checkbox("解除盤口熔斷 (不建議)", key="v9_override_gate", on_change=v10_save_settings,
+        st.checkbox("解除盤口熔斷 (不建議)", key="v9_override_gate", on_change=v10_save_settings, args=('v9_override_gate',), disabled=_v10_disabled,
                     help="樣本外回測 ≥ 20 注且 ROI ≤ −3% 的盤口類型會自動暫停建議。")
         _sb1, _sb2 = st.columns(2)
-        if _sb1.button("💾 儲存設定", use_container_width=True, key="v10_save_btn"):
-            v10_save_settings()
-        if _sb2.button("↺ 回復預設", use_container_width=True, key="v10_reset_btn"):
-            for _k, _d in V10_SETTING_DEFAULTS.items():
-                st.session_state[_k] = _d
-            v10_save_settings()
-            st.rerun()
+        _sb1.button("重新讀取設定", use_container_width=True, key="v10_reload_btn",
+                    on_click=v10_load_settings_into_state, args=(True,))
+        _sb2.button("↺ 回復預設", use_container_width=True, key="v10_reset_btn",
+                    on_click=v10_reset_settings, disabled=not _v10_read_ok,
+                    help="立即將這一區的所有策略及風控設定寫回程式預設；不改注單或聯賽記憶。")
         if st.button("♻ 重新訓練 V9 模型 + V10 看盤引擎", use_container_width=True, key="v9_retrain"):
             v14_clear_model_caches()
             st.toast("已清除模型快取，下次分析時會重新訓練。(投注設定不受影響)", icon="♻")
