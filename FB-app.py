@@ -11,7 +11,9 @@ from datetime import datetime, timedelta, timezone
 # ==============================================================================
 # V16.4.1 (2026-11-18)：主表增量寫入和墓碑/Undo 同一事務；只按明示 ID 刪除。
 # 保留差量備份，不再把「本次某些列成功」當作全份備份可清空的證據。
-FB_APP_RELEASE = 'V16.4.1'
+# V16.4.2 (2026-11-18)：保留復原資料的未知比賽日期；不在載入時按記錄時間推算並覆寫。
+# 已配置 Supabase 時，注單主檔及差量檔不得同步到公開的程式碼倉庫。
+FB_APP_RELEASE = 'V16.4.2'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -1216,6 +1218,11 @@ def _v1512_merge_pending_on_load():
         return 0
 
 def save_db_github(df, repo, path, token):
+    # SQL 為正式注單儲存時，不把注單資料（包括復原記錄）附帶發佈到 GitHub。
+    if (_v1512_is_main_db(path) or str(path).rsplit('/', 1)[-1] == PENDING_DB_FILE) and (
+        _has_secret("DB_URL") and st.secrets["DB_URL"]
+    ):
+        return False
     timestamp = int(get_hkt_now().timestamp())
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
     _big159 = _gh_is_big_file(path)
@@ -1397,8 +1404,7 @@ def save_db(df, filename, table_name, *, delete_ids=(), restore_ids=()):
 
     # 2. 寫入 GitHub 雲端倉庫
     _gh_ok1512 = False
-    can_sync_main = _sql_ok1513 and not st.session_state.get('_v1641_fallback_base')
-    if (not main_db or not sql_configured or can_sync_main) and _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO"):
+    if (not main_db or not sql_configured) and _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO"):
         try:
             _ok159 = save_db_github(df, st.secrets["GITHUB_REPO"], filename, st.secrets["GITHUB_TOKEN"])
             _gh_ok1512 = bool(_ok159)
@@ -1414,8 +1420,10 @@ def save_db(df, filename, table_name, *, delete_ids=(), restore_ids=()):
     if main_db:
         if _gh_ok1512:
             _v1512_capture_base(df)
-        elif not _sql_ok1513:
+        elif not _sql_ok1513 and not sql_configured:
             _v1512_backup_pending(df)
+        elif not _sql_ok1513:
+            st.warning("注單未獲 Supabase 確認，亦不會發佈至 GitHub。請保留本頁並先下載完整報表。")
 
     # 3. 寫入本地 CSV
     try:
@@ -10817,17 +10825,8 @@ def main():
     # --- V16.1 比賽日期自動回填：V16 clv 填充 bug 產生的 0001-01-01 注單 ---
     # (2026-11-17/18 隔夜共 71 筆；回填規則 = 記錄時間+35 分鐘的日期，冪等 —
     #  回填一次後不會再觸發，新注單已由填充層防護不再產生 0001-01-01)
-    try:
-        _bf161_df, _bf161_n = v161_backfill_match_dates(st.session_state.df_db)
-        if _bf161_n > 0:
-            st.session_state.df_db = _bf161_df
-            save_db(_bf161_df, db_file, db_table)
-            st.success(f"🔧 V16.1 已自動回填 {_bf161_n} 筆注單的比賽日期 (原為 0001-01-01，"
-                       f"按記錄時間+35 分鐘推算開賽日 — T-30 批次寫入距開賽約 25-35 分鐘)，"
-                       f"並已同步至雲端資料庫。此回填只會執行一次，之後不再觸發。")
-            st.toast(f"🔧 V16.1 已回填 {_bf161_n} 筆比賽日期", icon="✅")
-    except Exception:
-        pass
+    # V16.4.2：停用上述歷史推算。未知 Match_Date 必須由已核實的賽程補正，
+    # 不可在首次開頁時把記錄時間誤當成比賽時間，自動改寫復原的主表資料。
 
     # --- V15.1 K-League 待結算注單自動修復：2026-11-11 自動導入中斷遺留 ---
     # (FC首爾 vs FC安養 05-05 兩張 Open 模擬注；真實賽果經 Tipsme API 105841 核實)
