@@ -9,6 +9,41 @@ import requests
 import itertools
 from datetime import datetime, timedelta, timezone
 # ==============================================================================
+# V16.3.1 雲端同步修復 + 刪注復活修復 — 2026-11-18
+#
+#   背景 (用家 V16.3 部署後實測兩個問題)：
+#   1. 側邊欄紅色「雲端同步已連續失敗 1 次 — 最新注單/結算只存在本容器」；
+#   2. V16.2 時已刪除的 8 對重複注單 + 3 筆無隊名記錄，部署 V16.3 後全部
+#      「復活」再出現在數據質素檢查。
+#
+#   根因 (三個，逐一修復)：
+#   1. V16.3 製作時的編輯事故：_v159_merge_db (雲端合併核心函式) 被設定檔
+#      合併代碼覆蓋，函式體引用未定義的 force/rows → 任何雲端合併一呼叫即
+#      NameError。本版已從 V16 基線還原原函式體 (ID 聯集、已結算優先)。
+#      （製作期間另發現 _v1512_fp / _v1512_capture_base / _v1512_is_main_db 三個
+#      指紋工具函式定義意外遺失，已一併從基線復原並以全函式清點比對確認
+#      無其他遺漏 — 三者被 save_db/changed_rows 呼叫，缺失會令 SQL 成功路徑
+#      NameError，幸於交付前測試發現。）
+#   2. SQL 連線耗盡：舊代碼每次讀/寫都 create_engine 新引擎且從不 dispose，
+#      長 session (V16 CLV 每 5 分鐘快照) 連線不斷累積 → Supabase 連接數
+#      上限 → 間歇性「SQL 資料庫儲存失敗」→ 用家刪注結果只存在容器，
+#      容器重建 (部署新版) 後從雲端舊數據重載 → 已刪注單「復活」。
+#      修復：全 app 共用單例引擎 (pool_pre_ping 自動重建斷線、pool_recycle
+#      回收閒置連線)。
+#   3. V16.3 的 League_Size 空值寫法：無隊伍數目時寫 '' (空字串)，但 SQL 表
+#      League_Size 是整數欄 → append 整批失敗。修復：'' → None (NULL 任何
+#      欄位型別都合法)；CSV 往返後空白讀回 NaN，訓練端 get_league_size
+#      沿用預設 20，行為與 '' 相同。
+#   4. 差量備份檔「永不遺忘」已刪 ID：備份檔以 ID 聯集合併，用家刪注後
+#      備份檔仍留著已刪 ID → 下次載入 merge_pending_on_load 把它們合併回
+#      session 並回寫 SQL → 復活。修復：save_db SQL 成功路徑 (capture_base
+#      之前) 及 backup_pending 均剔除本 session 已刪 ID。
+#   5. 診斷加強：SQL 失敗時側邊欄顯示最近一次實際錯誤文字。
+#
+#   風險評估：低。合併函式還原 = 回到 V16.2 已驗證行為；單例引擎為標準
+#   Streamlit + SQLAlchemy 模式；None 寫法與既有 NULL 處理一致；備份剔除
+#   只影響「本 session 刪除的 ID」，其他裝置寫入備份檔的列不受影響。
+# ==============================================================================
 # V16.3 介面簡化 + 設定自動還原修復 + 取消假預設 — 2026-11-18
 #
 #   用家需求 (2026-11-18 下午)：
@@ -709,6 +744,27 @@ try:
 except ImportError:
     HAS_SQLALCHEMY = False
 
+
+@st.cache_resource(ttl=None, show_spinner=False)
+def _v163_sql_engine():
+    """V16.3.1：全 app 共用一個 SQL 引擎 (單例 + pool_pre_ping + 連線回收)。
+
+    背景 (2026-11-18 用家實測事故)：舊代碼每次讀/寫都 create_engine 新引擎，
+    各引擎自帶連接池且從不 dispose — 長時間運行的 session (尤其 V16 CLV 每 5
+    分鐘快照) 下連線不斷累積，Supabase 連接數上限被吃光 → 間歇性
+    「SQL 資料庫儲存失敗」→ 側邊欄紅色「雲端同步已連續失敗」警告，最嚴重時
+    用家刪注後刪除結果只存在容器，容器重建 (部署新版) 後已刪注單「復活」。
+
+    修正：全部 SQL 存取改用本單例引擎；pool_pre_ping 令斷線/過期連線自動
+    偵測重建，pool_recycle 定期回收閒置連線。無 SQL 設定 → 回傳 None
+    (呼叫端照舊跳過)。"""
+    try:
+        if not (HAS_SQLALCHEMY and _has_secret("DB_URL") and st.secrets["DB_URL"]):
+            return None
+        return create_engine(st.secrets["DB_URL"], pool_pre_ping=True, pool_recycle=1800)
+    except Exception:
+        return None
+
 # 選配套件：XGBoost / LightGBM (延遲載入：僅在真正訓練時才 import，加快啟動速度並降低記憶體)
 def get_xgb_classifier():
     try:
@@ -811,33 +867,80 @@ def load_db_github(repo, path, token, timeout=None, record_sha_key=None):
     return None
 
 def _v159_merge_db(cloud_df, ours_df):
-    # V15.9 覆蓋保護（設定檔）：其他裝置/session 可能已寫入較新設定。本 session
-    # 未修改過的鍵跟隨雲端現值 (避免舊快照把別人剛改的設定沖走)；LS|/IGN| 累積
-    # 型資料與雲端取聯集。任何失敗都按舊行為整份寫入 (與 V15.8 相容)。
-    # V16.3：force=True 時跳過整段合併 (schema 遷移強制寫入新預設，見函式 docstring)。
-    if not force:
-        try:
-            if _has_secret('GITHUB_TOKEN') and _has_secret('GITHUB_REPO'):
-                _cloud_s = load_db_github(st.secrets['GITHUB_REPO'], SETTINGS_FILE, st.secrets['GITHUB_TOKEN'])
-                if _cloud_s is not None and not _cloud_s.empty:
-                    _cloud_map = {str(r.get('Key', '')): str(r.get('Value', ''))
-                                  for _, r in _cloud_s.iterrows() if str(r.get('Key', ''))}
-                    _base159 = st.session_state.get('_v10_settings_base') or {}
-                    _ours159 = {r['Key']: r['Value'] for r in rows}
-                    _out159 = []
-                    for r in rows:
-                        k = r['Key']
-                        if (k in V10_SETTING_DEFAULTS and k in _cloud_map and k in _base159
-                                and _ours159[k] == str(_base159[k])):
-                            r = {'Key': k, 'Value': _cloud_map[k]}   # 本 session 沒改過 → 跟雲端現值
-                        _out159.append(r)
-                    _ours_keys159 = {r['Key'] for r in _out159}
-                    for k, v in _cloud_map.items():
-                        if (k.startswith(V11_LS_PREFIX) or k.startswith('IGN|')) and k not in _ours_keys159:
-                            _out159.append({'Key': k, 'Value': v})  # 雲端獨有的聯賽/忽略紀錄 → 保留
-                    rows = _out159
-        except Exception:
-            pass
+    """V15.9 覆蓋保護：雲端與本地快照分岔時的注單 ID 聯集合併。
+    - 雲端獨有 ID → 其他 session 寫入的新注單，保留；
+    - 本地獨有 ID → 本 session 寫入的新注單，保留；
+    - 共同 ID → 已結算 (Settled) 優先於未結算 (Open)；同狀態時以本 session 版本為準。
+    任何例外 → 回傳本地版本 (絕不因合併失敗而丟失本 session 數據)。
+    (2026-11-15 18:32 事故：持舊快照的 session 成功上傳，把雲端一筆 Open 注單覆蓋掉)"""
+    try:
+        if cloud_df is None or cloud_df.empty:
+            return ours_df
+        if ours_df is None or ours_df.empty:
+            return cloud_df
+        cloud = enforce_columns(cloud_df.copy(), DB_COLUMNS)
+        ours = enforce_columns(ours_df.copy(), DB_COLUMNS)
+        cloud_ids = set(cloud['ID'].astype(str))
+        ours_ids = set(ours['ID'].astype(str))
+        cloud_rows = {str(r['ID']): r for _, r in cloud.iterrows()}
+        keep, extra = [], []
+        for _, r in ours.iterrows():
+            c = cloud_rows.get(str(r['ID']))
+            if c is None:
+                keep.append(r)                      # 本 session 新注單
+            elif str(r.get('Status') or '') != 'Settled' and str(c.get('Status') or '') == 'Settled':
+                extra.append(c)                     # 雲端已結算、本地仍 Open → 用雲端版本
+            else:
+                keep.append(r)                      # 本地已結算或同狀態 → 本地優先
+        for _rid, c in cloud_rows.items():
+            if _rid not in ours_ids:
+                extra.append(c)                     # 其他 session 新注單 → 保留
+        merged = pd.DataFrame([r.to_dict() for r in keep] + [c.to_dict() for c in extra])
+        return enforce_columns(merged, DB_COLUMNS)
+    except Exception:
+        return ours_df
+
+# =============================================================================
+# V15.12 差量備份與同步保護 (2026-11-16)
+# =============================================================================
+PENDING_DB_FILE = "football_betting_db_pending.csv"
+
+# 指紋欄位：偵測「本 session 改過的列」。刻意不含龐大 JSON 欄位 (Recent_Matches/
+# H2H_Records/Odds_History 等 — 這些建檔時一次寫入，不會事後修改)，令指紋計算在
+# 2,800+ 列上只需毫秒級，自動輸入每場 4-8 次儲存零負擔。
+V1512_FP_COLS = ['ID', 'Status', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds',
+                 'System_Stake', 'User_Stake', 'Result_Label', 'System_Profit',
+                 'User_Profit', 'Unit_Profit', 'Note']
+
+def _v1512_is_main_db(filename):
+    """V15.12：是否主資料庫檔 (需要差量備份保護)。"""
+    return str(filename).endswith('football_betting_db.csv')
+
+def _v1512_fp(df):
+    """V15.12：計算每列指紋 {ID: md5} — 偵測新增列與被修改列 (結算/改注)。"""
+    try:
+        import hashlib
+        cols = [c for c in V1512_FP_COLS if c in df.columns]
+        d = df[cols].astype(str)
+        ids = df['ID'].astype(str).tolist()
+        vals = d.values.tolist()
+        fp = {}
+        for i, _rid in enumerate(ids):
+            if _rid and _rid.lower() != 'nan':
+                fp[_rid] = hashlib.md5('|'.join(vals[i]).encode('utf-8', 'ignore')).hexdigest()
+        return fp
+    except Exception:
+        return None
+
+def _v1512_capture_base(df):
+    """V15.12：記住目前數據狀態的指紋 (作為下次差量比對的基準)。"""
+    try:
+        if df is None or df.empty:
+            st.session_state['_v1512_base'] = {}
+        else:
+            st.session_state['_v1512_base'] = _v1512_fp(df) or {}
+    except Exception:
+        pass
 
 def _v1512_changed_rows(df):
     """V15.12：傳回與基準指紋不同的列 (新注單 + 已結算/被修改的注單)。
@@ -870,7 +973,9 @@ def _v1512_load_pending():
 
 def _v1512_backup_pending(df):
     """V15.12：主檔上傳失敗時的差量備份 — 只上傳有變動的列 (小檔，易成功)。
-    備份成功才更新指紋基準；備份也失敗則基準不變，下次儲存自動重試。"""
+    備份成功才更新指紋基準；備份也失敗則基準不變，下次儲存自動重試。
+    V16.3.1：合併雲端備份後，剔除本 session 已刪除的 ID (防止備份檔把
+    已刪注單在下一次載入時復活)。"""
     try:
         if df is None or df.empty:
             return
@@ -880,6 +985,11 @@ def _v1512_backup_pending(df):
         cloud_pend = _v1512_load_pending()
         if cloud_pend is not None and not cloud_pend.empty:
             changed = _v159_merge_db(cloud_pend, changed)
+        _deleted_v1631 = _v1512_session_deleted_ids(df)
+        if _deleted_v1631 and changed is not None and not changed.empty:
+            changed = changed[~changed['ID'].astype(str).isin(_deleted_v1631)]
+            if changed.empty:
+                return
         if save_db_github(changed, st.secrets["GITHUB_REPO"], PENDING_DB_FILE, st.secrets["GITHUB_TOKEN"]):
             _v1512_capture_base(df)
             st.session_state['_v1512_pending_used'] = True
@@ -898,6 +1008,44 @@ def _v1512_clear_pending():
     except Exception:
         pass
 
+
+def _v1512_session_deleted_ids(df):
+    """V16.3.1：本 session 刪除的注單 ID 清單 (載入基準 base 有、現 df 無)。
+    用家刪注後，這些 ID 必須從差量備份檔剔除，否則下次載入時備份檔會把
+    已刪注單「復活」回 session 並回寫 SQL (2026-11-18 用家實測：V16.2 刪了
+    8 對重複注單，部署 V16.3 後全部再出現的機制之一)。"""
+    try:
+        base = st.session_state.get('_v1512_base') or {}
+        if df is None or df.empty or not base:
+            return set()
+        cur_ids = set(df['ID'].astype(str))
+        return {r for r in base if r not in cur_ids}
+    except Exception:
+        return set()
+
+
+def _v1512_prune_pending_deleted(df):
+    """V16.3.1：把本 session 已刪除的 ID 從差量備份檔移除。
+    必須在 _v1512_capture_base(df) 之前呼叫 (capture 後 base 已更新，
+    刪除的 ID 不再可辨)。任何失敗靜默跳過 (best-effort)。"""
+    try:
+        deleted = _v1512_session_deleted_ids(df)
+        if not deleted:
+            return
+        pend = _v1512_load_pending()
+        if pend is None or pend.empty:
+            return
+        kept = pend[~pend['ID'].astype(str).isin(deleted)]
+        if len(kept) == len(pend):
+            return
+        if kept.empty:
+            _v1512_clear_pending()
+        else:
+            if _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO"):
+                save_db_github(kept, st.secrets["GITHUB_REPO"], PENDING_DB_FILE, st.secrets["GITHUB_TOKEN"])
+    except Exception:
+        pass
+
 def _v1512_save_sql_main(df, table_name):
     """V15.13：主資料庫 SQL 增量寫入。表不存在 → 一次性整檔遷移；之後每次只
     DELETE+INSERT 有變動的列 (新增/結算/修改) 及已被清理的列 — 幾 KB 級流量，
@@ -905,7 +1053,10 @@ def _v1512_save_sql_main(df, table_name):
     try:
         from sqlalchemy import text, bindparam
         from sqlalchemy import inspect as _sa_inspect
-        engine = create_engine(st.secrets["DB_URL"])
+        # V16.3.1：共用單例引擎 (見 _v163_sql_engine docstring)
+        engine = _v163_sql_engine()
+        if engine is None:
+            return False
         if not _sa_inspect(engine).has_table(table_name):
             # 首次遷移：整檔寫入
             df_to_db = df.copy()
@@ -947,6 +1098,7 @@ def _v1512_save_sql_main(df, table_name):
         return True
     except Exception as e:
         st.error(f"SQL 資料庫儲存失敗: {e}")
+        st.session_state['_v163_sql_err'] = str(e)[:300]   # V16.3.1：側邊欄顯示實際錯誤
         return False
 
 def _v1512_merge_pending_on_load():
@@ -1068,9 +1220,10 @@ def load_db(filename, columns, table_name, force_cloud=False):
     # 優先從雲端 SQL 資料庫讀取
     if HAS_SQLALCHEMY and _has_secret("DB_URL") and st.secrets["DB_URL"]:
         try:
-            engine = create_engine(st.secrets["DB_URL"])
-            df = pd.read_sql_table(table_name, engine)
-            df = process_legacy_columns(df)
+            engine = _v163_sql_engine()   # V16.3.1：共用單例引擎
+            if engine is not None:
+                df = pd.read_sql_table(table_name, engine)
+                df = process_legacy_columns(df)
         except Exception:
             pass
 
@@ -1116,7 +1269,9 @@ def save_db(df, filename, table_name):
             if _v1512_is_main_db(filename):
                 _sql_ok1513 = _v1512_save_sql_main(df, table_name)
             else:
-                engine = create_engine(st.secrets["DB_URL"])
+                engine = _v163_sql_engine()   # V16.3.1：共用單例引擎
+                if engine is None:
+                    raise RuntimeError("無 SQL 引擎 (DB_URL 未設定)")
                 df_to_db = df.copy()
                 for col in df_to_db.columns:
                     if df_to_db[col].dtype == 'object':
@@ -1126,7 +1281,12 @@ def save_db(df, filename, table_name):
         except Exception as e:
             st.error(f"SQL 資料庫儲存失敗: {e}")
         st.session_state['_v1512_sql_ok'] = _sql_ok1513
+        if _sql_ok1513:
+            st.session_state.pop('_v163_sql_err', None)   # V16.3.1：成功後清除錯誤顯示
         if _sql_ok1513 and _v1512_is_main_db(filename):
+            # V16.3.1：先剔除本 session 已刪 ID 的差量備份 (必須在 capture_base
+            # 之前 — capture 後 base 已更新，刪除的 ID 不再可辨)
+            _v1512_prune_pending_deleted(df)
             # SQL 已完整保存 → 更新指紋基準；差量備份檔內容已過時，順帶清空
             _v1512_capture_base(df)
             if st.session_state.get('_v1512_pending_used'):
@@ -1177,7 +1337,9 @@ def _v161_sql_read_bets():
     try:
         if not (HAS_SQLALCHEMY and _has_secret('DB_URL') and st.secrets['DB_URL']):
             return None
-        engine = create_engine(st.secrets['DB_URL'])
+        engine = _v163_sql_engine()   # V16.3.1：共用單例引擎
+        if engine is None:
+            return None
         df = pd.read_sql_table('football_bets', engine)
         if df is None or df.empty:
             return None
@@ -5565,7 +5727,7 @@ def render_v11_data_quality():
                 d.loc[mk, 'Tournament_Category'] = new_cat
                 # V16.3：隊伍數目留空 (無記錄) → 清空該賽事注單的 League_Size，不寫假預設
                 if new_ls is None:
-                    d.loc[mk, 'League_Size'] = ''
+                    d.loc[mk, 'League_Size'] = None
                 else:
                     d.loc[mk, 'League_Size'] = int(new_ls)
                 if mark_na:
@@ -10444,6 +10606,10 @@ def main():
         st.sidebar.error(f"⚠️ 雲端同步已連續失敗 {_fail159} 次 — 最新注單/結算只存在本容器！"
                          "請立即到「📊 數據庫即時線上預覽與管理」下載報表備份，並保持此分頁開啟；"
                          "同步成功後此警告會自動消失。")
+        # V16.3.1：顯示最近一次 SQL 實際錯誤，方便診斷
+        _sql_err_v1631 = str(st.session_state.get('_v163_sql_err', '') or '')
+        if _sql_err_v1631:
+            st.sidebar.caption(f"最近 SQL 錯誤：{_sql_err_v1631}")
     # V15.12：主檔同步失敗但差量備份已上傳成功 → 數據其實已安全，補充說明
     if _fail159 > 0 and not _sql_safe1513 and st.session_state.get('_v1512_pending_used'):
         st.sidebar.info("🛡 V15.12 差量備份已生效：最新變更已同步上傳到備份小檔，"
@@ -11439,7 +11605,7 @@ def main():
                                     'ID': new_id, 'Status': 'Open',
                                     'Tournament_Name': res['t_name'], 'Tournament_Category': res['t_cat'], 
                                     'Match': f"{home_team} vs {away_team}", 'Match_Date': match_date, 'Home_Team': home_team, 'Away_Team': away_team,
-                                    'Home_Rating': 'NA' if (no_rank or home_rank is None) else _final_rating_value(st.session_state.get('edit_h_rating_raw'), home_rank, default_h_rank), 'Away_Rating': 'NA' if (no_rank or away_rank is None) else _final_rating_value(st.session_state.get('edit_a_rating_raw'), away_rank, default_a_rank), 'League_Size': int(league_size) if league_size else '', 'Home_Form': home_form, 'Away_Form': away_form,
+                                    'Home_Rating': 'NA' if (no_rank or home_rank is None) else _final_rating_value(st.session_state.get('edit_h_rating_raw'), home_rank, default_h_rank), 'Away_Rating': 'NA' if (no_rank or away_rank is None) else _final_rating_value(st.session_state.get('edit_a_rating_raw'), away_rank, default_a_rank), 'League_Size': int(league_size) if league_size else None, 'Home_Form': home_form, 'Away_Form': away_form,
                                     'Bet_Type': _final_bt, 'Selection': cand['selection'], 'Initial_Line': cand['line'], 'Initial_Odds': cand['odds'], 
                                     'System_Stake': s_stk, 'User_Stake': u_stk,
                                     'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False)
@@ -11450,7 +11616,7 @@ def main():
                                     'ID': new_id, 'Date': get_hkt_now().strftime('%Y-%m-%d %H:%M'), 'Status': 'Open',
                                     'Tournament_Name': res['t_name'], 'Tournament_Category': res['t_cat'], 
                                     'Match': f"{home_team} vs {away_team}", 'Match_Date': match_date, 'Home_Team': home_team, 'Away_Team': away_team,
-                                    'Home_Rating': 'NA' if (no_rank or home_rank is None) else int(home_rank), 'Away_Rating': 'NA' if (no_rank or away_rank is None) else int(away_rank), 'League_Size': int(league_size) if league_size else '', 'Home_Form': home_form, 'Away_Form': away_form,
+                                    'Home_Rating': 'NA' if (no_rank or home_rank is None) else int(home_rank), 'Away_Rating': 'NA' if (no_rank or away_rank is None) else int(away_rank), 'League_Size': int(league_size) if league_size else None, 'Home_Form': home_form, 'Away_Form': away_form,
                                     'Bet_Type': cand['bet_type'], 'Selection': cand['selection'], 'Initial_Line': cand['line'], 'Initial_Odds': cand['odds'], 
                                     'System_Stake': s_stk, 'User_Stake': u_stk,
                                     'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False),
@@ -11963,7 +12129,7 @@ def main():
                                     'ID': new_id, 'Date': get_hkt_now().strftime('%Y-%m-%d %H:%M'), 'Status': 'Open',
                                     'Tournament_Name': ip_res['t_name'], 'Tournament_Category': ip_res['t_cat'],
                                     'Match': f"{ip_res['h_team']} vs {ip_res['a_team']}", 'Match_Date': ip_res.get('match_date', get_hkt_now().strftime('%Y-%m-%d')), 'Home_Team': ip_res['h_team'], 'Away_Team': ip_res['a_team'],
-                                    'Home_Rating': ip_res['h_rating'], 'Away_Rating': ip_res['a_rating'], 'League_Size': int(ip_res['league_size']) if ip_res.get('league_size') else '', 'Home_Form': ip_res['h_form'], 'Away_Form': ip_res['a_form'],
+                                    'Home_Rating': ip_res['h_rating'], 'Away_Rating': ip_res['a_rating'], 'League_Size': int(ip_res['league_size']) if ip_res.get('league_size') else None, 'Home_Form': ip_res['h_form'], 'Away_Form': ip_res['a_form'],
                                     'Bet_Type': f"{cand['bet_type']} (即場)", 'Selection': cand['selection'], 'Initial_Line': cand['line'], 'Initial_Odds': cand['odds'],
                                     'System_Stake': s_stk, 'User_Stake': u_stk,
                                     'Odds_History': json.dumps(ip_res['odds_history'], ensure_ascii=False),
