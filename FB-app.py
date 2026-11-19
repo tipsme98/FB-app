@@ -15,7 +15,8 @@ from datetime import datetime, timedelta, timezone
 # 已配置 Supabase 時，注單主檔及差量檔不得同步到公開的程式碼倉庫。
 # V16.4.3：V10 設定使用獨立來源及逐鍵交易；明示回復預設。
 # V16.4.4：賽事設定逐欄寫回、空白隊數及近況；未知賽日不以記錄日期推算。
-FB_APP_RELEASE = 'V16.4.4'
+# V16.4.5：只縮小自動 BET 前的 SQL 防重查詢；CLV 全量刷新及寫入交易不變。
+FB_APP_RELEASE = 'V16.4.5'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -1458,9 +1459,8 @@ def save_db(df, filename, table_name, *, delete_ids=(), restore_ids=()):
 # ==========================================
 def _v161_sql_read_bets():
     """V16.1：即時讀取 SQL 主資料庫 (football_bets) 全表。
-    用途：clv 批次「已記錄跳過」檢查及自動模式寫入前去重 — 不再依賴可能過舊的
-    session 快照。無 SQL 設定或讀取失敗 → 回傳 None (上層照舊用 session 快照，
-    best-effort 絕不攔截)。"""
+    用途：需要全表合併的刷新，以及非標準比賽 ID 的相容路徑。
+    無 SQL 設定或讀取失敗 → 回傳 None，保留原有處理。"""
     try:
         if not (HAS_SQLALCHEMY and _has_secret('DB_URL') and st.secrets['DB_URL']):
             return None
@@ -1471,6 +1471,36 @@ def _v161_sql_read_bets():
         if df is None or df.empty:
             return None
         return process_legacy_columns(df)
+    except Exception:
+        return None
+
+def _v1645_sql_read_bet_duplicates(match_id):
+    """自動 BET 的唯讀防重預查；精確比對仍使用原有 Python 規則。"""
+    if not match_id:
+        return None
+    # 自動填充通常給標準正整數。其他形態保留原查詢及舊比對語義。
+    if not re.fullmatch(r'0|[1-9][0-9]{0,11}', match_id):
+        return _v161_sql_read_bets()
+    try:
+        engine = _v163_sql_engine()
+        if engine is None:
+            return None
+        from sqlalchemy import text
+        # 普通十進位整數只傳本場；其他歷史表示法（如科學記號、非 ASCII
+        # 空白/數字）保守地納入五欄候選，再由原有正規化決定是否同場。
+        # 不把 ID 強制轉成數字，以免單一無效舊值令整個 SQL 失敗。
+        stmt = text(r'''
+            SELECT "ID", "Tipsme_Match_ID", "Bet_Type", "Selection", "Initial_Line"
+            FROM public."football_bets"
+            WHERE btrim(CAST("Tipsme_Match_ID" AS text)) <> ''
+              AND (
+                btrim(CAST("Tipsme_Match_ID" AS text)) ~ :match_pattern
+                OR btrim(CAST("Tipsme_Match_ID" AS text)) !~ '^[+]?0*[0-9]{1,12}([.]0+)?$'
+              )
+        ''')
+        pattern = rf'^[+]?0*{match_id}([.]0+)?$'
+        with engine.connect() as conn:
+            return pd.read_sql_query(stmt, conn, params={'match_pattern': pattern})
     except Exception:
         return None
 
@@ -11996,11 +12026,10 @@ def main():
                         _dbx = st.session_state.df_db
                         _dbx_m = _dbx['Match'].astype(str).map(v11_clean_name) if not _dbx.empty else pd.Series(dtype=str)
                         _dbx_md = v10_md_series(_dbx) if not _dbx.empty else pd.Series(dtype=str)
-                        # V16.1：自動模式下注前，再讀取 SQL 即時數據作重複檢查
-                        # (第二重保險 — session 快照即使過舊，SQL 查到同場同盤
-                        # 同選項同盤口線已存在即跳過，杜絕跨裝置重複寫入)。
-                        # 手動投注路徑零改動 (只用 session 檢查，行為不變)。
-                        _sql161 = _v161_sql_read_bets() if _v15_on('BET') else None
+                        # V16.4.5：自動 BET 仍即時查 SQL 防重，但只拉必要的候選欄位。
+                        # 手動投注仍照原本只用 session 的檢查。
+                        _smid161 = str(st.session_state.get('tipsme_fill_mid') or '') if _v15_on('BET') else ''
+                        _sql161 = _v1645_sql_read_bet_duplicates(_smid161) if _smid161 else None
                         for i, sel in enumerate(all_keys):
                             cand = option_map[sel]
                             s_stk = sys_stakes.get(sel, 0.0)
@@ -12017,9 +12046,8 @@ def main():
                                     continue
                             # V16.1：SQL 即時重複檢查 (只限自動模式) —
                             # 同 Tipsme 比賽 ID + 同盤口 + 同選項 + 同盤口線已在
-                            # SQL 資料庫 → 跳過，杜絕跨裝置重複寫入。
+                            # SQL 資料庫 → 跳過；這是預查，不是跨交易互斥。
                             if _sql161 is not None and not _sql161.empty:
-                                _smid161 = str(st.session_state.get('tipsme_fill_mid') or '')
                                 if _smid161:
                                     try:
                                         _nid161 = lambda x: (str(int(float(x))) if _v14_is_num(x) else str(x or '').strip())

@@ -1,5 +1,59 @@
 # FB-app 項目交接手冊
 
+## 最新接手紀錄：Egress 正式統計及 V16.4.5
+
+> 2026-11-19（HKT）｜正式統計確認寬欄全表讀取頻繁。V16.4.5 是只縮小自動 BET 防重查詢的候選修補；尚未部署。後面的 18 頁為歷史基線；目前狀態以本節為準。未改正式 GitHub、Streamlit、Supabase、排程或策略設定。
+
+### 已確認的流量與 SQL 證據
+
+- **使用量畫面：** `18 Nov 2026` 浮標為 `Shared Pooler Egress 5.245 GB (100.0%)`；畫面期間用量 7.95 GB，Free 配額 5 GB、超額 2.95 GB。Shared Pooler 是經 Supavisor 傳出的 PostgreSQL 流量，不是 Storage、CDN 快取或資料庫儲存大小。截圖未顯示專案選取及日界線；GB 超額不是帳單金額。<sup>1</sup>
+- **正式查詢統計：** 2026-11-17 10:31:30 至 11-19 13:14:12 HKT（CSV 的 UTC 重置／採樣時點），`statement_deallocations = 0`。`bets_wide_unfiltered` **221 次、681,364 列、每次 3,083.10 列**。設定／資金 3,544 次、92,773 列；其他主表查詢 88 次、153 列；墓碑 193 次、0 列。寬欄全讀佔本份報告四類回傳列數的 88.0%，不是流量佔比。<sup>2</sup>
+- **兩個查詢指紋：** `-4164684057315722318` 為 145 次、448,898 列；`7876000029619881624` 為 76 次、232,466 列。合計等於寬欄全讀的分類總數，勿再加一次。累計統計不能分出 11 月 18 日單日、個別客戶端、實際傳輸 bytes，也不能把兩個指紋直接對應到程式的兩個呼叫點。<sup>2</sup>
+- **原碼與量級：** V16.4.4 的 `_v161_sql_read_bets()` 為全表讀取；舊 CLV 每場 `FILL` 刷新和自動 `BET` 防重均可呼叫，V16.4 歷史原碼亦有這兩處。例行五分鐘快照本身不是每次全讀。Excel 3,203 筆及 68 個非報表專用欄位的 UTF-8 文字約 44.9 MB（44,862,529 bytes），只作單次量級估算，不可拿來把 221 次換算成正式流量。<sup>3</sup>
+
+### 資料驗收與程式版本邊界
+
+`Sheet1!A2:BQ3204` 為 3,203 個不同注單 ID，含 4 筆 `IP`；3,107 筆 `Settled`、96 筆 `Open`，不計 `A3205` 總計。Excel 的 71 個已知 ID、38 場均與 022 清單的比賽 ID 及主客隊吻合，日期都為 `2026-11-18`，全表未見空比賽日期或 `0001-01-01`。7 筆 `U21歐國外` 均為 `國際盃賽 (Cup)`、隊數空白、兩隊排名 `NA`。
+
+Excel 不能驗收正式庫的 `TS|U21歐國外` 和舊 `LS|`。若尚未驗收，先跑 [022 工作串](https://www.perplexity.ai/session/54b9c368-1082-4424-8219-3df6c7afa888?view=thread) 回填包內的 `01_preview_and_verify_read_only.sql` 及 `03_verify_u21_read_only.sql`。都通過便毋須重寫日期、重套 U21；勿重跑舊 315 筆回填或重置 V10。公開 `main` 查驗時仍為 V16.4.4 基線提交 `a5e0d231a7a6b5bb079da73cefc938048a17eec9`，原檔與 022 交付檔 Git blob 一致。公開提交不是 Streamlit 正在執行的版本證明。<sup>3</sup>
+
+<div class="page-sources">
+
+**1. Supabase Egress：** <https://supabase.com/docs/guides/platform/manage-your-usage/egress>  
+**2. Supabase 查詢統計：** <https://supabase.com/docs/guides/observability/inspect>  
+**3. V16.4.4 基線：** <https://github.com/tipsme98/FB-app/commit/a5e0d231a7a6b5bb079da73cefc938048a17eec9>  
+**V16.4 歷史原碼：** <https://raw.githubusercontent.com/tipsme98/FB-app/4a9c29e8987ee8e8e003b09febf8fbfdf940c502/FB-app.py>
+
+</div>
+
+<div class="page-break"></div>
+
+### V16.4.5 候選版與部署程序
+
+- **唯一減流量改動：** 自動 `BET` 寫入前仍即時讀正式庫，但只取 `ID`、`Tipsme_Match_ID`、`Bet_Type`、`Selection`、`Initial_Line`。標準 ID 在 SQL 先篩本場，歷史非標準表示法僅取五欄交由原有 Python 正規化；非標準的目標 ID 沿用舊查法，缺目標 ID 則不發出無用查詢。不讀賠率史等大欄位，精確防重仍按比賽 ID、盤類、方向及盤口線原式判斷。這只是寫入前預查，不是跨交易互斥。
+- **保持不變：** CLV `FILL`、接手或需合併的全量刷新，主表交易、墓碑、Undo、已結算/已填日期保護、U21 規則、V10、模型及手動操作。沒有 schema 遷移，也未改供應商、連線字串或配額方案。若日後再縮小 `FILL`，不能把共用刷新函式直接改為局部讀取。
+- **本地驗證：** 完整程式可編譯，Streamlit 本地啟動顯示 V16.4.5；獨立 PostgreSQL 驗證五欄查詢、舊格式及多種欄位型別、防重條件與第二連線已提交的新注單。合成資料舊查詢 3,219 列，新查詢只回傳 14 列、各五欄，所得防重結果相同。這是合成測試，未量度正式環境節流百分比。
+- **交付檔：** `FB-app.py`（V16.4.5，完整檔案）。SHA-256：`d4a09ce4eb936c7e44e84b3c53fafd9f4cb8f9b360a90d518d8ae3c9fd647f76`。更新的只讀量測 `FB-app_egress_read_only.sql` 亦內嵌在本 PDF。
+
+### 正式驗收、比較及停止條件
+
+1. **部署前：** 先用更新版只讀 SQL 匯一份基線 CSV，不要 Reset report。待主裝置批次完結，暫停每日排程及 CLV，關舊執行分頁。保存實際的舊 `FB-app.py`；如公開 `main` 已不同於上述基線，先比對，不要盲蓋。只用候選 `FB-app.py` 覆蓋 GitHub `main` 的同名主程式，勿上傳 CSV、憑證或私有備份。
+2. **部署後：** 確認 Streamlit 側欄顯示 V16.4.5、SQL 實際可讀，完成尚未驗收的 022 日期和 U21 只讀檢查；不用再跑回填或重置 V10。通過才恢復原排程及 CLV。在一個正常批次後核對沒有新增同場同盤同方向同盤口線副本、也沒有 SQL 儲存錯誤。若異常，先停自動流程，保存證據；只回退程式，不倒回正式庫或舊寫入 SQL。
+3. **量測：** 正常自動 BET 後，用同一 SQL 再匯出 CSV；`bets_auto_bet_scoped` 是新版五欄預查，`bets_wide_unfiltered` 應仍會出現。比較同一資料庫、同一重置基線的兩次計數差，記下批次場數及逐出次數，並在 Usage 選中 FB-app 專案比較相近工作量時段的 Pooler 流量。`category_total` 已含 `top_fingerprint`；不可雙加。只有 `meta` 不等於沒有流量，正式庫若報 extension／權限錯誤，留錯誤或用 Query Performance，不重設統計。<sup>1,2</sup>
+4. **下一輪：** 若全讀仍佔大頭，再單獨設計 CLV `FILL` 的單場核對，先測 session 合併、墓碑、已結算優先與寫入基準。不要為了看數字反覆按全量同步或開多個分頁。
+
+<div class="page-sources">
+
+**1. Supabase Egress 與專案篩選：** <https://supabase.com/docs/guides/platform/manage-your-usage/egress>  
+**2. Supabase 累計統計與同窗口比較：** <https://supabase.com/docs/guides/observability/inspect>
+
+</div>
+
+
+---
+
+> 以下為 022 交付的既有手冊（歷史基線）；目前狀態以開首「最新接手紀錄」為準。
+
 > 最後更新：2026-11-19（HKT）｜V16.4.4 修補及 71 筆已核實日期的回填包已備妥，待用家於正式環境部署、執行及驗收。V10 最新附件的 22 個設定鍵均顯示 `match`，毋須重置。保留既有版本、操作及研究紀錄；如歷史說明與本節相抵觸，以本節為準。
 > 用途：任何新接手的 AI 助手／人員讀完本手冊即可無縫接手，毋須再提供過往項目連結。
 > 維護規則：**每次完成任務後，必須更新本手冊**（版本、數據狀態、待辦、新結論）。
