@@ -14,7 +14,8 @@ from datetime import datetime, timedelta, timezone
 # V16.4.2 (2026-11-18)：保留復原資料的未知比賽日期；不在載入時按記錄時間推算並覆寫。
 # 已配置 Supabase 時，注單主檔及差量檔不得同步到公開的程式碼倉庫。
 # V16.4.3：V10 設定使用獨立來源及逐鍵交易；明示回復預設。
-FB_APP_RELEASE = 'V16.4.3'
+# V16.4.4：賽事設定逐欄寫回、空白隊數及近況；未知賽日不以記錄日期推算。
+FB_APP_RELEASE = 'V16.4.4'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -992,7 +993,8 @@ V1512_FP_COLS = ['ID', 'Status', 'Bet_Type', 'Selection', 'Initial_Line', 'Initi
                  'System_Stake', 'User_Stake', 'Result_Label', 'System_Profit',
                  'User_Profit', 'Unit_Profit', 'Note', 'Match_Date', 'Odds_History',
                  'Date', 'Match', 'Home_Team', 'Away_Team', 'Half_Score',
-                 'System_Payout', 'User_Payout']
+                 'System_Payout', 'User_Payout', 'Tournament_Name', 'Tournament_Category',
+                 'League_Size', 'Home_Rating', 'Away_Rating', 'Home_Form', 'Away_Form']
 
 def _v1512_is_main_db(filename):
     """V15.12：是否主資料庫檔 (需要差量備份保護)。"""
@@ -1012,7 +1014,7 @@ def _v1512_fp(df):
             except InvalidOperation:
                 return v
         for col in ('Initial_Line', 'Initial_Odds', 'System_Stake', 'User_Stake', 'System_Profit',
-                    'User_Profit', 'Unit_Profit', 'System_Payout', 'User_Payout'):
+                    'User_Profit', 'Unit_Profit', 'System_Payout', 'User_Payout', 'League_Size'):
             if col in d:
                 d[col] = d[col].map(number_string)
         ids = df['ID'].astype(str).tolist()
@@ -1147,16 +1149,19 @@ def _v1512_save_sql_main(df, table_name, *, delete_ids=(), restore_ids=()):
                         conn.execute(text(f'ALTER TABLE public."football_bets" ADD COLUMN "{c}" TEXT'))
                 # 未知或只在舊快照出現的 ID 不能覆蓋當前 SQL；已結算不能被其他
                 # session 的舊 Open 覆蓋（只有明示的原注單編輯可將其重開）。
-                lookup = text('SELECT "ID", "Status" FROM public."football_bets" WHERE "ID" IN :ids'
+                date_column = ', "Match_Date"' if 'Match_Date' in tbl_cols else ', NULL'
+                lookup = text('SELECT "ID", "Status"' + date_column + ' FROM public."football_bets" WHERE "ID" IN :ids'
                               ).bindparams(bindparam('ids', expanding=True))
                 states = {}
+                existing_dates = {}
                 ordered = sorted(write_ids)
                 for i in range(0, len(ordered), 500):
-                    for rid, state in conn.execute(lookup, {'ids': ordered[i:i+500]}):
+                    for rid, state, md in conn.execute(lookup, {'ids': ordered[i:i+500]}):
                         rid = str(rid)
                         if rid in states:
                             raise ValueError(f'SQL 存在同 ID 多列，須先核對：{rid}')
                         states[rid] = state
+                        existing_dates[rid] = md
                 edit_id = str(st.session_state.get('editing_bet_id') or '')
                 blocked = {str(row.ID) for row in changed[['ID', 'Status']].itertuples(index=False)
                            if str(row.ID) in states and (str(row.ID) in restored
@@ -1169,6 +1174,21 @@ def _v1512_save_sql_main(df, table_name, *, delete_ids=(), restore_ids=()):
                 keep = write_ids - (restored & states.keys())
                 changed = changed.loc[changed['ID'].astype(str).isin(keep)]
                 write_ids = keep
+                if {'Tournament_Name', 'Tournament_Category', 'League_Size', 'Home_Rating', 'Away_Rating'} <= set(changed):
+                    if _sa_inspect(conn).has_table('football_settings', schema='public'):
+                        rule_rows = conn.execute(text(f'''SELECT "Key", "Value" FROM {_V10_SQL_TABLE}
+                                                         WHERE "Key" LIKE 'TS|%' '''))
+                        rules = _v1644_tournament_rules(rule_rows)
+                        for idx in changed.index:
+                            rule = rules.get(v11_clean_name(changed.at[idx, 'Tournament_Name']))
+                            if rule is not None:
+                                for col, value in _v1644_rule_values(rule).items():
+                                    changed.at[idx, col] = value
+                if 'Match_Date' in changed:
+                    for idx in changed.index:
+                        old = existing_dates.get(str(changed.at[idx, 'ID']))
+                        if not is_missing_match_date(old) and is_missing_match_date(changed.at[idx, 'Match_Date']):
+                            changed.at[idx, 'Match_Date'] = str(old)[:10]
             batched(conn, 'DELETE FROM public."football_bets" WHERE "ID" IN :ids', deleted | write_ids)
             if write_ids:
                 for col in changed.columns:
@@ -1480,32 +1500,6 @@ def _v161_refresh_db_from_sql():
         return True
     except Exception:
         return False
-
-def v161_backfill_match_dates(df):
-    """V16.1：一次性回填 Match_Date 為 0001-01-01 的注單 (V16 clv 填充 bug 產生，
-    2026-11-17/18 隔夜共 71 筆)。回填規則：T-30 批次寫入距開賽約 25–35 分鐘 →
-    Match_Date ≈ 記錄時間 (Date 欄) + 35 分鐘的日期 (與項目手冊記載的回填規則
-    一致)。冪等：回填後不再觸發。回傳 (新 df, 回填筆數)；任何例外回傳 (原 df, 0)。"""
-    if df is None or df.empty or 'Match_Date' not in df.columns or 'Date' not in df.columns:
-        return df, 0
-    try:
-        _md = pd.to_datetime(df['Match_Date'], errors='coerce')
-        _mask = _md.isna() | (_md.dt.year < 2000)
-        if not _mask.any():
-            return df, 0
-        _dt = pd.to_datetime(df['Date'], errors='coerce')
-        _fill = (_dt + pd.Timedelta(minutes=35)).dt.strftime('%Y-%m-%d')
-        out = df.copy()
-        n = 0
-        for _idx in out.index[_mask]:
-            _fd = _fill.get(_idx)
-            # 只接受 YYYY-MM-DD 格式 (Date 欄無效/NaT 時不回填，留待質素檢查處理)
-            if _fd is not None and re.fullmatch(r'\d{4}-\d{2}-\d{2}', str(_fd)) and str(_fd) >= '2000-01-01':
-                out.at[_idx, 'Match_Date'] = str(_fd)
-                n += 1
-        return out, n
-    except Exception:
-        return df, 0
 
 # ==========================================
 # 2. 資金、風控與累計算式 (分離系統與真實資金)
@@ -3773,10 +3767,8 @@ def _v9_engine_input_impl(df_settled):
     # V11：去除名稱多餘空格 (' 托盧卡' 與 '托盧卡' 視為同一球隊)
     for c in ['Match', 'Tournament_Name', 'Home_Team', 'Away_Team']:
         d[c] = d[c].apply(lambda v: v11_clean_name(v) if v is not None else None)
-    # V11：缺少隊伍數目的舊紀錄，用系統內建的聯賽隊伍數目 (不再一律當 20 隊)
-    _ls = pd.to_numeric(d['League_Size'], errors='coerce')
-    _fill = d['Tournament_Name'].map(lambda t: V11_DEFAULT_LEAGUE_SIZES.get(t) if t is not None else None)
-    d['League_Size'] = _ls.where(_ls.notna(), pd.to_numeric(_fill, errors='coerce'))
+    # 只保留原紀錄的隊數；缺值由訓練端 get_league_size 提供 20 尺度，不改資料。
+    d['League_Size'] = pd.to_numeric(d['League_Size'], errors='coerce')
     return d.reset_index(drop=True)
 
 
@@ -5428,8 +5420,8 @@ V11_DEFAULT_LEAGUE_SIZES = {
 }
 V11_NA_TOKENS = {'NA', 'N/A', '無', '無排名', '-', ''}
 V11_CUP_CATS = ("國際盃賽 (Cup)", "國內盃賽 (Domestic Cup)", "友誼賽 (Friendly)")
-V11_INTL_HINTS = ('亞冠', '歐聯', '歐霸', '歐協', '世冠', '自由盃', '南美', '中北美', '世界盃', '國際')
-V11_CUP_HINTS = ('盃', '杯', '亞冠', '歐聯', '歐霸', '歐協', '友誼')
+V11_INTL_HINTS = ('亞冠', '歐聯', '歐霸', '歐協', '世冠', '自由盃', '南美', '中北美', '世界盃', '國際', 'U21歐國外')
+V11_CUP_HINTS = ('盃', '杯', '亞冠', '歐聯', '歐霸', '歐協', '友誼', 'U21歐國外')
 V11_STRAT_NAMES = {'kp': 'V10 看盤規則 (EV≥3%)', 'kz': 'V11 嚴格看盤規則 (z≥1.5)', 'v9': 'V9 市場錨定機器學習 (EV≥2%)',
                    'lb': '聯賽專屬偏差模型 (對照組)', 'mkt': '隨機買任一邊 (市場基準)'}
 V11_STRAT_THR = {'kp': 0.03, 'kz': 0.0, 'v9': 0.02}
@@ -5513,24 +5505,128 @@ def v11_ls_map():
     return dict(st.session_state.get('_v11_ls_map', {}) or {})
 
 
+def _v1644_valid_team_count(raw):
+    try:
+        n = float(raw)
+        if 2 <= n <= 40 and n.is_integer():
+            return int(n)
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return None
+
+
+def _v1644_tournament_rules(rows):
+    rules = {}
+    for key, raw in rows:
+        if not isinstance(key, str) or not key.startswith('TS|'):
+            continue
+        try:
+            obj = json.loads(raw)
+            if (obj['category'] in CATEGORY_OPTIONS and type(obj['no_rank']) is bool
+                    and (obj['size'] is None or _v1644_valid_team_count(obj['size']) is not None)):
+                rules[key[3:]] = obj
+        except (TypeError, ValueError, KeyError):
+            continue
+    return rules
+
+
+def _v1644_tournament_rule(t):
+    return _v1644_tournament_rules(st.session_state.get('_v10_rows', [])).get(t)
+
+
+def _v1644_rule_values(rule):
+    values = {'Tournament_Category': rule['category'], 'League_Size': rule['size']}
+    if rule['no_rank'] or rule['size'] is None:
+        values.update(Home_Rating='NA', Away_Rating='NA')
+    return values
+
+
+def _v1644_apply_tournament(t, category, size, no_rank):
+    """在正式資料同一交易更新確認過的賽事規則及相關欄，不使用分頁整列快照。"""
+    t = v11_clean_name(t)
+    if not t or category not in CATEGORY_OPTIONS or (size is not None and _v1644_valid_team_count(size) is None):
+        raise ValueError('賽事分類或隊數不正確')
+    size = _v1644_valid_team_count(size)
+    rule = {'category': category, 'size': size, 'no_rank': bool(no_rank or size is None)}
+    key, legacy = f'TS|{t}', f'{V11_LS_PREFIX}{t}'
+    payload = json.dumps(rule, ensure_ascii=False, separators=(',', ':'))
+    state = st.session_state
+    after = state.df_db.copy()
+    if _v10_settings_source() != 'Supabase':
+        # 本工具不容許 GitHub CSV 與本地備份冒充 Supabase 原子提交。
+        raise RuntimeError('此批次工具需要 Supabase 正式資料庫')
+    engine = _v163_sql_engine()
+    if engine is None or not state.get('_v10_settings_read_ok'):
+        raise RuntimeError('未能核對 Supabase 連線')
+    txt = sqlalchemy.text
+    before_setting = _v10_key_values(state.get('_v10_rows', []), key)
+    values = _v1644_rule_values(rule)
+    with engine.begin() as conn:
+        conn.execute(txt("SET LOCAL lock_timeout = '5s'"))
+        conn.execute(txt("SET LOCAL statement_timeout = '10s'"))
+        conn.execute(txt("LOCK TABLE public.football_bets IN SHARE ROW EXCLUSIVE MODE"))
+        conn.execute(txt(f"LOCK TABLE {_V10_SQL_TABLE} IN SHARE ROW EXCLUSIVE MODE"))
+        found = conn.execute(txt(f'SELECT "Value" FROM {_V10_SQL_TABLE} WHERE "Key" = :key'),
+                             {'key': key})
+        if tuple(r[0] for r in found) != before_setting:
+            raise _V10SettingsConflict(key)
+        # 正規化前後／連續空格；名稱相近的其他賽事不會被匹配。
+        where = '''btrim(regexp_replace("Tournament_Name", '[[:space:]]+', ' ', 'g')) = :t'''
+        if conn.execute(txt(f'''WITH targets AS (SELECT DISTINCT "ID" FROM public.football_bets WHERE {where})
+                                 SELECT b."ID" FROM public.football_bets b JOIN targets t
+                                   ON b."ID" IS NOT DISTINCT FROM t."ID"
+                                 GROUP BY b."ID" HAVING count(*) > 1 OR b."ID" IS NULL LIMIT 1'''),
+                        {'t': t}).first():
+            raise RuntimeError('目標賽事含重複或無效 ID，請先核對')
+        assignment = ', '.join(f'"{col}" = :{col}' for col in values)
+        changed = conn.execute(txt(
+            f'UPDATE public.football_bets SET {assignment} WHERE {where} RETURNING *'),
+            {'t': t, **values}).mappings().all()
+        if not changed:
+            raise RuntimeError('正式資料庫找不到該賽事')
+        if any((row[col] is not None if val is None else
+                _v1644_valid_team_count(row[col]) != val if col == 'League_Size' else row[col] != val)
+               for row in changed for col, val in values.items()):
+            raise RuntimeError('正式資料庫的賽事欄位與要求不符')
+        targets = enforce_columns(process_legacy_columns(pd.DataFrame([dict(row) for row in changed])), DB_COLUMNS)
+        ids = set(targets['ID'].astype(str))
+        conn.execute(txt(f'DELETE FROM {_V10_SQL_TABLE} WHERE "Key" IN (:key, :legacy)'),
+                     {'key': key, 'legacy': legacy})
+        conn.execute(txt(f'INSERT INTO {_V10_SQL_TABLE} ("Key", "Value") VALUES (:key, :value)'),
+                     {'key': key, 'value': payload})
+        rows = [tuple(r) for r in conn.execute(txt(f'SELECT "Key", "Value" FROM {_V10_SQL_TABLE}'))]
+        if _v10_key_values(rows, key) != (payload,):
+            raise RuntimeError('未能核對賽事規則寫入')
+    # 只更新或重讀確實已提交的 SQL 值；不以舊分頁覆蓋其他列。
+    _v10_apply_aux(rows)
+    state['_v10_rows'] = rows
+    after = pd.concat([after.loc[~after['ID'].astype(str).isin(ids)], targets], ignore_index=True)
+    state.setdefault('_v1641_sql_base', {}).update(_v1512_fp(targets) or {})
+    state.df_db = after
+    _v1512_capture_base(after)
+    state.pop('_v11_ls_marker', None)
+    state['show_analysis'] = state['show_inplay_analysis'] = False
+    return len(ids)
+
+
 def v11_lookup_league_size(tourn, df_db=None):
     """回傳 (隊伍數目, 來源說明)。優先次序：用家儲存 → 系統內建 → 數據庫最近一次輸入。
     V16.3：全部查無 → (None, '無記錄')，介面留空，不填假預設 20。"""
     t = v11_clean_name(tourn) or ''
+    rule = _v1644_tournament_rule(t)
+    if rule:
+        return rule['size'], '已套用的賽事設定'
     m = v11_ls_map()
     if t in m:
-        try:
-            return int(m[t]), '已記住的用家設定'
-        except (TypeError, ValueError):
-            pass
+        if (n := _v1644_valid_team_count(m[t])) is not None:
+            return n, '已記住的用家設定'
     if t in V11_DEFAULT_LEAGUE_SIZES:
         return V11_DEFAULT_LEAGUE_SIZES[t], '系統內建 (2026-27 球季)'
     if df_db is not None and not df_db.empty and t:
         d = df_db[df_db['Tournament_Name'].astype(str).map(v11_clean_name) == t]
-        s = pd.to_numeric(d.get('League_Size', pd.Series(dtype=float)), errors='coerce').dropna()
-        s = s[(s >= 2) & (s <= 40)]
-        if len(s):
-            return int(s.iloc[-1]), '數據庫最近一次輸入'
+        for raw in reversed(d.get('League_Size', pd.Series(dtype=float)).tolist()):
+            if (n := _v1644_valid_team_count(raw)) is not None:
+                return n, '數據庫最近一次輸入'
     return None, '無記錄'
 
 
@@ -5543,7 +5639,7 @@ def v11_save_league_size(tourn, n, silent=False):
     except (TypeError, ValueError):
         return
     m = v11_ls_map()
-    if m.get(t) == n:
+    if m.get(t) == n or _v1644_tournament_rule(t) or _v1644_valid_team_count(n) is None:
         return
     saved = _v10_settings_write({f'{V11_LS_PREFIX}{t}': str(n)}, auxiliary=True)
     if saved and not silent:
@@ -5554,6 +5650,9 @@ def _v11_on_ls_change(tourn):
     # V16.3：留空 (無記錄) 時不儲存，避免把空值寫進用家記住清單
     _v = st.session_state.get('league_size')
     if _v is None:
+        st.session_state['v11_no_rank'] = True
+        for key in ('h_rank', 'a_rank'):
+            st.session_state.pop(key, None)
         return
     v11_save_league_size(tourn, _v)
 
@@ -5563,11 +5662,39 @@ def v11_default_no_rank(tourn, df_db):
     t = v11_clean_name(tourn) or ''
     if not t or t == "➕ 新增手動輸入...":
         return False
+    rule = _v1644_tournament_rule(t)
+    if rule:
+        return rule['no_rank'] or rule['size'] is None
     if df_db is not None and not df_db.empty:
         d = df_db[df_db['Tournament_Name'].astype(str).map(v11_clean_name) == t]
         if len(d) and d['Home_Rating'].map(v11_is_na_rating).tail(10).mean() >= 0.5:
             return True
     return v11_is_cup_like(t)
+
+
+def _v1644_form_parts(raw):
+    if raw is not None:
+        m = re.fullmatch(r'\s*(\d{1,2})W(\d{1,2})D(\d{1,2})L\s*', str(raw), re.I)
+        if m and sum(map(int, m.groups())) == 5:
+            return tuple(map(int, m.groups()))
+    return (None, None, None)
+
+
+def _v1644_recent_form(w, d, l):
+    if None in (w, d, l):
+        return ''
+    return f'{w}W{d}D{l}L'
+
+
+def _v1644_fill_form_keys(keys, history, before):
+    values = (None, None, None)
+    if history and before is not None:
+        w, d, l, n = tipsme_form_from_matches(history, before, 5)
+        if n >= 5:
+            values = (w, d, l)
+    for key, value in zip(keys, values):
+        st.session_state[key] = value
+    return values[0] is not None
 
 
 # ---------- 數據質素檢查 ----------
@@ -5620,12 +5747,13 @@ def v11_data_audit(df_db):
             issues.append(_v11_issue('🔴 高', '同一比賽賽事名稱不一致', g.iloc[0], f"同一場比賽同時被記錄為：{'、'.join(f'{k} ({v} 張)' for k, v in cnt.items())}。",
                                      f"請把「{minor}」的注單改為正確賽事", list(g[g['_t'] == minor]['_ID']), tourn='/'.join(cnt.index), md=md_))
         for col, lab in (('Home_Rating', '主隊排名'), ('Away_Rating', '客隊排名'), ('Home_Form', '主隊近況'), ('Away_Form', '客隊近況'), ('League_Size', '隊伍數目')):
-            vals = g[col].dropna().astype(str).map(lambda x: x[:-2] if x.endswith('.0') else x)
-            vals = vals[vals != '']
+            vals = g[col].astype('string').fillna('').str.replace(r'\.0$', '', regex=True)
             if vals.nunique() > 1:
-                cnt = vals.value_counts()
+                cnt = vals[vals.ne('')].value_counts()
+                if len(cnt) < 2:
+                    continue
                 minor = cnt.index[-1]
-                ids_ = list(g[g[col].astype(str).map(lambda x: x[:-2] if x.endswith('.0') else x) == minor]['_ID'])
+                ids_ = list(g.loc[vals.eq(minor), '_ID'])
                 issues.append(_v11_issue('🟡 低', '同一比賽資料不一致', g.iloc[0], f"{lab}在同一場比賽有不同數值：{'、'.join(f'{k} ({v} 張)' for k, v in cnt.items())}。系統學習時只取其中一個。",
                                          '請統一為正確數值', ids_[:6], md=md_))
 
@@ -5722,15 +5850,16 @@ def v11_data_audit(df_db):
                                      '盃賽/洲際賽請在下方「賽事設定」標記為「沒有聯賽排名」；聯賽請輸入實際排名', None, tourn=t))
         elif 0 < default_rank.sum() < max(3, 0.6 * len(g)):
             for _, r in g[default_rank].iterrows():
-                issues.append(_v11_issue('🟡 低', '排名可能未填 (預設值)', r, f"兩隊排名都是預設值 {int((pd.to_numeric(r.get('League_Size'), errors='coerce') or 20) // 2)}。", '確認排名', [r['_ID']], md=r['_md']))
+                issues.append(_v11_issue('🟡 低', '排名可能未填 (預設值)', r, f"兩隊排名都是預設值 {get_league_size(r) // 2}。", '確認排名', [r['_ID']], md=r['_md']))
         exp_ls = V11_DEFAULT_LEAGUE_SIZES.get(t)
         if exp_ls is not None:
             wrong = g[ls_vals.notna() & (ls_vals != exp_ls)]
             if len(wrong):
                 issues.append(_v11_issue('🟠 中', '聯賽隊伍數目錯誤', None, f"{len(wrong)} 場比賽的隊伍數目為 {sorted(set(ls_vals[ls_vals.notna() & (ls_vals != exp_ls)].astype(int)))}，{t} 應為 {exp_ls} 隊。隊伍數目錯誤會令排名換算的實力分偏差。",
                                          '按下方「賽事設定」統一隊伍數目', list(wrong['_ID'])[:6], tourn=t))
-        if ls_vals.isna().mean() > 0.3:
-            issues.append(_v11_issue('🟡 低', '隊伍數目缺失', None, f"{int(ls_vals.isna().sum())}/{len(g)} 場沒有記錄隊伍數目 (系統以 20 隊計算)。", '按下方「賽事設定」統一隊伍數目', None, tourn=t))
+        _missing_ranked_size = ls_vals.isna() & ~na_rank & ~g['Away_Rating'].map(v11_is_na_rating)
+        if _missing_ranked_size.mean() > 0.3:
+            issues.append(_v11_issue('🟡 低', '隊伍數目缺失', None, f"{int(_missing_ranked_size.sum())}/{len(g)} 場有排名但沒有記錄隊伍數目 (運算用 20 隊尺度)。", '按下方「賽事設定」統一隊伍數目', None, tourn=t))
         cats = g['Tournament_Category'].dropna().astype(str).unique()
         if v11_is_cup_like(t) and any(c.startswith('國內聯賽') for c in cats):
             issues.append(_v11_issue('🟡 低', '賽事分類可能錯誤', None, f"「{t}」屬盃賽/洲際賽，但分類為「國內聯賽」。", '按下方「賽事設定」修改分類', None, tourn=t))
@@ -5853,7 +5982,9 @@ def v11_clear_model_caches():
 def _v11_commit_db(df_new, msg, undo_rows=None):
     df_new = enforce_columns(df_new.reset_index(drop=True), DB_COLUMNS)
     delete_ids = undo_rows['ID'].astype(str).tolist() if undo_rows is not None and len(undo_rows) else []
-    if not save_db(df_new, V11_DB_FILE, V11_DB_TABLE, delete_ids=delete_ids) and delete_ids:
+    ok = save_db(df_new, V11_DB_FILE, V11_DB_TABLE, delete_ids=delete_ids)
+    if not ok and (delete_ids or _v10_settings_source() != '本機'):
+        st.warning("未能確認正式寫入，未把變更當作已儲存。")
         return
     if undo_rows is not None and len(undo_rows):
         st.session_state.setdefault('undo_stack', [])
@@ -5974,41 +6105,42 @@ def render_v11_data_quality():
         if tours:
             t = st.selectbox("賽事", tours, key="v11_ts_tourn")
             dt = df_db[df_db['Tournament_Name'].astype(str).map(v11_clean_name) == t]
+            _rule = _v1644_tournament_rule(t)
             cur_cat = dt['Tournament_Category'].dropna().astype(str).mode()
             cur_cat = cur_cat.iloc[0] if len(cur_cat) else CATEGORY_OPTIONS[0]
             sug_cat = cur_cat
             if v11_is_cup_like(t) and cur_cat.startswith('國內聯賽'):
                 sug_cat = CATEGORY_OPTIONS[2] if v11_is_intl(t) else CATEGORY_OPTIONS[3]
-            new_cat = st.selectbox("賽事分類", CATEGORY_OPTIONS, index=CATEGORY_OPTIONS.index(sug_cat) if sug_cat in CATEGORY_OPTIONS else 0, key=f"v11_ts_cat_{t}")
+            if _rule:
+                sug_cat = _rule['category']
+            _rule_revision = json.dumps(_rule, ensure_ascii=False, sort_keys=True)
+            _rule_token = f'{t}|{_rule_revision}'
+            new_cat = st.selectbox("賽事分類", CATEGORY_OPTIONS, index=CATEGORY_OPTIONS.index(sug_cat) if sug_cat in CATEGORY_OPTIONS else 0, key=f"v11_ts_cat_{_rule_token}")
             ls0, _src = v11_lookup_league_size(t, df_db)
-            # V16.3：查無隊伍數目 → 留空 (value=None)，不填假預設 20
-            new_ls = st.number_input(f"隊伍數目 (目前自動填寫：{ls0 if ls0 else '無記錄'}，來源：{_src})", 2, 40,
-                                      value=ls0 if ls0 else None, key=f"v11_ts_ls_{t}")
-            hr_mid = dt['Home_Rating'].map(_parse_rank_int)
-            ar_mid = dt['Away_Rating'].map(_parse_rank_int)
-            ls_v = pd.to_numeric(dt['League_Size'], errors='coerce').fillna(20) // 2
-            n_def = int(((hr_mid == ls_v) & (ar_mid == ls_v)).sum())
-            mark_na = st.checkbox(f"把排名為預設值的 {n_def} 張注單標記為「沒有聯賽排名」(盃賽/洲際賽適用)", value=v11_is_cup_like(t) and n_def > 0, key=f"v11_ts_na_{t}")
-            if st.button("💾 套用到此賽事全部注單", key="v11_ts_apply", use_container_width=True):
-                d = df_db.copy()
-                mk = d['Tournament_Name'].astype(str).map(v11_clean_name) == t
-                d.loc[mk, 'Tournament_Category'] = new_cat
-                # V16.3：隊伍數目留空 (無記錄) → 清空該賽事注單的 League_Size，不寫假預設
-                if new_ls is None:
-                    d.loc[mk, 'League_Size'] = None
+            _bulk_ls_key = f"v11_ts_ls_{_rule_token}"
+            if _bulk_ls_key not in st.session_state:
+                st.session_state[_bulk_ls_key] = ls0
+            new_ls = st.number_input("隊伍數目（留空會清空）", 2, 40, value=None, key=_bulk_ls_key)
+            st.caption(f"隊伍數目來源：{_src}。套用後會保留此規則，亦用於新注單；以前的真實排名不會自動恢復。")
+            mark_na = st.checkbox("此賽事沒有聯賽排名（套用至全部相關注單）",
+                                  value=_rule['no_rank'] if _rule else v11_default_no_rank(t, df_db),
+                                  key=f"v11_ts_na_{_rule_token}")
+            if new_ls is None:
+                st.caption("隊伍數目留空時，套用會同時標記為沒有聯賽排名。")
+            if _msg := st.session_state.pop('_v1644_tournament_notice', None):
+                st.success(_msg)
+            if st.button("💾 套用到此賽事全部注單", key="v11_ts_apply", use_container_width=True,
+                         disabled=_v10_settings_source() != 'Supabase'):
+                try:
+                    count = _v1644_apply_tournament(t, new_cat, new_ls, mark_na)
+                except _V10SettingsConflict:
+                    st.warning("另一分頁已修改此賽事設定，本次未套用。請重新核對。")
+                except Exception:
+                    st.error("未能確認 Supabase 已提交賽事設定；請重新整理後核對，勿反覆套用。")
                 else:
-                    d.loc[mk, 'League_Size'] = int(new_ls)
-                if mark_na:
-                    hr2 = d.loc[mk, 'Home_Rating'].map(_parse_rank_int)
-                    ar2 = d.loc[mk, 'Away_Rating'].map(_parse_rank_int)
-                    lsv = pd.to_numeric(df_db.loc[mk, 'League_Size'], errors='coerce').fillna(20) // 2
-                    sel_na = mk.copy()
-                    sel_na.loc[mk] = ((hr2 == lsv) & (ar2 == lsv)).values
-                    d.loc[sel_na, 'Home_Rating'] = 'NA'
-                    d.loc[sel_na, 'Away_Rating'] = 'NA'
-                if new_ls is not None:
-                    v11_save_league_size(t, new_ls, silent=True)
-                _v11_commit_db(d, f"✅ 已更新「{t}」的分類、隊伍數目及排名設定")
+                    v14_clear_model_caches()
+                    st.session_state['_v1644_tournament_notice'] = f"Supabase 已更新「{t}」：{count} 張注單及賽事設定。"
+                    st.rerun()
 
     with st.container(border=True):
         st.markdown("**⑤ 移除不合理賠率紀錄 (Odds_History)**")
@@ -6343,37 +6475,23 @@ def load_bet_to_edit(bet_id):
     
     st.session_state.edit_t_name = str(row.get('Tournament_Name', '')) if pd.notna(row.get('Tournament_Name')) else ''
     st.session_state.edit_t_cat = str(row.get('Tournament_Category', CATEGORY_OPTIONS[0])) if pd.notna(row.get('Tournament_Category')) else CATEGORY_OPTIONS[0]
-    _match_date_str = get_row_match_date(row)
+    _match_date_str = None if is_missing_match_date(row.get('Match_Date')) else str(row.get('Match_Date'))[:10]
     st.session_state.edit_match_date = _match_date_str
     st.session_state.edit_h_team = str(row.get('Home_Team', '')) if pd.notna(row.get('Home_Team')) else ''
     st.session_state.edit_a_team = str(row.get('Away_Team', '')) if pd.notna(row.get('Away_Team')) else ''
     # 聯賽排名：新數據為數字排名，舊數據為字母評級 (自動換算為約略排名)
     # V16.3：隊伍數目空白 (無記錄) → 編輯時留空，不填假預設 20
-    _ls_raw = row.get('League_Size')
-    if _ls_raw is None or (isinstance(_ls_raw, float) and pd.isna(_ls_raw)) or not str(_ls_raw).strip():
-        _league_size = None
-    else:
-        _league_size = get_league_size(row)
+    _league_size = _v1644_valid_team_count(row.get('League_Size'))
     st.session_state.edit_league_size = _league_size
     # 隊伍數目空白時排名換算沿用 20 隊尺度 (僅供編輯畫面顯示，不會寫回假隊數)
-    st.session_state.edit_h_rank = rating_to_rank(row.get('Home_Rating'), _league_size or 20)
-    st.session_state.edit_a_rank = rating_to_rank(row.get('Away_Rating'), _league_size or 20)
+    st.session_state.edit_h_rank = rating_to_rank(row.get('Home_Rating'), _league_size) if _league_size else None
+    st.session_state.edit_a_rank = rating_to_rank(row.get('Away_Rating'), _league_size) if _league_size else None
     st.session_state.edit_h_rating_raw = str(row.get('Home_Rating', '')) if pd.notna(row.get('Home_Rating')) else ''
     st.session_state.edit_a_rating_raw = str(row.get('Away_Rating', '')) if pd.notna(row.get('Away_Rating')) else ''
     
     # V16.3：近況空白 (無近5場記錄) → 編輯時同樣留空，不填假預設
-    _hf_raw = row.get('Home_Form')
-    _af_raw = row.get('Away_Form')
-    if _hf_raw is None or (isinstance(_hf_raw, float) and pd.isna(_hf_raw)) or not str(_hf_raw).strip():
-        st.session_state.edit_hw = st.session_state.edit_hd = st.session_state.edit_hl = None
-    else:
-        hw, hd, hl = parse_form_str(_hf_raw)
-        st.session_state.edit_hw, st.session_state.edit_hd, st.session_state.edit_hl = hw, hd, hl
-    if _af_raw is None or (isinstance(_af_raw, float) and pd.isna(_af_raw)) or not str(_af_raw).strip():
-        st.session_state.edit_aw = st.session_state.edit_ad = st.session_state.edit_al = None
-    else:
-        aw, ad, al = parse_form_str(_af_raw)
-        st.session_state.edit_aw, st.session_state.edit_ad, st.session_state.edit_al = aw, ad, al
+    st.session_state.edit_hw, st.session_state.edit_hd, st.session_state.edit_hl = _v1644_form_parts(row.get('Home_Form'))
+    st.session_state.edit_aw, st.session_state.edit_ad, st.session_state.edit_al = _v1644_form_parts(row.get('Away_Form'))
     
     try:
         oh = json.loads(str(row.get('Odds_History', '[]')))
@@ -6417,6 +6535,9 @@ def load_bet_to_edit(bet_id):
     # 清除表單 widget 舊值，確保下一個 rerun 正確顯示已載入的資料
     # (包括賽事/球隊/分類/日期/近5場狀態/賠率走勢表/投注選單等所有欄位)
     reset_edit_form_widgets()
+    for key, edit_key in zip(('f1', 'f2', 'f3', 'f4', 'f5', 'f6'),
+                             ('edit_hw', 'edit_hd', 'edit_hl', 'edit_aw', 'edit_ad', 'edit_al')):
+        st.session_state[key] = st.session_state[edit_key]
 
 def clear_edit_mode():
     """清除修改模式狀態"""
@@ -6433,7 +6554,7 @@ def is_missing_match_date(v):
     if pd.isna(v):
         return True
     s = str(v).strip()
-    return s == '' or s.lower() in ('none', 'nan', 'nat')
+    return s == '' or s.lower() in ('none', 'nan', 'nat') or s[:10] == '0001-01-01'
 
 # 已完成注單表格編輯器中的數值欄位 (轉為數字型別方便直接編輯)
 SETTLED_EDITOR_NUMCOLS = [
@@ -6485,23 +6606,7 @@ def edit_settled_bets_dialog(db_file, db_table):
                                save_key="sbd_save_group", db_file=db_file, db_table=db_table,
                                button_label="💾 儲存此場次所有修改")
         
-        st.divider()
-        with st.expander("⚡ 一鍵智能補填：以記錄日期 (Date) 填補所有缺失的比賽日期"):
-            st.caption("系統會將所有缺少 Match_Date 的注單，自動以該注單的記錄日期 (Date 欄位) 作為比賽日期填入。")
-            if st.button("⚡ 執行一鍵補填", key="sbd_auto_fill"):
-                miss_mask = (st.session_state.df_db['Status'] == 'Settled') & st.session_state.df_db['Match_Date'].apply(is_missing_match_date)
-                miss_idx = st.session_state.df_db.index[miss_mask]
-                if len(miss_idx) == 0:
-                    st.toast("目前沒有缺少比賽日期的注單。", icon="✅")
-                else:
-                    for idx in miss_idx:
-                        dv = st.session_state.df_db.at[idx, 'Date']
-                        parsed = pd.to_datetime(dv, errors='coerce')
-                        fill_val = parsed.strftime('%Y-%m-%d') if pd.notna(parsed) else get_hkt_now().strftime('%Y-%m-%d')
-                        st.session_state.df_db.at[idx, 'Match_Date'] = fill_val
-                    save_db(st.session_state.df_db, db_file, db_table)
-                    st.toast(f"✅ 已智能補填 {len(miss_idx)} 張注單的比賽日期！", icon="⚡")
-                    st.rerun()
+        st.caption("補比賽日期請先核對實際賽程；寫入日期不等同開賽日期。")
     
     with tab_id:
         def _id_opt(r):
@@ -7374,8 +7479,17 @@ def tipsme_fetch_match_info(match_id):
     if not d.get('home') or not d.get('away'):
         return None
     ko = _tipsme_iso_time(d.get('fullMatchTimeUtc'))
-    if ko is not None:
+    if ko is None or ko.year < 2000:
+        page = _tipsme_livescore_from_page(match_id) or {}
+        if (str(page.get('matchId')) == str(match_id) and page.get('home') == d.get('home')
+                and page.get('away') == d.get('away')):
+            alternate = _tipsme_iso_time(page.get('fullMatchTimeUtc'))
+            if alternate is not None and alternate.year >= 2000:
+                ko = alternate
+    if ko is not None and ko.year >= 2000:
         ko = ko + timedelta(hours=8)  # UTC → 香港時間
+    else:
+        ko = None
     return {
         'match_id': str(match_id),
         'home': str(d.get('home')),
@@ -7707,6 +7821,11 @@ def tipsme_build_odds_history(api_odds):
 
 def tipsme_pick_category(league, is_cup, df_db=None):
     """由資料庫慣例 + 賽事性質推斷賽事分類 (之後仍可在表單手動更改)"""
+    rule = _v1644_tournament_rule(v11_clean_name(league))
+    if rule:
+        return rule['category']
+    if v11_clean_name(league) == 'U21歐國外':
+        return "國際盃賽 (Cup)"
     if df_db is not None and not df_db.empty and league:
         rows = df_db[df_db['Tournament_Name'].astype(str) == str(league)]
         if not rows.empty:
@@ -7825,12 +7944,16 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams):
     cat = tipsme_pick_category(league, info['is_cup'], df_db)
     if cat in CATEGORY_OPTIONS:
         st.session_state['sel_cat'] = cat
+        st.session_state['_v1644_cat_marker'] = f'{st.session_state.get("editing_bet_id") or ""}|{v11_clean_name(league)}'
     # --- 3. 比賽日期 ---
-    # V16.1 (2026-11-18)：kickoff 年份 < 2000 (即 0001-01-01 — Tipsme API 對
-    # 無開賽時間的編碼) 一律當「缺失」處理，不寫入 date_input，沿用今天的
-    # 預設值；clv 批次另會在 FILL 後以賽程表開賽時間強制覆蓋 (見執行器)。
-    if info['kickoff'] is not None and info['kickoff'].year >= 2000:
-        st.session_state['match_date_input'] = info['kickoff'].date()
+    kickoff_date = info['kickoff'].date() if info['kickoff'] is not None and info['kickoff'].year >= 2000 else None
+    st.session_state['_v1644_form_scope'] = (*map(v11_clean_name, (league, info['home'], info['away'])),
+                                           kickoff_date.isoformat() if kickoff_date else '')
+    st.session_state['match_date_input'] = kickoff_date
+    # 每次成功讀到新比賽都先清除上一場的近況及排名，缺資料不可沿用。
+    for key in ('f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'h_rank', 'a_rank'):
+        st.session_state.pop(key, None)
+    st.session_state.pop('_v11_ls_marker', None)
     # --- 4. 主客隊 ---
     for side, sel_key, txt_key, name in (('h', 'sh', 'txt_h_team', info['home']), ('a', 'sa', 'txt_a_team', info['away'])):
         if name in opts_teams:
@@ -7842,24 +7965,20 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams):
     form_ok = False
     rank_source = {'h': None, 'a': None}
     h2h = tipsme_fetch_h2h(mid)
-    before = info['kickoff'].date() if info['kickoff'] is not None else None
+    before = kickoff_date
     ctx = {}
     if h2h:
-        hw, hd, hl, havail = tipsme_form_from_matches(h2h['home_matches'], before, 5)
-        aw, ad, al, aavail = tipsme_form_from_matches(h2h['away_matches'], before, 5)
-        if havail >= 5 and aavail >= 5:
-            st.session_state['f1'], st.session_state['f2'], st.session_state['f3'] = hw, hd, hl
-            st.session_state['f4'], st.session_state['f5'], st.session_state['f6'] = aw, ad, al
-            form_ok = True
-        else:
-            warnings.append(f"近況比賽數目不足 (主隊 {havail} 場 / 客隊 {aavail} 場)，近 5 場狀態請手動輸入。")
+        home_ok = _v1644_fill_form_keys(('f1', 'f2', 'f3'), h2h['home_matches'], before)
+        away_ok = _v1644_fill_form_keys(('f4', 'f5', 'f6'), h2h['away_matches'], before)
+        form_ok = home_ok and away_ok
+        if not form_ok:
+            warnings.append("有一隊或兩隊未有可核對的賽前近 5 場；缺資料的一方留空。")
         # 近 10 場彙總 + 逐場明細 (存入資料庫新欄位，供日後學習)
-        h10w, h10d, h10l, _ = tipsme_form_from_matches(h2h['home_matches'], before, 10)
-        a10w, a10d, a10l, _ = tipsme_form_from_matches(h2h['away_matches'], before, 10)
-        ctx['Home_Form10'] = f"{h10w}W{h10d}D{h10l}L"
-        ctx['Away_Form10'] = f"{a10w}W{a10d}D{a10l}L"
-        ctx['Home_Recent_Matches'] = json.dumps(tipsme_form_details(h2h['home_matches'], before, 10), ensure_ascii=False)
-        ctx['Away_Recent_Matches'] = json.dumps(tipsme_form_details(h2h['away_matches'], before, 10), ensure_ascii=False)
+        if before is not None:
+            for prefix, history in (('Home', h2h['home_matches']), ('Away', h2h['away_matches'])):
+                w, d, l, n = tipsme_form_from_matches(history, before, 10)
+                ctx[f'{prefix}_Form10'] = f"{w}W{d}D{l}L" if n else ''
+                ctx[f'{prefix}_Recent_Matches'] = json.dumps(tipsme_form_details(history, before, 10), ensure_ascii=False)
         ctx['H2H_Records'] = json.dumps(_tipsme_h2h_rows(h2h['h2h']), ensure_ascii=False)
         ctx['Home_League_Stats'] = json.dumps(_tipsme_league_stats_rows(h2h['home_league']), ensure_ascii=False)
         ctx['Away_League_Stats'] = json.dumps(_tipsme_league_stats_rows(h2h['away_league']), ensure_ascii=False)
@@ -8214,7 +8333,7 @@ def _v15_log(*args):
 def _v15_on(step):
     """此 rerun 是否應自動觸發某按鈕分支 (自動模式啟用且目前步驟吻合)"""
     a = st.session_state.get('v15_auto') or {}
-    return bool(a.get('active')) and a.get('step') == step
+    return bool(a.get('active')) and a.get('step') == step and _v10_settings_allow_automation()
 
 def _v15_mlabel(m):
     """V15.10：佇列項目的輪次標籤 — 輪次模式「第X輪」；賽果日期模式 (round=0) 顯示日期。"""
@@ -8556,12 +8675,27 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
         _v15_log(f"✅ 已填充 ({a['idx'] + 1}/{len(q)})：{_v15_mlabel(m)} {m['home']} vs {m['away']}")
         # V16.1：clv 批次強制以「賽程表開賽時間」填比賽日期 — Tipsme 比賽頁
         # API 的 fullMatchTimeUtc 可能回傳 0001-01-01 (空日期編碼) 或缺失，
-        # 賽程表 matchSchedules 的時間則永遠正確 (HKT)。杜絕 0001-01-01 注單。
-        if str(a.get('mode')) == 'clv' and m.get('match_time'):
-            try:
-                st.session_state['match_date_input'] = datetime.fromtimestamp(m['match_time'], HKT).date()
-            except Exception:
-                pass
+        # 當指向同一場時，使用賽程表 matchSchedules 的已知時間 (HKT)。
+        if _dt is not None and _dt != st.session_state.get('match_date_input'):
+            st.session_state['match_date_input'] = _dt
+            _form_scope = st.session_state.get('_v1644_form_scope')
+            if _form_scope:
+                st.session_state['_v1644_form_scope'] = (*_form_scope[:3], _dt.isoformat())
+            # 原開賽日不同或缺失，原近況截點不能沿用。
+            for _key in ('f1', 'f2', 'f3', 'f4', 'f5', 'f6'):
+                st.session_state[_key] = None
+            for _key in ('Home_Form10', 'Away_Form10', 'Home_Recent_Matches', 'Away_Recent_Matches',
+                         'H2H_Records', 'Home_League_Stats', 'Away_League_Stats'):
+                (st.session_state.get('tipsme_fill_data') or {}).get('ctx', {}).pop(_key, None)
+        if st.session_state.get('match_date_input') is None:
+            _v15_log(f"未能核對 {m['home']} vs {m['away']} 的比賽日期，已跳過，未寫入注單。", 'err')
+            a.setdefault('failed', []).append({'home': m['home'], 'away': m['away'],
+                                               'stage': '填充', 'msg': '缺少已核對的賽日'})
+            a['idx'] += 1
+            a['tries'] = 0
+            _v15_save_remote(a)
+            st.rerun()
+            return
         a['step'] = 'ANALYZE'
         a['tries'] = 0
         st.rerun()
@@ -11223,17 +11357,18 @@ def main():
                         default_cat_idx = CATEGORY_OPTIONS.index(last_cat)
             if not is_editing and tournament_name and v11_is_cup_like(tournament_name) and CATEGORY_OPTIONS[default_cat_idx].startswith('國內聯賽'):
                 default_cat_idx = 2 if v11_is_intl(tournament_name) else 3
-                    
-            tournament_category = col_c.selectbox("賽事分類 (Tournament Category)", CATEGORY_OPTIONS, index=default_cat_idx, key="sel_cat")
-
-            # 比賽日期輸入 (用於時間維度盈虧分組)
-            _default_md = st.session_state.get('edit_match_date', get_hkt_now().strftime('%Y-%m-%d')) if is_editing else get_hkt_now().strftime('%Y-%m-%d')
-            try:
-                _default_md_dt = datetime.strptime(_default_md, '%Y-%m-%d').date()
-            except:
-                _default_md_dt = get_hkt_now().date()
-            match_date_input = st.date_input("比賽日期 / 下注日期 (Match Date)", value=_default_md_dt, key="match_date_input")
-            match_date = match_date_input.strftime('%Y-%m-%d')
+            if not is_editing and tournament_name == 'U21歐國外':
+                default_cat_idx = CATEGORY_OPTIONS.index('國際盃賽 (Cup)')
+            _rule = _v1644_tournament_rule(tournament_name)
+            if _rule:
+                default_cat_idx = CATEGORY_OPTIONS.index(_rule['category'])
+                st.session_state['sel_cat'] = _rule['category']
+            _cat_marker = f'{st.session_state.editing_bet_id or ""}|{tournament_name}'
+            if st.session_state.get('_v1644_cat_marker') != _cat_marker and not _rule:
+                st.session_state['sel_cat'] = CATEGORY_OPTIONS[default_cat_idx]
+            st.session_state['_v1644_cat_marker'] = _cat_marker
+            tournament_category = col_c.selectbox("賽事分類 (Tournament Category)", CATEGORY_OPTIONS, index=default_cat_idx,
+                                                  key="sel_cat", disabled=bool(_rule))
 
             col_h, col_a = st.columns(2)
             default_h_team = st.session_state.get('edit_h_team', '') if is_editing else ''
@@ -11247,14 +11382,39 @@ def main():
             sel_away = col_a.selectbox("客隊名稱", opts_teams, index=default_a_idx, key="sa")
             away_team = col_a.text_input("輸入新客隊", value=default_a_team, key="txt_a_team") if sel_away == "➕ 新增手動輸入..." else sel_away
             away_team = v11_clean_name(away_team) or ''
+            _fixture = (tournament_name, home_team, away_team)
+            _prev_form = st.session_state.get('_v1644_form_scope')
+            if _prev_form and all(_prev_form[:3]) and _prev_form[:3] != _fixture and not is_editing:
+                st.session_state['match_date_input'] = None
+                for _key in ('tipsme_fill_data', 'tipsme_fill_mid', 'h_rank', 'a_rank'):
+                    st.session_state.pop(_key, None)
+
+            _default_md = st.session_state.get('edit_match_date') if is_editing else None
+            try:
+                _default_md_dt = datetime.strptime(_default_md, '%Y-%m-%d').date()
+            except (TypeError, ValueError):
+                _default_md_dt = None
+            match_date_input = st.date_input("比賽日期 (Match Date)", value=_default_md_dt,
+                                             min_value=datetime(2000, 1, 1).date(), max_value=datetime(2099, 12, 31).date(),
+                                             key="match_date_input")
+            match_date = match_date_input.isoformat() if match_date_input else ''
+            _form_scope = (*_fixture, match_date)
+            if _prev_form is not None and _prev_form != _form_scope and not is_editing:
+                for _key in ('f1', 'f2', 'f3', 'f4', 'f5', 'f6'):
+                    st.session_state.pop(_key, None)
+                if _prev_form[:3] == _fixture:
+                    for _key in ('Home_Form10', 'Away_Form10', 'Home_Recent_Matches', 'Away_Recent_Matches',
+                                 'H2H_Records', 'Home_League_Stats', 'Away_League_Stats'):
+                        (st.session_state.get('tipsme_fill_data') or {}).get('ctx', {}).pop(_key, None)
+            st.session_state['_v1644_form_scope'] = _form_scope
 
             # V11：按賽事自動填寫隊伍數目 (用家修改後會記住，下次自動沿用)
             _eid = str(st.session_state.editing_bet_id or '')
-            _ls_marker = f"{_eid}|{tournament_name}"
+            _ls_marker = f"{_eid}|{tournament_name}|{json.dumps(_rule, ensure_ascii=False, sort_keys=True)}"
             _prev_marker = st.session_state.get('_v11_ls_marker')
             _ls_src = st.session_state.get('_v11_ls_src', '')
             if _prev_marker != _ls_marker or 'league_size' not in st.session_state:
-                if is_editing and (_prev_marker is None or not str(_prev_marker).startswith(f"{_eid}|")):
+                if is_editing and not _rule and (_prev_marker is None or not str(_prev_marker).startswith(f"{_eid}|")):
                     # V16.3：注單隊伍數目空白 (無記錄) → 留空，不填假預設 20
                     _ls_edit = st.session_state.get('edit_league_size')
                     _ls_val = int(_ls_edit) if _ls_edit else None
@@ -11270,18 +11430,24 @@ def main():
                 st.session_state['v11_no_rank'] = bool(_nr)
                 st.session_state['_v11_ls_marker'] = _ls_marker
                 st.session_state['_v11_ls_src'] = _ls_src
-            no_rank = st.checkbox("此賽事沒有聯賽排名 (盃賽 / 洲際賽，例如亞冠二級、日本聯賽盃)", key="v11_no_rank",
-                                  help="勾選後系統把兩隊實力視為『未知』：不會用排名計算實力差及盤口冷熱，避免以預設排名 (例如 10 vs 10) 誤導模型。")
             c_ls, c_hr, c_ar = st.columns(3)
             # V16.3：無記錄時 value=None → 留空；讀取到數目才自動填寫
-            _ls_default = st.session_state.get('league_size')
             league_size = c_ls.number_input("聯賽隊伍數目 (自動填寫，可手動修改)", min_value=2, max_value=40,
-                                            value=_ls_default, key="league_size",
+                                            value=None, key="league_size",
                                             on_change=_v11_on_ls_change, args=(tournament_name,),
+                                            disabled=bool(_rule),
                                             help="系統會按賽事自動填寫 (例如英超 20、德甲 18)。手動修改後會記住，下次選擇同一賽事自動沿用。查無記錄時留空，並自動勾選「沒有聯賽排名」。")
+            if league_size is None:
+                st.session_state['v11_no_rank'] = True
+            no_rank = st.checkbox("此賽事沒有聯賽排名 (盃賽 / 洲際賽，例如亞冠二級、日本聯賽盃)", key="v11_no_rank",
+                                  disabled=league_size is None or bool(_rule and _rule['no_rank']),
+                                  help="缺隊伍數目或已指定無排名時，不用排名計算實力差。")
             c_ls.caption(f"來源：{_ls_src}")
             for _rk in ('h_rank', 'a_rank'):
-                if league_size and _rk in st.session_state and int(st.session_state[_rk]) > int(league_size):
+                _value = st.session_state.get(_rk)
+                if no_rank:
+                    st.session_state[_rk] = None
+                elif league_size and _value is not None and int(_value) > int(league_size):
                     st.session_state[_rk] = int(league_size)
 
             _mid_rank = max(1, int(league_size) // 2) if league_size else None
@@ -11293,8 +11459,8 @@ def main():
                 default_h_rank = _mid_rank
                 default_a_rank = _mid_rank
             # V16.3：無隊伍數目 → 排名留空 (value=None)；有隊數才夾在 1~隊數之間
-            _hr_val = max(1, min(int(default_h_rank), int(league_size))) if (default_h_rank is not None and league_size) else default_h_rank
-            _ar_val = max(1, min(int(default_a_rank), int(league_size))) if (default_a_rank is not None and league_size) else default_a_rank
+            _hr_val = max(1, min(int(default_h_rank), int(league_size))) if (not no_rank and default_h_rank is not None and league_size) else None
+            _ar_val = max(1, min(int(default_a_rank), int(league_size))) if (not no_rank and default_a_rank is not None and league_size) else None
             home_rank = c_hr.number_input("主隊聯賽排名 (1=最強)", min_value=1, max_value=int(league_size) if league_size else 40,
                                          value=_hr_val, key="h_rank", disabled=no_rank,
                                          help="排名1 = 聯賽第一名 (實力最高)；排名越大實力越弱。")
@@ -11339,27 +11505,14 @@ def main():
             # 數據時會寫入 widget keys；編輯注單時載入該注單數值；兩者皆無 → 留空，
             # 提交時 Home_Form / Away_Form 存空白，訓練端一律回退 0 分 (與訓練一致)。
             f1, f2, f3, f4, f5, f6 = st.columns(6)
-            hw_val = st.session_state.get('edit_hw') if is_editing else None
-            hd_val = st.session_state.get('edit_hd') if is_editing else None
-            hl_val = st.session_state.get('edit_hl') if is_editing else None
-            aw_val = st.session_state.get('edit_aw') if is_editing else None
-            ad_val = st.session_state.get('edit_ad') if is_editing else None
-            al_val = st.session_state.get('edit_al') if is_editing else None
-
-            def _v163_form(wv, dv, lv):
-                """任一項留空 → 近況整體留空 (無近5場記錄)；三項齊全才組 '3W1D1L'"""
-                if wv is None or dv is None or lv is None:
-                    return ''
-                return f"{wv}W{dv}D{lv}L"
-
-            _hw_n = f1.number_input('主勝', 0, 10, hw_val, key='f1')
-            _hd_n = f2.number_input('主和', 0, 10, hd_val, key='f2')
-            _hl_n = f3.number_input('主敗', 0, 10, hl_val, key='f3')
-            _aw_n = f4.number_input('客勝', 0, 10, aw_val, key='f4')
-            _ad_n = f5.number_input('客和', 0, 10, ad_val, key='f5')
-            _al_n = f6.number_input('客敗', 0, 10, al_val, key='f6')
-            home_form = _v163_form(_hw_n, _hd_n, _hl_n)
-            away_form = _v163_form(_aw_n, _ad_n, _al_n)
+            _hw_n = f1.number_input('主勝', 0, 10, None, key='f1')
+            _hd_n = f2.number_input('主和', 0, 10, None, key='f2')
+            _hl_n = f3.number_input('主敗', 0, 10, None, key='f3')
+            _aw_n = f4.number_input('客勝', 0, 10, None, key='f4')
+            _ad_n = f5.number_input('客和', 0, 10, None, key='f5')
+            _al_n = f6.number_input('客敗', 0, 10, None, key='f6')
+            home_form = _v1644_recent_form(_hw_n, _hd_n, _hl_n)
+            away_form = _v1644_recent_form(_aw_n, _ad_n, _al_n)
             if home_form and away_form:
                 for _lab, _fm in (('主隊', home_form), ('客隊', away_form)):
                     _w, _d, _l = parse_form_str(_fm)
@@ -11384,9 +11537,12 @@ def main():
                 st.warning("⚠ 以下賠率不合理 (正常抽水約 1.03~1.12，兩邊同一數值或 >15 多數是輸入錯誤)，系統分析時會忽略：" + "；".join(_bad_odds[:8]))
         
         st.markdown("---")
+        _analysis_scope = (_form_scope, tournament_category, league_size, no_rank,
+                           home_rank, away_rank, home_form, away_form)
         
         # V14.12：_v15_on('ANALYZE') 令自動模式走完全相同的手動分析路徑
-        if st.button("🚀 賽前數據分析執行", type="primary", use_container_width=True) or _v15_on('ANALYZE'):
+        if st.button("🚀 賽前數據分析執行", type="primary", use_container_width=True,
+                     disabled=not match_date) or (_v15_on('ANALYZE') and match_date):
             try:
                 st.session_state.show_analysis = True
                 v9_set = v9_get_settings()
@@ -11402,10 +11558,7 @@ def main():
                 _unk_now = bool(no_rank) or v11_is_intl(tournament_name, tournament_category)
                 hf_val = float(extract_form_points(home_form))
                 af_val = float(extract_form_points(away_form))
-                try:
-                    _md_ts = pd.Timestamp(match_date)
-                except Exception:
-                    _md_ts = pd.Timestamp(get_hkt_now().strftime('%Y-%m-%d'))
+                _md_ts = pd.Timestamp(match_date)
 
                 # 依時間排序每個盤口 (類型+盤口線) 的賠率序列：每個時間點只使用「截至該時間點」的賠率 (不用未來數據)
                 _mk_sorted = v9_group_markets(st.session_state.odds_history, _md_ts.to_pydatetime())
@@ -11549,7 +11702,7 @@ def main():
                             'h_gf': v9_ctx['hp']['gf'], 'h_ga': v9_ctx['hp']['ga'], 'a_gf': v9_ctx['ap']['gf'], 'a_ga': v9_ctx['ap']['ga'],
                             'h_cf': v9_ctx['hp']['cf'], 'a_cf': v9_ctx['ap']['cf']},
                     'lambdas': (_lh, _la, _lc, _lsrc),
-                    't_name': tournament_name, 't_cat': tournament_category
+                    't_name': tournament_name, 't_cat': tournament_category, 'input_scope': _analysis_scope
                 }
                 # V14.12：自動模式 — 分析完成，自動推進至「系統投注」步驟
                 if _v15_on('ANALYZE'):
@@ -11571,8 +11724,10 @@ def main():
                 if _v15_is_control_exc(_v15e) or not (st.session_state.get('v15_auto') or {}).get('active'):
                     raise
                 _v15_step_crash('ANALYZE', _v15e)
-        if st.session_state.get('show_analysis', False) and not st.session_state.get('analysis_result', {}).get('v9'):
-            st.session_state.show_analysis = False
+        if st.session_state.get('show_analysis', False):
+            _cached_analysis = st.session_state.get('analysis_result') or {}
+            if not _cached_analysis.get('v9') or _cached_analysis.get('input_scope') != _analysis_scope:
+                st.session_state.show_analysis = False
 
         if st.session_state.get('show_analysis', False):
             res = st.session_state.analysis_result
@@ -11811,7 +11966,8 @@ def main():
             
             # V14.12：_v15_on('BET') 令自動模式走完全相同的手動投注路徑
             # (用家投注為空 → 只寫入系統注項；過往賽事毋須人手下注)
-            if st.button(submit_btn_label, type="primary", use_container_width=True) or _v15_on('BET'):
+            if st.button(submit_btn_label, type="primary", use_container_width=True,
+                         disabled=not match_date) or (_v15_on('BET') and match_date):
                 try:
                     all_keys = set(sys_selected + usr_selected)
                     if not all_keys:
@@ -12194,9 +12350,22 @@ def main():
 
                 # --- 即場數據分析執行 ---
                 _ip_on = {'讓球': ip_hd_on, '入球大小': ip_ou_on, '角球大小': ip_cr_on}
+                _pre_rows = matching_bets[~matching_bets['Bet_Type'].astype(str).str.contains('即場', na=False)]
+                ip_last_row = _pre_rows.iloc[-1] if not _pre_rows.empty else matching_bets.iloc[-1]
+                ip_match_date = None
+                _raw_ip_date = ip_last_row.get('Match_Date')
+                if not is_missing_match_date(_raw_ip_date):
+                    try:
+                        ip_match_date = datetime.strptime(str(_raw_ip_date).strip()[:10], '%Y-%m-%d').date().isoformat()
+                    except (ValueError, TypeError):
+                        pass
                 if not any(_ip_on.values()):
                     st.warning("⚠ 已關閉全部即場盤口，請至少勾選一個有即場投注的盤口才可執行分析。")
-                if st.button("🚀 即場數據分析執行", type="primary", use_container_width=True, key="btn_inplay_analysis", disabled=not any(_ip_on.values())):
+                if not ip_match_date:
+                    st.warning("此場未有已核對的比賽日期；先補正原注單，然後重新分析。")
+                    st.session_state.show_inplay_analysis = False
+                if st.button("🚀 即場數據分析執行", type="primary", use_container_width=True, key="btn_inplay_analysis",
+                             disabled=not (any(_ip_on.values()) and ip_match_date)):
                     st.session_state.show_inplay_analysis = True
                     v9_set = v9_get_settings()
                     # 即場沒有歷史即場賠率可供驗證，因此提高 EV 門檻 2% 作安全邊際
@@ -12205,33 +12374,25 @@ def main():
                     engine, mt_hist, tl_hist = v9_get_engine(st.session_state.df_db)
 
                     # 取得比賽資料 (優先使用賽前注單作為賽前資料來源)
-                    _pre_rows = matching_bets[~matching_bets['Bet_Type'].astype(str).str.contains('即場', na=False)]
-                    ip_last_row = _pre_rows.iloc[-1] if not _pre_rows.empty else matching_bets.iloc[-1]
                     ip_t_name = str(ip_last_row.get('Tournament_Name', '')) if pd.notna(ip_last_row.get('Tournament_Name')) else ''
                     ip_t_cat = str(ip_last_row.get('Tournament_Category', CATEGORY_OPTIONS[0])) if pd.notna(ip_last_row.get('Tournament_Category')) else CATEGORY_OPTIONS[0]
                     ip_h_team = str(ip_last_row.get('Home_Team', '')) if pd.notna(ip_last_row.get('Home_Team')) else ''
                     ip_a_team = str(ip_last_row.get('Away_Team', '')) if pd.notna(ip_last_row.get('Away_Team')) else ''
-                    ip_h_rating = str(ip_last_row.get('Home_Rating', 'C')) if pd.notna(ip_last_row.get('Home_Rating')) else 'C'
-                    ip_a_rating = str(ip_last_row.get('Away_Rating', 'C')) if pd.notna(ip_last_row.get('Away_Rating')) else 'C'
+                    ip_h_rating = str(ip_last_row.get('Home_Rating')) if pd.notna(ip_last_row.get('Home_Rating')) else 'NA'
+                    ip_a_rating = str(ip_last_row.get('Away_Rating')) if pd.notna(ip_last_row.get('Away_Rating')) else 'NA'
                     # V16.3：無近況記錄 → 留空 (不寫假預設；extract_form_points('')=0 分)
-                    ip_h_form = str(ip_last_row.get('Home_Form', '')) if pd.notna(ip_last_row.get('Home_Form')) else ''
-                    ip_a_form = str(ip_last_row.get('Away_Form', '')) if pd.notna(ip_last_row.get('Away_Form')) else ''
+                    ip_h_form = _v1644_recent_form(*_v1644_form_parts(ip_last_row.get('Home_Form')))
+                    ip_a_form = _v1644_recent_form(*_v1644_form_parts(ip_last_row.get('Away_Form')))
 
                     # 聯賽排名 → 實力分 (新數據為數字排名，舊數據為字母自動換算)
                     # V16.3：原注單隊伍數目空白 → 沿用中性值 (rating_to_strength 內部
                     # 20 隊尺度)，但寫入新注單時留空，不複製假預設 20
-                    _ip_ls_raw = ip_last_row.get('League_Size')
-                    if _ip_ls_raw is None or (isinstance(_ip_ls_raw, float) and pd.isna(_ip_ls_raw)) or not str(_ip_ls_raw).strip():
-                        ip_league_size = None
-                    else:
-                        ip_league_size = get_league_size(ip_last_row)
+                    ip_league_size = _v1644_valid_team_count(ip_last_row.get('League_Size'))
+                    if ip_league_size is None:
+                        ip_h_rating = ip_a_rating = 'NA'
                     ip_hr_val = rating_to_strength(ip_h_rating, ip_league_size or 20)
                     ip_ar_val = rating_to_strength(ip_a_rating, ip_league_size or 20)
-                    ip_match_date = get_row_match_date(ip_last_row)
-                    try:
-                        _ip_md_ts = pd.Timestamp(ip_match_date)
-                    except Exception:
-                        _ip_md_ts = pd.Timestamp(get_hkt_now().strftime('%Y-%m-%d'))
+                    _ip_md_ts = pd.Timestamp(ip_match_date)
                     ip_ctx = v9_match_context(mt_hist, tl_hist, ip_h_team, ip_a_team, ip_t_name, _ip_md_ts, ip_hr_val, ip_ar_val,
                                               float(extract_form_points(ip_h_form)), float(extract_form_points(ip_a_form)))
 
@@ -12418,7 +12579,10 @@ def main():
                         for sel in ip_usr_selected:
                             ip_usr_stakes[sel] = st.number_input(f"用家自訂金額 ($): {sel}", min_value=0.0, step=10.0, value=100.0, key=f"ip_u_stk_{sel}")
                     st.write("")
-                    if st.button("✅ 確定即場投注並寫入雲端資料庫", type="primary", use_container_width=True, key="btn_submit_inplay"):
+                    if not ip_res.get('match_date'):
+                        st.warning("此場未有已核對的比賽日期；先補正原注單，然後重新分析。")
+                    if st.button("✅ 確定即場投注並寫入雲端資料庫", type="primary", use_container_width=True,
+                                 key="btn_submit_inplay", disabled=not ip_res.get('match_date')):
                         ip_all_keys = set(ip_sys_selected + ip_usr_selected)
                         if not ip_all_keys:
                             st.warning("⚠️ 請至少在系統或用家選擇一項即場投注！")
@@ -12433,7 +12597,7 @@ def main():
                                 new_record = {
                                     'ID': new_id, 'Date': get_hkt_now().strftime('%Y-%m-%d %H:%M'), 'Status': 'Open',
                                     'Tournament_Name': ip_res['t_name'], 'Tournament_Category': ip_res['t_cat'],
-                                    'Match': f"{ip_res['h_team']} vs {ip_res['a_team']}", 'Match_Date': ip_res.get('match_date', get_hkt_now().strftime('%Y-%m-%d')), 'Home_Team': ip_res['h_team'], 'Away_Team': ip_res['a_team'],
+                                    'Match': f"{ip_res['h_team']} vs {ip_res['a_team']}", 'Match_Date': ip_res['match_date'], 'Home_Team': ip_res['h_team'], 'Away_Team': ip_res['a_team'],
                                     'Home_Rating': ip_res['h_rating'], 'Away_Rating': ip_res['a_rating'], 'League_Size': int(ip_res['league_size']) if ip_res.get('league_size') else None, 'Home_Form': ip_res['h_form'], 'Away_Form': ip_res['a_form'],
                                     'Bet_Type': f"{cand['bet_type']} (即場)", 'Selection': cand['selection'], 'Initial_Line': cand['line'], 'Initial_Odds': cand['odds'],
                                     'System_Stake': s_stk, 'User_Stake': u_stk,
