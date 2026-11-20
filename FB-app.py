@@ -9,6 +9,7 @@ import requests
 import itertools
 from tempfile import NamedTemporaryFile
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 # ==============================================================================
 # V16.4.1 (2026-11-18)：主表增量寫入和墓碑/Undo 同一事務；只按明示 ID 刪除。
 # 保留差量備份，不再把「本次某些列成功」當作全份備份可清空的證據。
@@ -20,7 +21,9 @@ from datetime import datetime, timedelta, timezone
 # V16.4.6：BET 允許隊數留空；不嘗試把空白隊數記成賽事設定。
 # V16.4.7：單場填充核對賽日；日期空白時提示，僅對同一場提供恢復已讀日期。
 # V16.4.8：分離主分頁身分與心跳；活動分頁的心跳不再依賴整頁重新執行。
-FB_APP_RELEASE = 'V16.4.8'
+# V16.4.9：加上獨立、唯讀的時序參數擂台和凍結影子分析；不改自動 BET。
+# V16.4.10：分開顯示主分頁與批次狀態；核對賽日前才分析／提交，保留逐步進度。
+FB_APP_RELEASE = 'V16.4.10'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -1399,6 +1402,9 @@ def load_db(filename, columns, table_name, force_cloud=False):
 
 def save_db(df, filename, table_name, *, delete_ids=(), restore_ids=()):
     main_db = _v1512_is_main_db(filename)
+    if main_db and st.session_state.get('_v16410_bet_unconfirmed'):
+        st.warning("本分頁有未獲確認的 BET；已暫停寫入注單。請匯出報表並核對正式庫，勿重送。")
+        return False
     explicit_change = bool(delete_ids or restore_ids)
     _sql_ok1513 = False
     sql_configured = bool(_has_secret("DB_URL") and st.secrets["DB_URL"])
@@ -7494,6 +7500,30 @@ def _tipsme_livescore_from_page(match_id, timeout=25):
     except Exception:
         return None
 
+def _tipsme_hkt_kickoff(data):
+    """UTC 欄優先；缺失時接受明細的完整香港日期與時間，不接受只有日期或哨兵。"""
+    for key, source_tz in (('fullMatchTimeUtc', timezone.utc), ('fullMatchTime', HKT)):
+        value = str(data.get(key) or '').strip()
+        try:
+            if re.match(r'^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}', value):
+                actual = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            elif key == 'fullMatchTime' and re.fullmatch(r'\d{1,2}/\d{1,2}/\d{4} \d{1,2}:\d{2}:\d{2}', value):
+                # Tipsme liveScore 的香港時間欄採美式月／日／年。
+                actual = datetime.strptime(value, '%m/%d/%Y %H:%M:%S')
+            else:
+                continue
+            if not 2000 <= actual.year <= 2099:
+                continue
+            if actual.tzinfo is None:
+                actual = actual.replace(tzinfo=source_tz)
+            local = actual.astimezone(HKT).replace(tzinfo=None)
+            if 2000 <= local.year <= 2099:
+                return local
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return None
+
+
 def tipsme_fetch_match_info(match_id):
     """讀取比賽基本資料與賽果。優先 azure Score/match API；V15.4 起 API 失敗時
     自動改用比賽頁內嵌 liveScore (後備數據源)，令 azure API 故障期間填充及
@@ -7505,25 +7535,19 @@ def tipsme_fetch_match_info(match_id):
             d = json.loads(txt)
         except Exception:
             d = None
-    if not d or not d.get('home') or not d.get('away'):
+    if not d or not d.get('home') or not d.get('away') or str(d.get('matchId') or match_id) != str(match_id):
         # V15.4：azure API 失敗 → 比賽頁後備
         d = _tipsme_livescore_from_page(match_id)
     if not d:
         return None
-    if not d.get('home') or not d.get('away'):
+    if not d.get('home') or not d.get('away') or str(d.get('matchId') or match_id) != str(match_id):
         return None
-    ko = _tipsme_iso_time(d.get('fullMatchTimeUtc'))
-    if ko is None or ko.year < 2000:
+    ko = _tipsme_hkt_kickoff(d)
+    if ko is None:
         page = _tipsme_livescore_from_page(match_id) or {}
         if (str(page.get('matchId')) == str(match_id) and page.get('home') == d.get('home')
                 and page.get('away') == d.get('away')):
-            alternate = _tipsme_iso_time(page.get('fullMatchTimeUtc'))
-            if alternate is not None and alternate.year >= 2000:
-                ko = alternate
-    if ko is not None and ko.year >= 2000:
-        ko = ko + timedelta(hours=8)  # UTC → 香港時間
-    else:
-        ko = None
+            ko = _tipsme_hkt_kickoff(page)
     return {
         'match_id': str(match_id),
         'home': str(d.get('home')),
@@ -7983,6 +8007,18 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams, *, schedule_matc
     kickoff = info.get('kickoff')
     if kickoff is not None and not 2000 <= kickoff.year <= 2099:
         kickoff = None
+    if kickoff is None and schedule_match is None:
+        # 貼單場鏈結時，也可先查已載入賽程，再查今日賽程；只取同 ID 的有效時間。
+        for source in (lambda: st.session_state.get('tipsme_schedule') or [], _v16_today_cache):
+            matching = [r for r in source() if str(r.get('hkjc_match_id') or '') == mid]
+            dated = [(r, _v15_sched_date(r)) for r in matching]
+            dated = [(r, d) for r, d in dated if d is not None and 2000 <= d.year <= 2099]
+            if len({d for _, d in dated}) > 1:
+                warnings.append("同一比賽 ID 的賽程有多個香港賽日；請手動核對。")
+                break
+            if dated:
+                schedule_match = dated[0][0]
+                break
     # 賽程「填充此場」有同一比賽 ID 的香港開賽時間，可在明細缺日期時使用。
     # 如兩處日期互相矛盾，讓用家核對；不猜日期，也不按錯誤日期截斷近況。
     if schedule_match and str(schedule_match.get('hkjc_match_id') or '') == mid:
@@ -7993,6 +8029,8 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams, *, schedule_matc
             elif kickoff.date() != sched_date:
                 warnings.append(f"賽程日期 {sched_date} 與比賽頁日期 {kickoff.date()} 不一致；請核對同一場的香港賽日後手動選擇。")
                 kickoff = None
+    if kickoff is None:
+        warnings.append("未能從同一場比賽核對香港賽日；預覽仍可查看，未選日期不能分析或寫入注單。")
     info = {**info, 'kickoff': kickoff}
     kickoff_date = kickoff.date() if kickoff is not None else None
     st.session_state['_v1644_form_scope'] = (*map(v11_clean_name, (league, info['home'], info['away'])),
@@ -8483,9 +8521,10 @@ def _v15_finish_summary(a):
     if _failed:
         _v15_log(f"📋 共 {len(_failed)} 場需手動處理 (填充或結算失敗，未寫入任何錯誤數據；注單保持 Open)：")
         for _f in _failed[:60]:
-            _v15_log(f"    {_v15_mlabel(_f)} {_f.get('home')} vs {_f.get('away')} ({_f.get('stage')}失敗) — "
-                     f"請在賽程列表按「填充此場」手動補入後結算")
+            _v15_log(f"    {_v15_mlabel(_f)} {_f.get('home')} vs {_f.get('away')} ({_f.get('stage')}) — "
+                     f"{_f.get('msg') or '請核對批次及注單狀態'}")
     a['active'] = False
+    a['finished'] = True
     _v15_save_remote(a)
     # V15.11：排程啟動的批次完成 → 在雲端標記 last_run，其他裝置不會重複啟動
     if a.get('sched') and a.get('rdate'):
@@ -8494,8 +8533,14 @@ def _v15_finish_summary(a):
 # --- V15.7 自動輸入可靠性：例外續傳 + 跨裝置接手 (純錯誤處理層，不改任何計算) ---
 
 def _v15_new_sid():
-    """V15.7：產生 session 標記 (sid)，寫入狀態檔用於跨裝置接手互斥。"""
-    return f"S{get_hkt_now().strftime('%Y%m%d%H%M%S')}-{id(st.session_state):x}"
+    """每批唯一；不可用同一個 Streamlit session_state 代理物件的 id 辨認分頁。"""
+    return f"S{get_hkt_now().strftime('%Y%m%d%H%M%S')}-{uuid4().hex}"
+
+
+def _v15_session_owner():
+    if not st.session_state.get('_v16410_status_owner'):
+        st.session_state['_v16410_status_owner'] = uuid4().hex
+    return st.session_state['_v16410_status_owner']
 
 def _v15_is_control_exc(exc):
     """V15.7：是否為 Streamlit 內部控制流例外 (st.rerun / st.stop) — 必須原樣放行。"""
@@ -8526,7 +8571,7 @@ def _v15_step_crash(step, exc):
     st.rerun()
 
 def _v15_taken_over(a):
-    """V15.7：狀態檔是否已被另一 session 接手 (sid 不同且對方仍在進行中)。"""
+    """比本批次啟動較早的記錄不是接手；較新的不同批次即使已完成亦不能覆寫。"""
     try:
         _ms = str(a.get('sid') or '')
         if not _ms:
@@ -8534,10 +8579,9 @@ def _v15_taken_over(a):
         _s = _v15_load_remote()
         if not _s:
             return False
-        if str(_s.get('active')) != '1':
-            return False
         _rs = str(_s.get('sid') or '')
-        return bool(_rs) and _rs != _ms
+        # 即使後來的批次已完成，舊批次也不可在復線時重新寫入。
+        return bool(_rs) and _rs != _ms and float(_s.get('updated_ts') or 0) >= a.get('_started_ts', 0)
     except Exception:
         return False
 
@@ -8547,6 +8591,20 @@ def _v15_takeover(_s):
     重複檢查邏輯，已記錄/已結算的比賽自動略過)；接手後原裝置會因狀態檔 sid 不符
     自動停止，兩邊不會同時寫入。需先在本裝置貼上同一聯賽的賽程連結。
     V15.10：日期模式 (mode=date) 接手時自動重新讀取當日賽果重建佇列，毋須貼連結。"""
+    # 以點擊當刻的狀態重查，避免舊頁按鈕覆蓋更新了的批次。
+    current = _v15_load_remote()
+    if (not _v162_can_automate() or _v15_status_phase(current) != 'stale'
+            or str(current.get('sid')) != str(_s.get('sid'))
+            or (st.session_state.get('v15_auto') or {}).get('active')):
+        st.info("批次狀態或執行權已變更，沒有啟動新批次。")
+        return
+    _s = current
+    if str(_s.get('mode') or '') == 'clv':
+        # CLV 沒有歷史輪次；只按當前規則重新選未開賽賽事，不補下注。
+        if v16_try_start_auto_bet(st.session_state.get('df_db'), _v16_clv_load()):
+            st.rerun()
+        st.info("未啟動開賽前批次：請核對 CLV／風控設定、資料庫狀態，以及有否合資格的未開賽賽事。已開賽不會補注。")
+        return
     # --- V15.10：賽果日期模式接手 ---
     if str(_s.get('mode') or '') == 'date':
         _rdate = str(_s.get('rdate') or '')
@@ -8631,19 +8689,66 @@ def _v15_takeover(_s):
     _v15_save_remote(st.session_state['v15_auto'])
     st.rerun()
 
+
+def _v15_skip_match(a, m, stage, reason):
+    _v15_log(a, f"{_v15_mlabel(m)} {m.get('home')} vs {m.get('away')}：{stage} — {reason}", 'err')
+    a.setdefault('failed', []).append({
+        'round': m.get('round'), 'home': m.get('home'), 'away': m.get('away'),
+        'date': str(_v15_sched_date(m) or ''), 'stage': stage, 'msg': reason,
+    })
+    a.update(idx=a.get('idx', 0) + 1, step='FILL', tries=0)
+    _v15_save_remote(a)
+    st.rerun()
+
+
+def _v15_validate_form(stage, fixture, match_date, *, input_scope=None):
+    """在實際 widget 渲染後才核對，以免日期空白／表單改場而卡住或混場。"""
+    if not _v15_on(stage):
+        return
+    a = st.session_state['v15_auto']
+    m = a['queue'][a['idx']]
+    fd = (st.session_state.get('tipsme_fill_data') or {}).get('info') or {}
+    mid = str(m.get('hkjc_match_id') or '')
+    dt = _v15_sched_date(m)
+    kickoff = fd.get('kickoff')
+    if (not mid or str(st.session_state.get('tipsme_fill_mid') or '') != mid
+            or str(fd.get('match_id') or '') != mid
+            or not all(fixture)
+            or tuple(v11_clean_name(fd.get(k)) for k in ('league', 'home', 'away')) != fixture
+            or not match_date or kickoff is None or kickoff.date().isoformat() != match_date
+            or (dt is not None and dt.isoformat() != match_date)):
+        _v15_skip_match(a, m, stage, '表單的比賽 ID／主客隊／香港賽日未能與當前賽事核對；未寫入注單。')
+        return
+    if stage == 'BET' and (st.session_state.get('analysis_result') or {}).get('input_scope') != input_scope:
+        _v15_skip_match(a, m, stage, '表單自分析後已改動；未寫入注單。')
+        return
+    if a.get('mode') == 'clv':
+        remaining = float(m.get('match_time') or 0) - get_hkt_now().timestamp()
+        if remaining < 60 or (kickoff.replace(tzinfo=HKT).timestamp() - get_hkt_now().timestamp()) < 60:
+            _v15_skip_match(a, m, stage, '已開賽或距開賽不足 1 分鐘；不補注。')
+
+
 def v15_auto_executor(df_db, opts_tournaments, opts_teams):
     """V14.12 自動導入執行器：每個 rerun 執行一步。
     FILL 步驟會實際呼叫 tipsme_auto_fill 並 rerun；ANALYZE / BET / SETTLE_* 步驟
     只設定 widget 狀態然後「放行」，讓同一 rerun 內稍後渲染的按鈕分支自動執行
     (與手動點擊同一程式碼路徑)。"""
     a = st.session_state.get('v15_auto')
-    if not a or not a.get('active') or not _v10_settings_allow_automation():
+    if not a or not a.get('active'):
         return
     # V15.7：跨裝置互斥 — 狀態檔已被另一 session 接手 (sid 不符) 時自動停止本裝置，
     # 避免兩邊同時寫入 (不寫回狀態檔，以免覆蓋接手裝置的進度)
     if _v15_taken_over(a):
         _v15_log(a, "🤝 偵測到另一裝置已接手自動輸入，本裝置自動停止 (避免重複寫入)。")
         a['active'] = False
+        st.rerun()
+        return
+    if st.session_state.get('_v16410_bet_unconfirmed') or not _v10_settings_allow_automation():
+        a['active'] = False
+        reason = ("本分頁有未獲確認的 BET，已停止自動批次。" if st.session_state.get('_v16410_bet_unconfirmed')
+                  else "未能核對 V10 設定，已停止自動批次；本次未繼續寫入。")
+        _v15_log(a, reason, 'err')
+        _v15_save_remote(a)
         st.rerun()
         return
     q = a.get('queue') or []
@@ -8663,6 +8768,10 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
         return
 
     if step == 'FILL':
+        if a.get('mode') == 'clv' and float(m.get('match_time') or 0) - get_hkt_now().timestamp() < 60:
+            _v15_skip_match(a, m, '填充', '已開賽或距開賽不足 1 分鐘；不補注。')
+            return
+        _v15_save_remote(a, publish=False)
         if st.session_state.get('editing_bet_id'):
             clear_edit_mode()
         # 清除上一場殘留的投注選單狀態，令本場使用系統自動預選
@@ -8675,11 +8784,13 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
         # 裝置剛寫入的注單，令「已記錄跳過」失效。刷新後此檢查用 SQL 即時
         # 數據。非 clv 模式 (每日結算/輪次) 零改動。
         if str(a.get('mode')) == 'clv':
-            try:
-                if _v161_refresh_db_from_sql():
-                    df_db = st.session_state.get('df_db') or df_db
-            except Exception:
-                pass
+            if _v161_refresh_db_from_sql():
+                refreshed = st.session_state.get('df_db')
+                if refreshed is not None:
+                    df_db = refreshed
+            elif _has_secret('DB_URL'):
+                _v15_skip_match(a, m, '填充', '未能刷新正式注單做防重核對；未寫入注單。')
+                return
         _dt = _v15_sched_date(m)
         _dup = v14_find_duplicate_match(df_db, m['home'], m['away'], _dt, tipsme_id=m.get('hkjc_match_id'))
         if _dup is not None and not _dup.empty:
@@ -8700,7 +8811,7 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
             return
         _murl = f"https://tipsme.hk/zh-HK/match/{m['hkjc_match_id']}/chat"
         with st.spinner(f"🤖 自動填充 ({a['idx'] + 1}/{len(q)})：{_v15_mlabel(m)} {m['home']} vs {m['away']} ..."):
-            ok, msg, _ = tipsme_auto_fill(_murl, df_db, opts_tournaments, opts_teams)
+            ok, msg, fd = tipsme_auto_fill(_murl, df_db, opts_tournaments, opts_teams, schedule_match=m)
         if not ok:
             # V15.3 失敗續傳：填充失敗不再整體停止 — 該場列入待手動處理清單，
             # 繼續下一場直到所選輪次掃完。填充失敗發生在任何寫入之前，不會污染數據。
@@ -8719,31 +8830,17 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
             return
         a['err'] = 0
         _v15_log(f"✅ 已填充 ({a['idx'] + 1}/{len(q)})：{_v15_mlabel(m)} {m['home']} vs {m['away']}")
-        # V16.1：clv 批次強制以「賽程表開賽時間」填比賽日期 — Tipsme 比賽頁
-        # API 的 fullMatchTimeUtc 可能回傳 0001-01-01 (空日期編碼) 或缺失，
-        # 當指向同一場時，使用賽程表 matchSchedules 的已知時間 (HKT)。
-        if _dt is not None and _dt != st.session_state.get('match_date_input'):
-            st.session_state['match_date_input'] = _dt
-            _form_scope = st.session_state.get('_v1644_form_scope')
-            if _form_scope:
-                st.session_state['_v1644_form_scope'] = (*_form_scope[:3], _dt.isoformat())
-            # 原開賽日不同或缺失，原近況截點不能沿用。
-            for _key in ('f1', 'f2', 'f3', 'f4', 'f5', 'f6'):
-                st.session_state[_key] = None
-            for _key in ('Home_Form10', 'Away_Form10', 'Home_Recent_Matches', 'Away_Recent_Matches',
-                         'H2H_Records', 'Home_League_Stats', 'Away_League_Stats'):
-                (st.session_state.get('tipsme_fill_data') or {}).get('ctx', {}).pop(_key, None)
         if st.session_state.get('match_date_input') is None:
-            _v15_log(f"未能核對 {m['home']} vs {m['away']} 的比賽日期，已跳過，未寫入注單。", 'err')
-            a.setdefault('failed', []).append({'home': m['home'], 'away': m['away'],
-                                               'stage': '填充', 'msg': '缺少已核對的賽日'})
-            a['idx'] += 1
-            a['tries'] = 0
-            _v15_save_remote(a)
-            st.rerun()
+            date_reason = next((w for w in (fd or {}).get('warnings', []) if '日期' in w and '不一致' in w),
+                               '缺少已核對的香港賽日')
+            _v15_skip_match(a, m, '填充', f'{date_reason}；未寫入注單。')
+            return
+        if a.get('mode') == 'clv' and (not (fd or {}).get('odds_ok') or ((fd or {}).get('info') or {}).get('finished')):
+            _v15_skip_match(a, m, '填充', '沒有可用的本場核心盤口，或明細已完場；未寫入注單。')
             return
         a['step'] = 'ANALYZE'
         a['tries'] = 0
+        _v15_save_remote(a, publish=False)
         st.rerun()
         return
 
@@ -8788,9 +8885,12 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
 # ==========================================================
 AUTO_STATUS_FILE = 'auto_status.csv'
 
-def _v15_save_remote(a):
+def _v15_save_remote(a, *, publish=True):
     """V15.3：把自動輸入進度寫入共用狀態檔。失敗不影響自動輸入本身 (best-effort)。"""
+    tmp = None
     try:
+        now = get_hkt_now()
+        a.setdefault('_started_ts', int(now.timestamp()))
         _row = {
             'active': '1' if a.get('active') else '0',
             'rounds': ','.join(str(r) for r in (a.get('rounds') or [])),
@@ -8804,19 +8904,33 @@ def _v15_save_remote(a):
             'bets': a.get('bets', 0),
             'failed': len(a.get('failed') or []),
             'sid': str(a.get('sid') or ''),
-            'updated': get_hkt_now().strftime('%Y-%m-%d %H:%M:%S'),
-            'updated_ts': int(get_hkt_now().timestamp()),
+            'owner': _v15_session_owner(),
+            'step': str(a.get('step') or ''),
+            'finished': '1' if a.get('finished') else '0',
+            'updated': now.strftime('%Y-%m-%d %H:%M:%S'),
+            'updated_ts': int(now.timestamp()),
             'log': json.dumps((a.get('log') or [])[-15:], ensure_ascii=False),
         }
-        pd.DataFrame([_row]).to_csv(AUTO_STATUS_FILE, index=False)
-        if _has_secret('GITHUB_TOKEN') and _has_secret('GITHUB_REPO'):
+        frame = pd.DataFrame([_row])
+        with NamedTemporaryFile(mode='w', encoding='utf-8', newline='', delete=False,
+                                dir=os.path.dirname(os.path.abspath(AUTO_STATUS_FILE)), prefix='.auto-status-') as f:
+            tmp = f.name
+            frame.to_csv(f, index=False)
+        os.replace(tmp, AUTO_STATUS_FILE)
+        if publish and _has_secret('GITHUB_TOKEN') and _has_secret('GITHUB_REPO'):
             try:
-                save_db_github(pd.DataFrame([_row]), st.secrets['GITHUB_REPO'],
+                save_db_github(frame, st.secrets['GITHUB_REPO'],
                                AUTO_STATUS_FILE, st.secrets['GITHUB_TOKEN'])
             except Exception:
                 pass
     except Exception:
         pass
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 def _v15_load_remote():
     """讀取共用狀態檔 (本地優先，GitHub 後備)；無檔案回 None。"""
@@ -8833,8 +8947,29 @@ def _v15_load_remote():
         pass
     return None
 
+
+def _v15_status_phase(record):
+    """共享批次紀錄的時間不是主裝置心跳；未知時間不可宣稱正在執行或可接手。"""
+    if not record:
+        return 'missing'
+    if str(record.get('active')) != '1':
+        return 'closed'
+    try:
+        age = get_hkt_now().timestamp() - float(record.get('updated_ts'))
+    except (TypeError, ValueError):
+        return 'unknown'
+    if 0 <= age < 300:
+        return 'running'
+    if 300 <= age < float('inf'):
+        return 'stale'
+    return 'unknown'
+
+
 def _v15_render_remote_body():
     """V15.3：其他裝置的即時進度橫幅 (唯讀；本 session 正在跑時不顯示，避免重複)。"""
+    # 已排程的 fragment 可能在新批次開始後才重跑，不能只在外層首次渲染時檢查。
+    if (st.session_state.get('v15_auto') or {}).get('active'):
+        return
     try:
         _s = _v15_load_remote()
     except Exception:
@@ -8842,44 +8977,51 @@ def _v15_render_remote_body():
     if not _s:
         return
     try:
-        _act = str(_s.get('active')) == '1'
         _log = json.loads(str(_s.get('log') or '[]'))
     except Exception:
-        _act, _log = False, []
+        _log = []
     _upd = str(_s.get('updated') or '')
     _age = None
     try:
-        _age = datetime.now().timestamp() - float(_s.get('updated_ts'))
+        _age = get_hkt_now().timestamp() - float(_s.get('updated_ts'))
     except Exception:
         pass
-    _stale = (_age is not None and _age > 300)
+    _phase = _v15_status_phase(_s)
+    _own = str(_s.get('owner') or '') == _v15_session_owner()
     def _n(v):
         try:
             return int(float(v or 0))
         except Exception:
             return 0
-    if not _act:
+    if _phase == 'closed':
         # 已完結：只在最近 60 分鐘內完結時顯示結果摘要，避免永久殘留
-        _recent = (_age is not None and _age < 3600)
+        _recent = (_age is not None and 0 <= _age < 3600)
         if not _recent or not _log:
             return
-        st.info(f"🏁 另一裝置的自動輸入已於 {_upd} 完成：結算 {_n(_s.get('done'))} 場、"
+        _result = "已完成" if str(_s.get('finished')) == '1' else "已停止或結束"
+        st.info(f"最近批次{_result}（{_upd} 香港）：結算 {_n(_s.get('done'))} 場、"
                 f"寫入 {_n(_s.get('bets'))} 注、待手動 {_n(_s.get('failed'))} 場。")
-        return
-    st.info(f"📡 另一裝置正在自動輸入：第 {_n(_s.get('idx'))}/{_n(_s.get('total'))} 場 "
-            f"(已結算 {_n(_s.get('done'))}、寫入 {_n(_s.get('bets'))} 注、待手動 {_n(_s.get('failed'))} 場)，"
-            f"更新於 {_upd}。本裝置請只觀看進度，暫勿投注/結算/修改，以免覆蓋對方寫入。")
-    if _stale:
-        st.warning("⚠️ 逾 5 分鐘無更新 — 啟動裝置的分頁可能已關閉或網站故障，進度可能已中斷。")
+    _step = {'FILL': '待填充／填充中', 'ANALYZE': '待分析／分析中', 'BET': '待提交',
+             'SETTLE_READ': '讀取賽果', 'SETTLE_CONFIRM': '結算'}.get(str(_s.get('step')), '未記錄')
+    _detail = (f"已掃描 {_n(_s.get('idx'))}/{_n(_s.get('total'))} 場，已寫入 {_n(_s.get('bets'))} 注，"
+               f"階段：{_step}，最後進度：{_upd}（香港）。")
+    if _phase == 'running':
+        _where = "本分頁曾啟動批次，但目前未持有執行佇列" if _own else "共享批次有近期進度"
+        st.info(f"{_where}：{_detail} 暫勿重複提交同一場。")
+    elif _phase == 'stale':
+        st.warning(f"上一批次已至少 5 分鐘無進度：{_detail} 此紀錄不能判定分頁已關閉、網絡有故障或主裝置身分失效。")
         # V15.7：一鍵接手 — 在本裝置重建佇列續傳 (已記錄/已結算的比賽自動略過)；
         # 接手後原裝置偵測到狀態檔 sid 不符會自動停止，兩邊不會同時寫入
         # V16.2：主裝置模式下唯讀分頁不提供接手 (主分頁在線時)；主分頁離線逾 12 分鐘
         # 例外開放 (唯讀裝置補位，維持 09:30 結算與 T-n 下注不會靜默停擺)
         if _v162_can_automate():
-            if st.button("▶️ 本裝置接手續傳 (從中斷處繼續)", key="v15_takeover_btn"):
+            _label = "重新檢查未開賽賽事（不補注）" if _s.get('mode') == 'clv' else "本分頁接手續傳"
+            if st.button(_label, key="v15_takeover_btn"):
                 _v15_takeover(_s)
         else:
             st.caption("🔒 主裝置模式開啟中且主分頁在線 — 本裝置唯讀查看，不會啟動或接手批次。")
+    elif _phase == 'unknown':
+        st.warning("共享批次的更新時間無法核對。請先在主分頁核對進度，勿重複提交。")
     if _log:
         with st.container(height=150):
             for _ts, _lvl, _msg in (_log or [])[-8:]:
@@ -8981,9 +9123,8 @@ def _v1511_sched_try_start(df_db):
     # 其他裝置正在跑 (5 分鐘內有更新) → 不搶；逾 5 分鐘無更新 → 可接手
     try:
         _s = _v15_load_remote()
-        if _s and str(_s.get('active')) == '1':
-            if (now.timestamp() - float(_s.get('updated_ts') or 0)) < 300:
-                return False
+        if _v15_status_phase(_s) in ('running', 'unknown'):
+            return False
     except Exception:
         pass
     if df_db is None:
@@ -9097,22 +9238,10 @@ def tipsme_fetch_today_schedule():
                 mid = int(x.get('matchId') or 0)
                 if not mid:
                     continue
-                ko = None
-                for k in ('fullMatchTimeUtc', 'fullMatchTime'):
-                    s = str(x.get(k) or '')
-                    if not s:
-                        continue
-                    try:
-                        if k == 'fullMatchTimeUtc':
-                            # 明確標記為 UTC 再轉香港 — 避免 astimezone 以伺服器本地時區解讀 naive datetime
-                            ko = datetime.fromisoformat(s).replace(tzinfo=timezone.utc).astimezone(HKT)
-                        else:
-                            ko = datetime.strptime(s, '%Y-%m-%d %H:%M:%S').replace(tzinfo=HKT)
-                        break
-                    except Exception:
-                        ko = None
+                ko = _tipsme_hkt_kickoff(x)
                 if ko is None:
                     continue
+                ko = ko.replace(tzinfo=HKT)
                 out.append({'round': 0, 'day': ko.strftime('%Y-%m-%d'),
                             'hkjc_match_id': mid,
                             'home': str(x.get('home') or ''), 'away': str(x.get('away') or ''),
@@ -9230,22 +9359,18 @@ def v16_try_start_auto_bet(df_db, cfg):
     if not matches:
         return False
     # 其他裝置正在跑 (5 分鐘內有更新) → 不搶；逾 5 分鐘無更新 → 可接手
-    try:
-        _s = _v15_load_remote()
-        if _s and str(_s.get('active')) == '1':
-            if (now.timestamp() - float(_s.get('updated_ts') or 0)) < 300:
-                return False
-            # V16.1：狀態檔逾 5 分鐘無更新 → 本裝置即將接手。接手前先從 SQL
-            # 強制刷新 session 快照，確保「已記錄跳過」看得到原裝置剛寫入的
-            # 注單 (2026-11-17 首晚 7 對重複下注的根因修復；FILL 步驟另有
-            # 每場刷新作第二重保險)。
-            try:
-                if _v161_refresh_db_from_sql():
-                    df_db = st.session_state.get('df_db') or df_db
-            except Exception:
-                pass
-    except Exception:
-        pass
+    phase = _v15_status_phase(_v15_load_remote())
+    if phase in ('running', 'unknown'):
+        return False
+    if phase == 'stale':
+        # 接手前保留正式庫防重；不能核對時不接手。FILL 仍有獨立刷新。
+        if _v161_refresh_db_from_sql():
+            refreshed = st.session_state.get('df_db')
+            if refreshed is not None:
+                df_db = refreshed
+        elif _has_secret('DB_URL'):
+            return False
+    now = get_hkt_now()   # 賽程及防重刷新可能需時，按當前時間選未開賽場次
     tried = st.session_state.get('_v16_bet_tried') or {}
     q = []
     for m in matches:
@@ -9273,7 +9398,7 @@ def v16_try_start_auto_bet(df_db, cfg):
         if _dup is not None and not _dup.empty:
             continue                 # 已記錄 (手動或早前已下注) → 跳過
         q.append(dict(m))
-    if not q:
+    if not q or _v15_status_phase(_v15_load_remote()) in ('running', 'unknown'):
         return False
     for m in q:
         tried[m['hkjc_match_id']] = int(tried.get(m['hkjc_match_id'], 0)) + 1
@@ -9299,19 +9424,21 @@ def _v16_clv_body():
     V16.2：主裝置模式下，主分頁心跳新鮮時，其他分頁略過 (a) 快照，
     (b) 已在 v16_try_start_auto_bet 內閘門；唯讀分頁只顯示狀態。"""
     cfg = _v16_clv_load()
-    if str(cfg.get('enabled')) != '1':
+    if str(cfg.get('enabled')) != '1' or st.session_state.get('_v16410_bet_unconfirmed'):
         return
     df_db = st.session_state.get('df_db')
-    if df_db is None or df_db.empty:
+    if df_db is None:
         return
     _v162_viewer_view = _v162_runner_mode_on() and not _v162_is_runner() and _v162_hb_fresh()
     # (a) 開賽前賠率快照 — 例外不外洩 (背景檢查絕不令程式崩潰)
-    if not _v162_viewer_view:
+    if not _v162_viewer_view and not (st.session_state.get('v15_auto') or {}).get('active'):
         try:
             added, updated_matches = v16_snapshot_open_bets(df_db, cfg)
             if added > 0:
-                save_db(df_db, 'football_betting_db.csv', 'football_bets')
-                st.toast(f"📸 V16 CLV 快照：{len(updated_matches)} 場新增 {added} 個賠率快照", icon="📸")
+                if save_db(df_db, 'football_betting_db.csv', 'football_bets'):
+                    st.toast(f"📸 V16 CLV 快照：{len(updated_matches)} 場新增 {added} 個賠率快照", icon="📸")
+                else:
+                    st.warning("CLV 快照未獲主儲存確認；目前不列為已入庫。")
         except Exception:
             pass
     # (b) T-n 自動下注 — v15_auto 執行器會在主流程逐場推進 (每步一次 rerun)
@@ -9500,6 +9627,8 @@ def _v162_can_automate():
     - 主裝置模式開啟 → 只有主裝置 True；唯讀分頁只有當主裝置離線
       (心跳逾 12 分鐘) 時才 True (安全網：維持每日結算運作)。
     手動操作 (用家親手按按鈕) 不受此限 — 此函式只管「自動」觸發。"""
+    if st.session_state.get('_v16410_bet_unconfirmed'):
+        return False
     try:
         if not _v162_runner_mode_on():
             return True
@@ -10957,9 +11086,113 @@ def render_v10_kanpan_panel(v9_set):
     st.warning("⚠ 看盤規則來自數百場比賽的統計，數百注的 ROI 標準誤約 ±5%，任何結果都不保證未來盈利。請持續記錄、定期重新訓練，並以小注碼驗證。")
 
 
+def _v1649_render_parameter_lab(df_settled):
+    with st.expander("模型參數研究（唯讀）"):
+        st.caption("每場每市場最多模擬 1U，不讀舊下注方向或注碼。搜尋只用開發段；末段只驗證已鎖定的組合。")
+        try:
+            import fb_app_parameter_lab as lab
+        except ImportError:
+            st.warning("未載入研究引擎。請將同版 fb_app_parameter_lab.py 與 FB-app.py 放在同一目錄，並安裝現有 ML 套件。")
+            return
+        live_dataset = st.session_state.get("df_db", df_settled)
+        pct = lambda v: f"{v:+.2%}" if v is not None else "不適用"
+        if lab.FROZEN:
+            st.markdown("##### 凍結的歷史候選")
+            st.caption(f"以截至 {lab.FROZEN_AS_OF} 的固定研究配置分析；只作模擬。重新搜尋不會改下表，也不會開啟下注。")
+            st.dataframe(pd.DataFrame([
+                {"盤口": m, "用途": c["use"], "模型": c["model"], "參數": c["parameter"],
+                 "開啟特徵": "、".join(c["groups"]) or "只用基礎盤口",
+                 "最低 EV": pct(c["threshold"]), "歷史末段 ROI": pct(c.get("holdout_roi")),
+                 "末段注數": c.get("holdout_n", 0)}
+                for m, c in lab.FROZEN.items()
+            ]), hide_index=True, width="stretch")
+        if st.button("用目前資料重跑參數搜尋", key="v1649_lab_search"):
+            st.session_state.pop("_v1649_lab_report", None)
+            try:
+                with st.spinner("正在分盤口搜尋和驗證，不會存入注單…"):
+                    st.session_state["_v1649_lab_report"] = lab.run_search(live_dataset)
+            except (ValueError, RuntimeError) as exc:
+                st.warning(str(exc))
+        research = st.session_state.get("_v1649_lab_report")
+        if research:
+            periods = research["period"]
+            count = len(research["leaderboard"])
+            st.write(f"可用賽事 {research['coverage']['usable_matches']} 場；完成 {count} 個組合。"
+                     f"開發段 {periods['development']['from']} 至 {periods['development']['to']}；"
+                     f"末段 {periods['holdout']['from']} 至 {periods['holdout']['to']}。")
+            st.caption("歷史價格只用賽日 00:00 以前的報價（最長 48 小時），不是已驗證的 T−30 報價。"
+                       "至少 30 注及每開發折至少 5 注才可成為開發冠軍；末段不換冠軍。")
+            market = st.selectbox("查看盤口", lab.MARKETS, key="v1649_lab_market")
+            r = research["markets"].get(market, {})
+            chosen, test = r.get("winner"), r.get("holdout")
+            if chosen:
+                st.dataframe(pd.DataFrame([
+                    {"階段": name, "注數": s["n"], "淨利潤（U）": round(s["net"], 3),
+                     "ROI": pct(s["roi"]), "同線隨機 ROI": pct(s["pair_roi"])}
+                    for name,s in (("開發冠軍",chosen), ("末段驗證",test)) if s
+                ]), hide_index=True, width="stretch")
+                st.caption(f"{chosen['model']}／{chosen['parameter']}；最低 EV {pct(chosen['threshold'])}；"
+                           f"開啟：{'、'.join(chosen['groups']) or '無額外特徵'}。")
+                with st.expander("一次切換一項特徵"):
+                    st.dataframe(pd.DataFrame([
+                        {"特徵": t["group"], "冠軍配置": "開" if t["enabled"] else "關",
+                         "反轉後注數": t["flipped"]["n"], "反轉後淨利潤（U）": round(t["flipped"]["net"], 3),
+                         "反轉後 ROI": pct(t["flipped"]["roi"])}
+                        for t in r["feature_toggles"]
+                    ]), hide_index=True, width="stretch")
+                with st.expander("比較模型及數值參數"):
+                    st.caption("各模型列出開發段最佳合資格組合；下表固定冠軍其餘設定，只改動一個數值。")
+                    st.dataframe(pd.DataFrame([
+                        {"模型": m, "參數": t["parameter"], "開啟特徵": "、".join(t["groups"]) or "無",
+                         "最低 EV": pct(t["threshold"]), "注數": t["n"], "淨利潤（U）": round(t["net"], 3),
+                         "ROI": pct(t["roi"])} for m, t in r["family_max"].items() if t
+                    ]), hide_index=True, width="stretch")
+                    st.dataframe(pd.DataFrame([
+                        {"模型參數": s["parameter"], "最低 EV": pct(s["threshold"]), "注數": s["n"],
+                         "淨利潤（U）": round(s["net"], 3), "ROI": pct(s["roi"]), "合資格": s["eligible"]}
+                        for s in research["leaderboard"] if s["market"] == market and
+                        s["model"] == chosen["model"] and s["mask"] == chosen["mask"] and
+                        (s["parameter"] == chosen["parameter"] or s["threshold"] == chosen["threshold"])
+                    ]), hide_index=True, width="stretch")
+            else:
+                st.info(r.get("status", "未有可比較的結果。"))
+            df_rank = pd.DataFrame(research["leaderboard"])
+            if not df_rank.empty:
+                peek = df_rank.loc[df_rank.market == market, ["model", "parameter", "mask", "threshold", "n",
+                                                               "net", "roi", "eligible"]].head(12)
+                st.dataframe(peek, hide_index=True, width="stretch",
+                             column_config={"roi":st.column_config.NumberColumn("ROI",format="percent"),
+                                            "threshold":st.column_config.NumberColumn("最低 EV",format="percent")})
+                st.download_button("下載全部模型組合 CSV", df_rank.to_csv(index=False).encode("utf-8-sig"),
+                                   "fb-app-parameter-lab.csv", "text/csv", key="v1649_lab_download", on_click="ignore")
+        st.markdown("##### 新賽事 T−30 影子分析")
+        st.caption("使用凍結配置重訓。貼上 JSON，須有 fixture_id、kickoff（含 +08:00 或 UTC 時區）、"
+                   "home、away、league、odds；odds 使用 type、line、upper、lower、record_time、unlock（true）。"
+                   "只接受 T−30 前 15 分鐘內的雙邊報價，不寫入注單。")
+        st.caption("大／小或主／客必須是同時、同線的十進制賠率。賠率走勢宜提供多個已記錄時點，"
+                   "只有一筆報價時，走勢特徵為零。")
+        with st.form("v1649_lab_form"):
+            value = st.text_area("賽前資料 JSON", max_chars=80000, key="v1649_lab_input")
+            submitted = st.form_submit_button("執行影子分析")
+        if submitted:
+            st.session_state.pop("_v1649_lab_forecast", None)
+            try:
+                with st.spinner("用較早的賽果與報價重新訓練凍結配置…"):
+                    st.session_state["_v1649_lab_forecast"] = lab.score_fixture(live_dataset, json.loads(value))
+            except (ValueError, RuntimeError) as exc:
+                st.warning("沒有產生影子分析：" + str(exc))
+        if st.session_state.get("_v1649_lab_forecast"):
+            pred = pd.DataFrame(st.session_state["_v1649_lab_forecast"])
+            st.dataframe(pred, hide_index=True, width="stretch",
+                         column_config={"估計EV":st.column_config.NumberColumn("估計 EV",format="percent")})
+            st.download_button("下載這次影子分析 CSV", pred.to_csv(index=False).encode("utf-8-sig"),
+                               "fb-app-shadow.csv", "text/csv", key="v1649_lab_forecast_download", on_click="ignore")
+
+
 def render_dl_ml_analysis_section(df_settled):
     """V9 全局模型板塊：特徵說明、特徵組合搜尋結果、模型比較、前進式回測、盤口熔斷狀態"""
     st.markdown("### 🧠 V11 模型擂台 + V10 看盤引擎 + V9 市場錨定機器學習分析")
+    _v1649_render_parameter_lab(df_settled)
     if not HAS_AI_MODULES:
         st.warning("未安裝 sklearn 套件，無法執行 ML 模型訓練。")
         return
@@ -11089,6 +11322,9 @@ def main():
     has_gh = _has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO")
     
     st.sidebar.subheader("☁️ 數據同步狀態看板")
+    if st.session_state.get('_v16410_bet_unconfirmed'):
+        st.sidebar.error("本分頁有未獲主儲存確認的 BET，已暫停自動化及注單寫入。"
+                         "保持本頁並下載報表，先按注單 ID 核對正式庫；勿重送或按合併同步。")
     if has_sql:
         st.sidebar.success("✅ 已連接 PostgreSQL/SQL 雲端資料庫")
     elif has_gh:
@@ -11619,6 +11855,7 @@ def main():
         st.markdown("---")
         _analysis_scope = (_form_scope, tournament_category, league_size, no_rank,
                            home_rank, away_rank, home_form, away_form)
+        _v15_validate_form('ANALYZE', _fixture, match_date)
         if not match_date:
             st.warning("未能執行賽前分析：表單未有「比賽日期」。請展開上方「賽事與球隊資料」，核對並選擇香港賽日。")
             if not is_editing and all(_fixture):
@@ -11814,11 +12051,13 @@ def main():
                         _a15['_v155_autosys_noted'] = True
                         _v15_log(_a15, "ℹ️ 側邊欄「系統自動預選每種盤口」目前為關閉；自動導入模式下系統仍會強制預選 $0 模擬注，"
                                        "確保每場比賽都存入數據庫供學習 (此開關只影響手動模式，本提示每輪只顯示一次)")
+                    _v15_save_remote(_a15, publish=False)
 
             except Exception as _v15e:
                 if _v15_is_control_exc(_v15e) or not (st.session_state.get('v15_auto') or {}).get('active'):
                     raise
                 _v15_step_crash('ANALYZE', _v15e)
+        _v15_validate_form('BET', _fixture, match_date, input_scope=_analysis_scope)
         if st.session_state.get('show_analysis', False):
             _cached_analysis = st.session_state.get('analysis_result') or {}
             if not _cached_analysis.get('v9') or _cached_analysis.get('input_scope') != _analysis_scope:
@@ -12209,6 +12448,7 @@ def main():
                                 _a15['idx'] += 1
                                 _a15['step'] = 'FILL'
                                 _a15['tries'] = 0
+                                _v15_save_remote(_a15, publish=False)
                                 st.rerun()
                             st.stop()
                         if league_size is not None:
@@ -12216,7 +12456,15 @@ def main():
                         
                         st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame(new_records)], ignore_index=True)
                         st.session_state.last_bet_id = new_records[-1]['ID']
-                        if save_db(st.session_state.df_db, db_file, db_table):
+                        try:
+                            _saved_bet = save_db(st.session_state.df_db, db_file, db_table)
+                        except Exception as _save_error:
+                            if _v15_is_control_exc(_save_error) or not _v15_on('BET'):
+                                raise
+                            _saved_bet = False
+                            _v15_log(st.session_state['v15_auto'],
+                                     f"BET 儲存回應例外：{type(_save_error).__name__}", 'err')
+                        if _saved_bet:
                             st.toast("✅ 投注紀錄雲端同步成功！", icon="📝")
                         else:
                             st.warning("投注紀錄未獲主儲存確認；請先保留本頁並匯出備份，勿重新提交相同注單。")
@@ -12224,6 +12472,14 @@ def main():
                         # V14.12：自動模式 — 投注已寫入，自動切換至賽果結算
                         if _v15_on('BET'):
                             _a15 = st.session_state['v15_auto']
+                            if not _saved_bet:
+                                st.session_state['_v16410_bet_unconfirmed'] = [
+                                    str(r['ID']) for r in new_records
+                                ]
+                                _a15['active'] = False
+                                _v15_log(_a15, "BET 未獲主儲存確認，已停止本批次；保留本頁並匯出報表，先核對正式庫，勿重送。", 'err')
+                                _v15_save_remote(_a15)
+                                st.rerun()
                             _a15['bets'] = _a15.get('bets', 0) + len(new_records)
                             if str(_a15.get('mode')) == 'clv':
                                 # V16 開賽前模式：投注已寫入 — 比賽未完場不結算，跳到下一場；
@@ -12237,6 +12493,7 @@ def main():
                                 _a15['step'] = 'SETTLE_READ'
                                 _v15_log(_a15, f"📝 已寫入 {len(new_records)} 張注單 (含 $0 模擬注)，切換至賽果結算")
                             _a15['tries'] = 0
+                            _v15_save_remote(_a15, publish=False)
                     
                         clear_edit_mode()
                         st.session_state.odds_history = [{"id": 0, "type": "讓球", "record_time": "", "line": 0.0, "upper": 1.90, "lower": 1.90, "unlock": False, "margin": 1.085}] 
