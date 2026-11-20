@@ -1,3 +1,23 @@
+# V16.4.11｜自動批次與手動表單分離
+
+2026-11-20 香港時間。以 [V16.4.10 發布提交](https://github.com/tipsme98/FB-app/commit/d9f4b8a50822d33701d2847f99421360b38994b0) 的 `FB-app.py` 為基礎。此版無須 SQL 遷移；未執行正式驗收或更動正式設定。
+
+## 事故紀錄
+
+17:37:47 開始的 CLV 批次三場皆填充成功，然後在 `ANALYZE` 被比賽 ID／主客隊／香港賽日的合併檢查拒絕，最終 0 注、3 場待跟進。批次確實運行，與較早「主裝置卻只觀看」的過期狀態誤判不同（[批次最後公開紀錄](https://raw.githubusercontent.com/tipsme98/FB-app/7adca1476abd9cfa12dc5efdf61ec92f5fbc7878/auto_status.csv)）。
+
+三場是 18:00 的 [鹿島鹿角 vs 清水心跳（116101）](https://tipsme.hk/zh-HK/match/116101/chat)、[柏雷素爾 vs 千葉市原（116099）](https://tipsme.hk/zh-HK/match/116099/chat) 和 [神戶勝利船 vs 水戶蜀葵（116100）](https://tipsme.hk/zh-HK/match/116100/chat)。離線在 FILL 與 ANALYZE 之間注入過期手動欄位，可重現 V16.4.10 的拒絕；公開批次檔未保存當時哪項 widget 值觸發。
+
+## 維護及驗收
+
+- **批次階段：** FILL 保存 `(批次 SID, 佇列位置, Tipsme ID)` 綁定資料；ANALYZE、BET 不讀手動 widget。BET 重驗分析範圍及盤口；缺快照、賽事／賽日不符、過近開賽、正式庫防重查詢失敗仍不寫入。BET 未獲主儲存確認須保留分頁、匯出報表並查正式庫，勿重送。
+- **兼容：** 自動注單的 ID 保持 `B` 加數字，避免同秒撞號。結算把 `Half_Score` 及 `Result_Label` 當文字處理，避免全空欄被 pandas 判為數字。沒有更改結算公式或既有注單。批次完成但有失敗會顯示待跟進；主分頁及心跳診斷沿用既有機制。05:00 為[事故當時的設定](https://raw.githubusercontent.com/tipsme98/FB-app/7adca1476abd9cfa12dc5efdf61ec92f5fbc7878/football_schedule_db.csv)，只更正對硬編碼 09:30 的描述。
+- **離線回歸：** 18 項全過。三場重播各寫入一筆，賽事 ID、隊伍、香港賽日和賠率逐場相符，沒有登記用家注碼。另測失效快照、錯場及盤口與分析不符、正式庫防重讀取失敗、重複注單、未確認儲存、分頁狀態、手動填充及編輯，以及歷史日期及輪次建檔與結算。
+- **上線後：** 核對 Streamlit 側欄版本及一個指定主分頁的近期心跳，再唯讀觀察下一場合資格未開賽賽事的 FILL → ANALYZE → BET 和報表。不補錄上述三場的賽前注單；待正常排程後再查是否有合資格收盤價。排程和 runner 設定不用改。
+- **回退：** 以新提交只恢復 [V16.4.10 的 `FB-app.py`](https://github.com/tipsme98/FB-app/blob/d9f4b8a50822d33701d2847f99421360b38994b0/FB-app.py)，不重設 `main`，不還原資料 CSV，不改正式紀錄。BET 是 FB-app 帳簿寫入，不會向馬會提交交易。
+
+<hr>
+
 <div class="kicker">維護及事故交接　／　2026-11-20 香港時間</div>
 
 # FB-app 項目交接手冊
