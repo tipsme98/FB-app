@@ -7,6 +7,7 @@ import re
 import io
 import requests
 import itertools
+from tempfile import NamedTemporaryFile
 from datetime import datetime, timedelta, timezone
 # ==============================================================================
 # V16.4.1 (2026-11-18)：主表增量寫入和墓碑/Undo 同一事務；只按明示 ID 刪除。
@@ -17,7 +18,9 @@ from datetime import datetime, timedelta, timezone
 # V16.4.4：賽事設定逐欄寫回、空白隊數及近況；未知賽日不以記錄日期推算。
 # V16.4.5：只縮小自動 BET 前的 SQL 防重查詢；CLV 全量刷新及寫入交易不變。
 # V16.4.6：BET 允許隊數留空；不嘗試把空白隊數記成賽事設定。
-FB_APP_RELEASE = 'V16.4.6'
+# V16.4.7：單場填充核對賽日；日期空白時提示，僅對同一場提供恢復已讀日期。
+# V16.4.8：分離主分頁身分與心跳；活動分頁的心跳不再依賴整頁重新執行。
+FB_APP_RELEASE = 'V16.4.8'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -7944,7 +7947,7 @@ def v14_find_duplicate_match(df_db, home, away, match_date, tipsme_id=None):
         return None
 
 
-def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams):
+def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams, *, schedule_match=None):
     """貼上鏈結 → 讀取資料 → 寫入表單所有輸入欄位 (用家其後仍可逐項核對及修改)。
     回傳 (成功?, 訊息, 填充結果 dict)"""
     mid = tipsme_match_id_from_url(link)
@@ -7977,7 +7980,21 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams):
         st.session_state['sel_cat'] = cat
         st.session_state['_v1644_cat_marker'] = f'{st.session_state.get("editing_bet_id") or ""}|{v11_clean_name(league)}'
     # --- 3. 比賽日期 ---
-    kickoff_date = info['kickoff'].date() if info['kickoff'] is not None and info['kickoff'].year >= 2000 else None
+    kickoff = info.get('kickoff')
+    if kickoff is not None and not 2000 <= kickoff.year <= 2099:
+        kickoff = None
+    # 賽程「填充此場」有同一比賽 ID 的香港開賽時間，可在明細缺日期時使用。
+    # 如兩處日期互相矛盾，讓用家核對；不猜日期，也不按錯誤日期截斷近況。
+    if schedule_match and str(schedule_match.get('hkjc_match_id') or '') == mid:
+        sched_date = _v15_sched_date(schedule_match)
+        if sched_date is not None and 2000 <= sched_date.year <= 2099:
+            if kickoff is None:
+                kickoff = datetime.fromtimestamp(schedule_match['match_time'], HKT)
+            elif kickoff.date() != sched_date:
+                warnings.append(f"賽程日期 {sched_date} 與比賽頁日期 {kickoff.date()} 不一致；請核對同一場的香港賽日後手動選擇。")
+                kickoff = None
+    info = {**info, 'kickoff': kickoff}
+    kickoff_date = kickoff.date() if kickoff is not None else None
     st.session_state['_v1644_form_scope'] = (*map(v11_clean_name, (league, info['home'], info['away'])),
                                            kickoff_date.isoformat() if kickoff_date else '')
     st.session_state['match_date_input'] = kickoff_date
@@ -8097,9 +8114,7 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams):
     if mid:
         ctx['Tipsme_Match_ID'] = str(mid)
     # V14.4：重複比賽警告 — 資料庫已有同一場比賽 (同隊伍+同日期) 的記錄時提示，避免重複記錄
-    _dup = v14_find_duplicate_match(df_db, info.get('home'), info.get('away'),
-                                    info['kickoff'].date() if (info.get('kickoff') is not None and info['kickoff'].year >= 2000) else None,
-                                    tipsme_id=mid)
+    _dup = v14_find_duplicate_match(df_db, info.get('home'), info.get('away'), kickoff_date, tipsme_id=mid)
     if _dup is not None and not _dup.empty:
         _dup_ids = ', '.join(_dup['ID'].astype(str).head(5))
         _dup_st = '/'.join(sorted(set(_dup['Status'].astype(str)))[:3])
@@ -8874,10 +8889,7 @@ def _v15_render_remote_body():
                     st.markdown(f"`{_ts}` {_msg}")
 
 def v15_render_remote_status():
-    """V15.3：在頁面頂部顯示遠端進度 (本 session 沒有進行中的自動輸入時)。
-    V16.2：主分頁 (runner=1) 每次渲染同時輸出主裝置心跳檔。"""
-    if _v162_is_runner():
-        _v162_hb_write()
+    """在沒有進行中批次時顯示遠端進度；主分頁心跳由獨立 fragment 處理。"""
     _a = st.session_state.get('v15_auto') or {}
     if _a.get('active'):
         return
@@ -9049,14 +9061,18 @@ def _v16_clv_load():
     return cfg
 
 def _v16_clv_save(cfg):
-    """V16：儲存 CLV 記錄器設定到雲端 (SQL → GitHub → 本地)。回傳是否成功。"""
+    """依設定來源確認儲存；設定了雲端時，只有本地備份不算成功。"""
     try:
         now = get_hkt_now()
         cfg = dict(cfg)
         cfg['updated_ts'] = str(int(now.timestamp()))
-        save_db(pd.DataFrame([{k: str(cfg.get(k, '')) for k in CLV_COLUMNS}], columns=CLV_COLUMNS),
-                CLV_FILE, CLV_TABLE)
-        return True
+        row = {k: str(cfg.get(k, '')) for k in CLV_COLUMNS}
+        if save_db(pd.DataFrame([row], columns=CLV_COLUMNS), CLV_FILE, CLV_TABLE):
+            return True
+        if _has_secret("DB_URL") or (_has_secret("GITHUB_TOKEN") and _has_secret("GITHUB_REPO")):
+            return False
+        local = pd.read_csv(CLV_FILE, dtype=str, keep_default_na=False)
+        return len(local) == 1 and local.iloc[0].to_dict() == row
     except Exception:
         return False
 
@@ -9280,7 +9296,7 @@ def v16_try_start_auto_bet(df_db, cfg):
 def _v16_clv_body():
     """V16 背景 fragment 主體 (每 5 分鐘 + 每次頁面載入)：
     (a) 開賽前賠率快照 (b) T-n 自動下注觸發 (c) 狀態顯示。
-    V16.2：主裝置模式下，唯讀分頁略過 (a) 快照 (v15 心跳亦由主分頁輸出)，
+    V16.2：主裝置模式下，主分頁心跳新鮮時，其他分頁略過 (a) 快照，
     (b) 已在 v16_try_start_auto_bet 內閘門；唯讀分頁只顯示狀態。"""
     cfg = _v16_clv_load()
     if str(cfg.get('enabled')) != '1':
@@ -9363,40 +9379,30 @@ def v16_render_clv_config():
         _hrs = _c2.number_input("快照監察窗口 (開賽前 X 小時內的未結算注單)",
                                 min_value=0.0, max_value=12.0, value=_hv, step=0.5, key="v16_hrs")
 
-        # --- V16.2 主裝置模式 ---
-        _rmode = st.checkbox("🔒 主裝置模式（其他裝置唯讀查看，不自動運行批次）",
-                             value=str(_cc.get('runner_mode') or '') == '1', key="v162_rmode")
+        # 全域設定與分頁身分分開；隱藏 widget 不等於用家取消這個分頁。
+        _saved_rmode = str(_cc.get('runner_mode') or '') == '1'
+        _rmode = st.checkbox("🔒 主裝置模式（主裝置在線時其他分頁不自動運行）",
+                             value=_saved_rmode, key="v162_rmode")
+        if _rmode != _saved_rmode:
+            st.caption("主裝置模式有未儲存變更。按「儲存 CLV 記錄器設定」後才套用到其他分頁。")
         if _rmode:
-            _is_run = _v162_is_runner()
-            _run_ck = st.checkbox("🖥️ 本裝置為主裝置（自動運行由本分頁負責，請保持開啟）",
-                                  value=_is_run, key="v162_runner")
-            if _run_ck != _is_run:
-                try:
-                    if _run_ck:
-                        st.query_params['runner'] = '1'
-                        st.toast("🖥️ 本裝置已標記為主裝置 — 此標記存在網址中，重新整理/書籤均保留。"
-                                 "請把此頁加到書籤，日後由書籤開啟。", icon="🖥️")
-                    else:
-                        try:
-                            del st.query_params['runner']
-                        except Exception:
-                            st.query_params['runner'] = ''
-                except Exception:
-                    pass
-            if _v162_hb_fresh():
-                st.caption("🟢 主裝置心跳：正常 (最近 12 分鐘內) — 其他裝置現為唯讀查看模式。")
-            else:
-                st.caption("🔴 主裝置心跳：未偵測到 — 其他裝置若開啟逾 12 分鐘仍無心跳，將自動補位維持每日結算。")
+            st.session_state["v162_runner"] = _v162_is_runner()
+            st.checkbox("🖥️ 本裝置為主裝置（自動運行由本分頁負責，請保持開啟）",
+                        key="v162_runner", on_change=_v1648_runner_changed)
+            st.caption("勾選後請把含 `runner=1` 的網址加到書籤，只在主裝置使用。"
+                       "普通網址開啟的新分頁不會成為主裝置。心跳見頁首。")
+            if st.session_state.get("_v1648_runner_url_error"):
+                st.warning("未能同步本分頁身分至網址；請先核對網址是否含 `runner=1` 再儲存書籤。")
 
         if st.button("💾 儲存 CLV 記錄器設定", key="v16_save", use_container_width=True):
             _new = {'enabled': '1' if _cen else '0', 'bet_lead_min': str(int(_lead)),
                     'snap_hours': str(float(_hrs)),
                     'runner_mode': '1' if _rmode else '0', 'updated_ts': ''}
             if _v16_clv_save(_new):
-                st.toast("✅ V16 CLV 記錄器設定已儲存到雲端，所有裝置同步生效。", icon="🎯")
+                st.toast("✅ V16 CLV 記錄器設定已儲存。", icon="🎯")
                 st.rerun()
             else:
-                st.error("設定儲存失敗，請再試一次。")
+                st.error("未能確認設定已儲存至設定來源；其他分頁未必收到變更。請核對連線後再試。")
         st.caption("💡 運作原理 (預設 開賽前 30 分鐘 自動下注)：背景檢查每 5 分鐘一次，讀取 "
                    "Tipsme 首頁今日賽程；任何有馬會盤、即將到達「開賽前 N 分鐘」且未記錄的比賽，"
                    "自動執行 填充 → 分析 → 系統投注 (含 $0 模擬注) — Initial_Odds 即下注時的真實市價。"
@@ -9414,6 +9420,25 @@ def v16_render_clv_config():
 # =============================================================================
 V162_RUNNER_HB_FILE = 'v16_runner_hb.csv'
 V162_USER_BET_NOTE = '用家跟投'
+V1648_RUNNER_KEY = '_v1648_runner_selected'
+
+def _v1648_sync_runner():
+    """只在新 session 從網址讀取身分；既有 session 不受暫時缺失的網址影響。"""
+    try:
+        marked = st.query_params.get('runner') == '1'
+        if V1648_RUNNER_KEY not in st.session_state:
+            st.session_state[V1648_RUNNER_KEY] = marked
+        if _v162_is_runner() and not marked:
+            st.query_params['runner'] = '1'
+        elif not _v162_is_runner() and marked:
+            del st.query_params['runner']
+        st.session_state['_v1648_runner_url_error'] = False
+    except Exception:
+        st.session_state['_v1648_runner_url_error'] = True
+
+def _v1648_runner_changed():
+    """只有用家的勾選／取消勾選可以改變本 session 的分頁身分。"""
+    st.session_state[V1648_RUNNER_KEY] = bool(st.session_state.get('v162_runner'))
 
 def _v162_runner_mode_on():
     """V16.2：主裝置模式是否開啟 (雲端設定 runner_mode，預設 '0' 關閉=沿用舊行為)。"""
@@ -9423,29 +9448,49 @@ def _v162_runner_mode_on():
         return False
 
 def _v162_is_runner():
-    """V16.2：本分頁是否為主裝置 (網址參數 runner=1，書籤/重新整理均保留)。"""
-    try:
-        return str(st.query_params.get('runner') or '') == '1'
-    except Exception:
-        return False
+    """身分獨立於 checkbox 與心跳。有 `runner=1` 的書籤可在新 session 恢復。"""
+    return st.session_state.get(V1648_RUNNER_KEY) is True
 
 def _v162_hb_write():
-    """V16.2：主裝置心跳 — 寫入時間戳到容器共用檔 (所有瀏覽器 session 共用)。
-    由 v15_render_remote_status 每 10 秒呼叫 (主裝置分頁開著 = 心跳持續)。"""
+    """原子更新容器自己的時間戳，避免其他分頁讀到剛被截斷的空檔。"""
+    tmp = None
     try:
-        with open(V162_RUNNER_HB_FILE, 'w', encoding='utf-8') as f:
+        with NamedTemporaryFile(mode='w', encoding='utf-8', delete=False,
+                                dir=os.path.dirname(os.path.abspath(V162_RUNNER_HB_FILE)),
+                                prefix='.runner-hb-') as f:
+            tmp = f.name
             f.write(str(int(get_hkt_now().timestamp())))
-    except Exception:
-        pass
+        os.replace(tmp, V162_RUNNER_HB_FILE)
+        return True
+    except OSError:
+        return False
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+def _v1648_render_runner_status():
+    """同一個 fragment 週期寫心跳和顯示時間；不查雲端，也不執行下注。"""
+    @st.fragment(run_every=10)
+    def tick():
+        if _v162_is_runner():
+            if _v162_hb_write():
+                st.caption(f"🖥️ 本分頁已標記為主裝置｜最後心跳：{get_hkt_now():%H:%M:%S}（香港）")
+            else:
+                st.warning("本分頁已標記為主裝置，但無法更新心跳檔；其他分頁可能誤判離線。")
+    if _v162_is_runner():
+        tick()
 
 def _v162_hb_fresh(max_min=12):
-    """V16.2：主裝置心跳是否新鮮 (預設 12 分鐘 = 逾 70 個 10 秒週期無心跳)。"""
+    """主分頁最近 12 分鐘是否曾報到；不會更改任何分頁的主裝置身分。"""
     try:
         if not os.path.exists(V162_RUNNER_HB_FILE):
             return False
         with open(V162_RUNNER_HB_FILE, encoding='utf-8') as f:
             _ts = int(float((f.read() or '0').strip() or 0))
-        return (get_hkt_now().timestamp() - _ts) < max_min * 60
+        return 0 <= (get_hkt_now().timestamp() - _ts) < max_min * 60
     except Exception:
         return False
 
@@ -9491,8 +9536,8 @@ def v162_render_follow_tab():
             elif _v162_hb_fresh():
                 st.info("👁️ **唯讀查看模式** — 主裝置在線中，本裝置不會啟動或接手任何自動批次。")
             else:
-                st.warning("⚠️ 主裝置離線逾 12 分鐘 — 自動運行暫停中。如需本裝置接手，請到「📝 賽前建檔與投注」"
-                           "的 V16 面板勾選「本裝置為主裝置」。")
+                st.warning("⚠️ 最近 12 分鐘未收到主裝置心跳。本分頁未標記為主裝置，"
+                           "但原有後備規則允許活動分頁補位。請先檢查主分頁再決定是否手動接手。")
     except Exception:
         pass
 
@@ -9823,7 +9868,8 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
                 st.error(msg)
         st.caption("💡 賽程頁一條連結已內嵌整季全部輪次 (R1 至最後一輪) 的比賽：主客隊、開賽時間、馬會比賽 ID，"
                    "以及已完場比賽的賽果 (入球、半場、角球、紅黃牌)。讀取一次後，下方按輪次選擇比賽，"
-                   "逐場按「填充此場」即等同貼上該場比賽鏈結，之後的分析、下注、結算流程完全不變。")
+                   "按「填充此場」讀取該場比賽；若明細缺日期，可用同一比賽 ID 的賽程日期。"
+                   "若兩處日期不符，請先核對香港賽日；之後的分析、下注、結算流程不變。")
 
         # --- V15.10 賽果日期模式：按日期讀取全部聯賽的已完場比賽 ---
         st.markdown("**📆 賽果日期模式 (跨全部聯賽，適合每日批量輸入前一天賽事)**")
@@ -9924,7 +9970,7 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
                                        f"如確實要為此場加新注單，請直接貼上該場比賽鏈結。")
                         else:
                             _murl = f"https://tipsme.hk/zh-HK/match/{r['hkjc_match_id']}/chat"
-                            ok, msg2, _ = tipsme_auto_fill(_murl, df_db, opts_tournaments, opts_teams)
+                            ok, msg2, _ = tipsme_auto_fill(_murl, df_db, opts_tournaments, opts_teams, schedule_match=r)
                             if ok:
                                 st.toast(f"✅ 已填充：{r['home']} vs {r['away']}", icon="🔗")
                                 st.rerun()
@@ -9973,6 +10019,7 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
             info = fd['info']
             st.success(f"✅ 已自動填充：**{info['home']} vs {info['away']}** ({info['league']})"
                        f"{(' | 比賽時間 ' + info['kickoff'].strftime('%Y-%m-%d %H:%M')) if info['kickoff'] else ''}")
+            st.caption("這是填充預覽；本次填充並未寫入注單。")
             m1, m2, m3, m4 = st.columns(4)
             _rs = fd.get('rank_source') or {}
             _h_lab = "主隊排名（比賽當天）" if _rs.get('h') == 'asof' else "主隊排名（最新）"
@@ -11003,6 +11050,7 @@ def render_dl_ml_analysis_section(df_settled):
 # 6. 主程式 UI 
 # ==========================================
 def main():
+    _v1648_sync_runner()
     st.title("⚽ Actuarial and fund management system by Dr. EdwinPro")
     
     # V13.1：凍結主分頁列 (sticky tabs) — 捲動到最底時分頁永遠顯示在頁面頂部，方便快速切換
@@ -11300,6 +11348,7 @@ def main():
         edit_settled_bets_dialog(db_file, db_table)
 
     # V15.3：其他裝置的即時進度 (唯讀，每 10 秒自動更新；本 session 正在跑時不顯示)
+    _v1648_render_runner_status()
     v15_render_remote_status()
     v1511_render_sched_status()   # V15.11：每日排程背景檢查 (每 5 分鐘)
     v16_render_clv_recorder()     # V16：開賽前 CLV 記錄器背景檢查 (每 5 分鐘)
@@ -11570,7 +11619,22 @@ def main():
         st.markdown("---")
         _analysis_scope = (_form_scope, tournament_category, league_size, no_rank,
                            home_rank, away_rank, home_form, away_form)
-        
+        if not match_date:
+            st.warning("未能執行賽前分析：表單未有「比賽日期」。請展開上方「賽事與球隊資料」，核對並選擇香港賽日。")
+            if not is_editing and all(_fixture):
+                _read_info = (st.session_state.get('tipsme_fill_data') or {}).get('info') or {}
+                _read_mid = st.session_state.get('tipsme_fill_mid')
+                _read_ko = _read_info.get('kickoff')
+                _read_fixture = tuple(v11_clean_name(_read_info.get(k)) for k in ('league', 'home', 'away'))
+                if (_read_mid and str(_read_mid) == str(_read_info.get('match_id')) and _read_fixture == _fixture
+                        and _read_ko is not None and 2000 <= _read_ko.year <= 2099):
+                    _read_date = _read_ko.date()
+                    # 回調在下一次 rerun 開始前執行，不改已渲染的日期 widget。
+                    st.button(f"套用本場已讀比賽日期：{_read_date.isoformat()}（香港）",
+                              key="v1647_apply_read_date", on_click=st.session_state.__setitem__,
+                              args=('match_date_input', _read_date),
+                              help="只填日期，不會執行分析或寫入注單。若近況欄位已清空，請重新填充或核對後再分析。")
+
         # V14.12：_v15_on('ANALYZE') 令自動模式走完全相同的手動分析路徑
         if st.button("🚀 賽前數據分析執行", type="primary", use_container_width=True,
                      disabled=not match_date) or (_v15_on('ANALYZE') and match_date):
