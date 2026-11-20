@@ -16,7 +16,8 @@ from datetime import datetime, timedelta, timezone
 # V16.4.3：V10 設定使用獨立來源及逐鍵交易；明示回復預設。
 # V16.4.4：賽事設定逐欄寫回、空白隊數及近況；未知賽日不以記錄日期推算。
 # V16.4.5：只縮小自動 BET 前的 SQL 防重查詢；CLV 全量刷新及寫入交易不變。
-FB_APP_RELEASE = 'V16.4.5'
+# V16.4.6：BET 允許隊數留空；不嘗試把空白隊數記成賽事設定。
+FB_APP_RELEASE = 'V16.4.6'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -12146,7 +12147,8 @@ def main():
                                 _a15['tries'] = 0
                                 st.rerun()
                             st.stop()
-                        v11_save_league_size(res['t_name'], int(league_size), silent=True)
+                        if league_size is not None:
+                            v11_save_league_size(res['t_name'], int(league_size), silent=True)
                         
                         st.session_state.df_db = pd.concat([st.session_state.df_db, pd.DataFrame(new_records)], ignore_index=True)
                         st.session_state.last_bet_id = new_records[-1]['ID']
