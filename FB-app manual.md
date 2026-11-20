@@ -1,5 +1,227 @@
 # FB-app 項目交接手冊
 
+## 最新接手紀錄：V9–V11 模型與盈虧審計
+
+> 2026-11-20（香港時間）｜用 V16.4.8 及新版 `football_betting_report.xlsx` 離線核對。1,348 場、16,016 個方向樣本是 8,008 個雙邊盤口，不是獨立注單。未改正式程式、策略、設定、資料庫或排程。
+
+### 核對結果
+
+- **擂台：** V9 勝出 LR 只用市場賠率及水位，最高估計 EV −0.31%，降到 0% 也無注。V10 原 ROI −9.79%（1,857 注）、同場同線隨機 −5.80%；V11 原 ROI −8.67%（715 注）、同線隨機 −4.74%。V11 是加嚴的 V10 規則，並非獨立預測模型。
+- **回測缺陷：** `v11_arena` 在切時段前擬合全期「冷熱」；改每折只用過去資料後，V10／V11 ROI 為 −10.42%／−10.22%。介面 `v11_act_min_n`／`v11_act_roi` 沒有接到擂台固定的 50 注／+2%。舊隨機列是所有候選盤，應另保留同場同線配對。報表無實際開賽時間；最後快照不能直接視為可用賽前價。
+- **帳簿獨立核對：** 系統 642 筆，98,720 注碼、−1,628.45（−1.65%）；讓球 +8.15%，入球大小 −0.76%，角球 −21.45%。讓球 198 筆全無 Tipsme ID／模型閘門，138 筆記錄日期晚於賽日，60 筆同日記錄合計 −13.83%。記錄日期不等於下注時刻。重算 3,251 筆賽前結算金額相符，另有 37 筆 0.01U 單位差。
+
+### 接手後優先工作
+
+1. **讓球做影子測試，不改實注。** 逐場近況比分＋市場，0% 門檻回測 +2.12%（284 注）；只用比賽日前價格為 +0.65%（327 注），兩者區間均跨零且資料重疊，整體 Log-Loss 未超越原始去水市場。角球攻防僅較重新校準的市場略好，無正 ROI 證據。不以這份帳簿往績加碼。
+2. **先補時間，再凍結驗收。** 按 Tipsme ID 補實際開賽時間，保留 T−30 兩邊可用價格、盤線、各特徵採集時間、版本及拒絕原因；收盤價只作事後同線 CLV。比較原去水市場、近況比分模型與攻守比分模型，預先鎖定入場規則，按賽事／賽日測試配對差、ROI 和 CLV。<sup>1</sup>
+3. **復現與未完事項。** 詳見《FB-app 模型與盈虧審計》及離線 `fb-app-model-audit.py`。首次 Egress baseline 已由用家執行；約 24 小時後收兩份 CSV 比較。V16.4.8 主裝置的首場自動入庫／CLV 快照仍待正式驗收。
+
+<div class="page-sources">
+
+**1. 攻守比分基準（Dixon 與 Coles）：** <https://academic.oup.com/jrsssc/article-abstract/46/2/265/6990546>
+
+</div>
+
+
+---
+
+> 以下保留 Egress 寬限、V16.4.8 上線及 022 的歷史交接；首次 Egress baseline 已執行，等第二份採樣再分析。
+
+## 最新接手紀錄：Egress 超額與寬限通知
+
+> 2026-11-20（香港時間）｜使用者確認 Supabase 組織只有 FB-app 一個專案，並補交已選中 FB-app 的 Usage 截圖。已確認專案流量、本期超額及一次性寬限，未見已實施服務限制的證據。V16.4.8 的主裝置心跳已見一次；開賽前自動入庫及 CLV 快照仍待正式驗收。
+
+### 已確認：用量和通知是兩件事
+
+- **組織用量：** Free 方案，期間 `2026-10-30 至 2026-11-30`。最近一次有顯示累計用量的組織截圖為 `13.00 GB`，配額 `5 GB`，超額 `8.00 GB`。最新專案截圖只顯示日圖，不能更新這組累計數字。結算週期交替時重置，減少新流量不會扣回已用量。<sup>1</sup>
+- **專案流量：** 先前 `All projects` 的 `11 月 20 日` 浮標為 `Shared Pooler 1.271 GB（100.0%）`；已選中 `FB-app` 的新截圖為同日 `1.537 GB（100.0%）`，可直接確認該專案的流量類型。日圖每小時更新；兩個讀數不是全日，也沒有按部署時間切分，不能用差值判定 V16.4.8 用量或節流成效。Shared Pooler 顯示資料庫連線的流出量，不指明是哪個客戶端或哪條查詢。<sup>1</sup>
+- **一次性寬限：** 電郵表示本結算期可在現有用量下繼續使用，`2026-12-19` 起適用 Fair Use Policy；若寬限期間仍持續大幅超額，Supabase 可縮短寬限或立即限制服務。`11-30` 是頁面所示週期終點；`12-19` 是電郵所列政策日期，不代表當天必然停用，也不是寬限期間保證不受限。<sup>2</sup>
+- **兩個門檻：** `5 GB` 是後台列出的 Free Egress 配額；`低於 5.5 GB` 是這封電郵要求的降量目標，並非配額已加大。以每個結算週期用量低於 `5 GB` 為目標。<sup>1</sup>
+
+### 接手後先做甚麼
+
+1. **定位到專案，無須重做：** 已有 FB-app 專案浮標截圖，不用再篩選來排除其他專案。後續可用相近工作量的完整日期對照專案 `Shared Pooler`，用組織總量追蹤配額，並記錄服務限制提示。不要為了採樣重跑歷史批次。<sup>1</sup>
+2. **採集正常負載：** 現在和約 24 小時後各執行本手冊附帶的原版 `FB-app_egress_read_only.sql`，各匯出一份 CSV，記錄 V16.4.8 的正常賽事場數及有無批次。用同一資料庫、同一重置基線和未增加的逐出計數比較 `category_total` 中 `bets_wide_unfiltered` 的查詢次數／回傳列數。列數不是 GB，不能當作節流比例。
+3. **判斷後續：** 若 FB-app Pooler 流量仍高且全表讀取增量明顯，優先追查 CLV 填充前的全表刷新，保留跨裝置防重規則；若出現明確服務限制，先核對後台通知與正常寫入的錯誤，再判斷是否需立即處理方案。這次未改程式、資料庫、排程或帳單，也未驗收正式寫入。<sup>1,2</sup>
+
+<div class="page-sources">
+
+**1. Supabase Egress 用量、專案篩選與配額：** <https://supabase.com/docs/guides/platform/manage-your-usage/egress>  
+**2. Supabase Fair Use 政策與限制：** <https://supabase.com/docs/guides/platform/billing-faq#fair-use-policy>
+
+</div>
+
+
+---
+
+> 以下為較早的交接紀錄（包括 V16.4.8 上線及 022）；Egress 讀數及寬限狀態以本次最新紀錄為準。
+
+## 最新接手紀錄：主裝置心跳與補錄驗收
+
+> 2026-11-20（香港時間）｜V16.4.8 已由使用者部署（含 V16.4.7 日期修正）。截圖見 `runner=1`、主分頁心跳 `14:36:01`、CLV 運作中。使用者已存書籤，只開一個主分頁；首場開賽前自動入庫與快照仍待驗收。原有 23 頁及兩份只讀 SQL 保留。
+
+### 補錄結果
+
+- **11 月 19 日：** 使用者在 V16.4.6 跑完全日，畫面顯示 24 場已結算。新報表 `football_betting_report.xlsx`（`Sheet1` 的 A、C、F、G、X、AE 欄）按 `Match_Date` 過濾及排除即場後，有 24 個 Tipsme ID、56 筆 `Settled`、0 筆 `Open`；這不是「56 筆全是這次新增」，也不代表補回真實賽前 CLV。
+- **Supabase 抽查：** 利雲特女足 vs 伊巴女足 `116093` 已結算 2 筆；多哈艾阿里 vs 艾沙瑪 `116089` 已結算 2 筆；赫根女足 vs 曼城女足 `116073` 已結算 3 筆。11 月 20 日西雅圖海灣者 vs 皇家鹽湖城 `116060` 有 3 筆 `Open`，不是漏寫，也不應重建。四場與報表一致，抽查的同場同盤同方向同線額外列均為 0。
+
+### 問題、修法與限制
+
+- **已確認的程式錯誤：** 舊版 `v15_render_remote_status()` 只在整頁重跑時寫心跳，每 10 秒重跑的是遠端進度 fragment，沒有寫心跳。主分頁可仍開着而被其他分頁當成離線；12 分鐘逾時不會直接取消勾選。舊分頁身分完全依賴網址 `runner=1`，新 session 從不含參數的網址開啟便不是主分頁。沒有事發網址、心跳及頁面狀態，不能確認當時是哪個原因，沒有證據指向 Egress。<sup>1</sup>
+- **V16.4.8：** 只由明確勾選切換現有分頁身分；同一 session 若網址標記遺失會補回。新 session 可用 `runner=1` 書籤恢復，普通網址不自動設成主裝置。獨立 fragment 每 10 秒原子更新容器內心跳；頁首顯示香港時間或寫入警告，不新增雲端查詢。全域 CLV 儲存未獲來源確認時不再顯示成功。原有 12 分鐘後備補位規則、快照／下注策略、防重與資料庫結構不變。<sup>2</sup>
+
+### 正式驗收與 Egress
+
+1. **主裝置：** 一張截圖只證明一次報到。保持單一主分頁和電腦不休眠，觀察心跳跨過 12 分鐘仍更新；以一場合資格的未開賽賽事核對系統注單確實入庫及新增快照。不重跑 11 月 19 日。若再失效，記下香港時間、兩個勾選、網址是否有 `runner=1` 及最後心跳；Chrome 可加入網站保活例外。<sup>2,3</sup>
+2. **Egress：** 上次截圖為 `12.10 GB / 5 GB`，超額 `7.10 GB`；這不是最新讀數，也不等於已受限。先查 Supabase 組織 Usage 的本期累計、結算週期及限制通知；再篩選 FB-app，記下 Shared Pooler 日用量。已用量在本期累計，減少新用量不會回扣。<sup>4</sup>
+3. **量度後才改：** 現在和約 24 小時後各跑一次原只讀 Egress SQL，不重置統計，記錄實際批次／場數。比較 `bets_wide_unfiltered` 的增量（回傳列數不是 GB）；若全表讀取仍高，優先核對 CLV 在每場填充前的全表刷新，保留防重。未掌握限制通知或新用量前，毋須先升級方案。
+
+`FB-app.py` V16.4.8 SHA-256：`28193b88e7083dbc17cae7652f2dbb0d33ec925d36fab377a1af2eb356bf65d7`。
+
+<div class="page-sources">
+
+**1. 正式 V16.4.6 心跳與進度：** <https://github.com/tipsme98/FB-app/blob/c490fa1c31aaede7185ac7da3d91c0ae19f4fb0e/FB-app.py#L8889>  
+**2. Streamlit 1.67.0 fragment：** <https://github.com/streamlit/streamlit/blob/1.67.0/lib/streamlit/runtime/fragment.py>  
+**3. Chrome 效能設定：** <https://support.google.com/chrome/answer/12929150?hl=en>  
+**4. Supabase Egress 用量與週期：** <https://supabase.com/docs/guides/platform/manage-your-usage/egress>
+
+</div>
+
+
+---
+
+> 以下為截至 V16.4.7 候選版的歷史交接（包括 022）；目前部署狀態及操作以最新紀錄為準。
+
+## 最新接手紀錄：單場填充後分析按鈕停用
+
+> 2026-11-20（香港時間）｜使用者已上線 V16.4.6。利雲特女足 vs 伊巴女足已填充，預覽顯示 `2026-11-19 01:00` 及 13 筆盤口，但分析按鈕呈灰。V16.4.7 為本地驗證候選，尚未部署、未正式補寫注單。後面 22 頁保留歷史處理。
+
+### 已確認與仍待驗收
+
+- **正式庫前置證據：** 使用者貼出的只讀 SQL 結果，利雲特女足 vs 伊巴女足、多哈艾阿里 vs 艾沙瑪、赫根女足 vs 曼城女足、西雅圖海灣者 vs 皇家鹽湖城均為 `bet_rows=0`，Open／Settled 各 0、`tipsme_match_ids=NULL`。這是指定隊名及香港賽日下的非即場記錄，不排除其他譯名、日期或相同 ID 已有記錄；不代表 11 月 19 日全日無注單。仍缺單場補錄後的正式入庫證據。
+- **停用條件：** V16.4.6 的「賽前數據分析執行」只在表單 `match_date_input` 沒有值時停用。綠色預覽使用填充結果中的另一個值；畫面顯示時刻，不等於表單已有日期，也不代表注單已入庫。這一關在 SQL 寫入前，與上一輪 `int(None)` 及 Egress 分開。截圖中表單收起，未有證據判定正式分頁在哪次操作遺失日期。<sup>1</sup>
+- **本地重現與修法：** 以同一 Streamlit 1.67.0、合成資料和實際畫面流程，重現「預覽有日期、表單空白、按鈕停用」。V16.4.7 顯示缺日期原因；只有填充的比賽 ID、賽事與主客隊一致才顯示「套用本場已讀比賽日期」。若比賽頁無日期，「填充此場」可按同一 ID 用賽程的香港日期；兩處衝突則留空、提示人工核對，不以當天或上一場日期代填。<sup>2</sup>
+
+### 單場復原及驗收
+
+1. **可先用已上線的 V16.4.6：** 展開「賽事與球隊資料」，確認對賽仍為利雲特女足 vs 伊巴女足；若「比賽日期」是空白，手動選 `2026-11-19`。核對近況和盤口，先試分析；若日期已正確顯示而按鈕仍灰，保存展開後的日期欄及按鈕截圖，不重試全日。
+2. **若要驗收 V16.4.7：** 備份目前主程式後只替換 `FB-app.py`，確認側欄版本，重按同一場「填充此場」。日期空白時按「套用本場已讀比賽日期」，或核對後手動選擇；如近況欄已清空，重新填充並核對後才分析。單場驗收前先確認自動批次已暫停；不改策略、日期修復或方案。修正版已在本地驗證恢復日期後能執行分析；缺日期與日期衝突仍會停用，換隊不沿用舊資料，原分析及 BET 分支不變。
+3. **正式庫核對：** 確認 Tipsme ID 和隊名後，只補這場系統歷史記錄並核對結算；已有 Open 只核對結算，已有 Settled 不重建。再跑 PDF 內附的只讀驗收 SQL；若未見正式記錄、場次不符或疑似重複，先停下來核對，不重送。歷史補錄不恢復過去沒有留下的賽前價格或 CLV。
+
+`FB-app.py` V16.4.7 SHA-256：`441e4afa46ff973a2c4c8cec556a1d384dbec09bfb69c4619ccd6974c2e95464`。
+
+<div class="page-sources">
+
+**1. V16.4.6 正式基線的按鈕條件：** <https://github.com/tipsme98/FB-app/blob/c490fa1c31aaede7185ac7da3d91c0ae19f4fb0e/FB-app.py#L11575>  
+**2. 基線固定的 Streamlit 版本：** <https://raw.githubusercontent.com/tipsme98/FB-app/c490fa1c31aaede7185ac7da3d91c0ae19f4fb0e/requirements.txt>
+
+</div>
+
+
+---
+
+> 以下為上一版 V16.4.6 的故障處理及既有歷史交接（包括 022）；現在的部署狀態以上面為準。
+
+## 最新接手紀錄：11 月 19–20 日 BET 故障與復原
+
+> 2026-11-20（香港時間）｜已重現空白隊數在 BET 寫入前造成 `TypeError`。有證據確認歷史補跑及開賽前模式均受影響；不是截圖所顯示失敗的 Egress 拒絕。V16.4.6 已本地驗證，尚未部署。後面 20 頁保留歷史狀態，不可當作當前操作指示。
+
+### 故障證據與範圍
+
+- **11 月 19 日晚的原批次：** 22:57 艾阿恩 vs 艾迪哈夫拉、23:04 多哈艾阿里 vs 艾沙瑪，完成填充和分析後，BET 報 `int(None)`、該批次 0 注。證實至少部分原始漏記已有同一錯誤，不代表找到全部漏場。<sup>1</sup>
+- **11 月 20 日手動補跑 11 月 19 日：** 10:29 日期模式把 24 場排入佇列；前兩場利雲特女足 vs 伊巴女足、赫根女足 vs 曼城女足皆填充成功，分析產生模擬注，但 BET 報 `TypeError: int() ... not 'NoneType'`。只有取樣的場次已核實；24 場是當時佇列數，並非 24 場全都未寫入或全部同錯。<sup>2</sup>
+- **11 月 20 日開賽前：** 截圖的西雅圖海灣者 vs 皇家鹽湖城在 10:38:03 已填充、10:38:15 分析完成後同樣在 BET 失敗，0 注。畫面通用提示「填充或結算失敗」不是這場的實際失敗階段。<sup>3</sup>
+- **程式原因：** V16.4.5 與公開 `main` 所查 `FB-app.py` 的 Git blob `ec1eff1235da4cc886694d66313787e2d9651569` 相符。表單及注單容許 `League_Size=None`，但下注分支在 `save_db()` 前呼叫 `v11_save_league_size(..., int(league_size), ...)`。轉型在函式外出錯，連函式內的防護也到不了；五欄 SQL 不是這個例外的來源。<sup>4</sup>
+
+### Supabase：確定超額，未見已限制的證據
+
+截圖顯示用量 12.10 GB／Free 5 GB、超額 7.10 GB；11 月 19 日浮標爲 Shared Pooler 3.729 GB（100%），20 日截圖時爲 445.584 MB（100%），不是全日。超額不等於已受限；應查組織通知／帳單電郵是否明示限制，以及同時間 DB 寫入的 SQLSTATE（如 `25006` 只讀，不單憑它認定是 Egress）。SQL Editor 可讀也不能保證 App 的 Pooler 寫入正常。<sup>5</sup>
+
+相同 reset（11 月 17 日 10:31:30），兩份 CSV 的採樣相差 21 小時 08 分 48 秒（11 月 19 日 13:29:32 → 20 日 10:38:20），兩份 `deallocations=0`。五欄查詢由未列出變為 **34 次、0 列**，證明新讀取路徑有執行，零列不是失敗，也不證明寫入成功；全表讀取 **221→297 次、681,364→926,795 列**，增加 76 次、245,431 列，全部來自指紋 `-4164684057315722318`。窗口包含故障及其他操作，不是成功批次對照，不能估算節流百分比；`after-bet` 採樣亦早於西雅圖批次 10:38:25 結束。<sup>6</sup>
+
+<div class="page-sources">
+
+**1. 11 月 19 日開賽前批次：** <https://raw.githubusercontent.com/tipsme98/FB-app/5ff6b5aaaeab422ea1a514cf9ef2047a18a82784/auto_status.csv>  
+**2. 11 月 19 日補跑日誌：** <https://raw.githubusercontent.com/tipsme98/FB-app/06949e6083bf362fc191cd2ea25f10a5394a7502/auto_status.csv>  
+**3. 西雅圖批次日誌：** <https://raw.githubusercontent.com/tipsme98/FB-app/05ec2bd3a15f4289bcf9644da3ab1bfdc0c1fc1c/auto_status.csv>  
+**4. V16.4.5 主程式：** <https://github.com/tipsme98/FB-app/blob/05ec2bd3a15f4289bcf9644da3ab1bfdc0c1fc1c/FB-app.py#L12149>  
+**5. Supabase 限制政策：** <https://supabase.com/docs/guides/platform/billing-faq#fair-use-policy>  
+**6. Supabase 累積 SQL 統計：** <https://supabase.com/docs/guides/observability/inspect>
+
+</div>
+
+<div class="page-break"></div>
+
+### V16.4.6 修正與本地驗證
+
+- **唯一運行改動：** 隊數為 `None` 時跳過「記住隊伍數」的設定寫回；注單仍依原規則存空白隊數、排名 `NA`。有有效隊數時沿用原流程。不調模型、策略、排程、防重 SQL、全表刷新、主表交易、結算邏輯、U21 與日期規則。
+- **回歸驗證：** 以舊版實際 BET 分支重現歷史與開賽前兩模式在主表儲存前中斷；修正後，兩種自動模式及手動提交在空／有效隊數下均走到模擬的儲存呼叫，原防重阻擋及狀態轉移未變。另用獨立 PostgreSQL 重跑五欄防重測試，並確認 Streamlit 本地側欄顯示 V16.4.6。未測正式庫的實際寫入。
+- **交付：** `FB-app.py`（V16.4.6 完整程式），SHA-256 `0d5fd7d85bb51dd05296fb5116d21218a717a823b64c0d9baa3b90206d722c75`。PDF 內嵌單場驗收 SQL 及原有只讀 Egress 診斷。未改正式 GitHub、Streamlit、Supabase、方案或排程，未補寫注單。
+
+### 恢復順序：先一場，再補其餘
+
+1. **部署前備查：** 暫停反覆重試；待主裝置停止批次，記下原每日排程／CLV 設定並暫停，保留實際舊 `FB-app.py`。檢查 Supabase 組織是否有已生效的服務限制。只更新程式檔，側欄必須顯示 V16.4.6；不要先改方案、重設統計、補假隊數、重跑日期／U21 寫入或重置 V10。
+2. **擇一已完場、確定缺單的已知樣本：** 用 `FB-app_2026-11-19_BET_verify_read_only.sql` 查庫，例如利雲特女足 vs 伊巴女足；確認比賽 ID／香港賽日，只有沒有正式注單才單場補錄。用日期模式窄時段；如時段含其他場，改用賽程的單場填充、分析、只記系統注並核對結算。已有 Open 只核對結算，已有 Settled 不重建。驗收 SQL 只按所列日期與正式隊名匹配；零筆若可能是別名，先按比賽 ID 到 App 複查。
+3. **再查正式庫，而非只看日誌：** 單場驗證要有正式記錄、日期與 ID 正確、缺隊數保持空白（兩隊排名 `NA`）、核對結算狀態，並檢查有沒有多一份同場同盤同方向同線。若顯示 SQL 儲存失敗、未獲主儲存確認，或查庫未見寫入，保留分頁、匯出備份和脫敏錯誤，不要重送；自動摘要可能仍計入未確認儲存的列。
+4. **對清單逐步恢復：** 單場通過才重建 11 月 19 日 00:00–23:59 佇列補其餘；重新讀取當日賽果，不沿用舊 24 場數目。已過開賽點的比賽只能用歷史流程補錄，不可還原當時未記下的賽前入場價或視為真實賽前 CLV。再用一場確實未開賽的賽事驗證 CLV，確認正式入庫才恢復原自動設定。
+5. **後續 Egress 驗收：** 在正常批次用同一只讀報告取前後快照，並記批次場數、開賽前/歷史模式及確認入庫數；在 Usage 選中 FB-app 專案，比較相近工作量。若寬欄全讀仍高，再單獨排查 CLV 刷新，不能把 34 次空結果當作節流率。<sup>1</sup>
+
+<div class="page-sources">
+
+**1. Supabase Egress 與專案篩選：** <https://supabase.com/docs/guides/platform/manage-your-usage/egress>
+
+</div>
+
+
+### 單場復原驗收 SQL（只讀）
+
+```sql
+-- FB-app incident 2026-11-19/20: run in Supabase SQL Editor before and after
+-- a single historical trial. Read-only; no stake, odds, individual bet ID
+-- or unfiltered match report is returned. Edit the VALUES list if needed.
+-- Zero means no exact date/team-name match in the non-live records shown here;
+-- if names differ, check the fixture ID and aliases in the app before retrying.
+WITH targets (match_date_hkt, fixture) AS (
+    VALUES
+        ('2026-11-19', '利雲特女足 vs 伊巴女足'),
+        ('2026-11-19', '赫根女足 vs 曼城女足'),
+        ('2026-11-19', '多哈艾阿里 vs 艾沙瑪'),
+        ('2026-11-20', '西雅圖海灣者 vs 皇家鹽湖城')
+),
+hits AS (
+    SELECT t.match_date_hkt, t.fixture, b."Status" AS status,
+           nullif(btrim(b."Tipsme_Match_ID"::text), '') AS tipsme_match_id,
+           nullif(btrim(b."League_Size"::text), '') AS league_size,
+           b."Home_Rating" AS home_rating, b."Away_Rating" AS away_rating,
+           row_number() OVER (
+               PARTITION BY t.match_date_hkt, t.fixture, b."Bet_Type", b."Selection", b."Initial_Line"
+               ORDER BY b."ID"
+           ) AS key_row
+    FROM targets AS t
+    JOIN public.football_bets AS b
+      ON btrim(b."Match_Date"::text) = t.match_date_hkt
+     AND btrim(b."Match"::text) = t.fixture
+    WHERE b."ID"::text NOT LIKE 'IP%'
+      AND coalesce(b."Bet_Type"::text, '') NOT LIKE '%即場%'
+)
+SELECT t.match_date_hkt, t.fixture,
+       count(h.key_row) AS bet_rows,
+       count(*) FILTER (WHERE h.status = 'Open') AS open_rows,
+       count(*) FILTER (WHERE h.status = 'Settled') AS settled_rows,
+       count(*) FILTER (WHERE h.key_row > 1) AS same_market_side_line_extra_rows_to_review,
+       count(*) FILTER (WHERE h.key_row IS NOT NULL AND h.league_size IS NULL) AS blank_league_size_rows,
+       count(*) FILTER (WHERE h.home_rating = 'NA' AND h.away_rating = 'NA') AS both_ratings_na_rows,
+       array_agg(DISTINCT h.tipsme_match_id) FILTER (WHERE h.tipsme_match_id IS NOT NULL) AS tipsme_match_ids
+FROM targets AS t
+LEFT JOIN hits AS h USING (match_date_hkt, fixture)
+GROUP BY t.match_date_hkt, t.fixture
+ORDER BY t.match_date_hkt, t.fixture;
+```
+
+---
+
+> 以下為截至 11 月 19 日的歷史交接（包括 022）；舊部署狀態以當時記錄為準。
+
 ## 最新接手紀錄：Egress 正式統計及 V16.4.5
 
 > 2026-11-19（HKT）｜正式統計確認寬欄全表讀取頻繁。V16.4.5 是只縮小自動 BET 防重查詢的候選修補；尚未部署。後面的 18 頁為歷史基線；目前狀態以本節為準。未改正式 GitHub、Streamlit、Supabase、排程或策略設定。
