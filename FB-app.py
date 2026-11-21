@@ -10073,6 +10073,50 @@ def _v162_excl_user_bets(df):
     except Exception:
         return df
 
+def _v162_follow_record_time(value, bet_id):
+    """Order by entry time in Hong Kong, refining minute-only records with a matching ID clock."""
+    raw = str(value).strip()
+    try:
+        recorded = datetime.fromisoformat(raw)
+        if recorded.tzinfo is not None:
+            recorded = recorded.astimezone(HKT).replace(tzinfo=None)
+    except (ValueError, OverflowError):
+        return datetime.min
+    if not re.fullmatch(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}', raw):
+        return recorded
+    code = str(bet_id).strip()
+    automatic = re.fullmatch(r'B(\d{14})(\d{6})\d{14}', code)
+    match = automatic or re.fullmatch(r'(?:B|IP)(\d{14})\d+F?', code)
+    if match:
+        try:
+            precise = datetime.strptime(match[1], '%Y%m%d%H%M%S')
+            if precise.replace(second=0) == recorded:
+                return precise.replace(microsecond=int(automatic[2])) if automatic else precise
+        except ValueError:
+            pass
+    return recorded
+
+
+def _v162_follow_match_sections(open_df):
+    """Keep the existing match identity and slip order, newest distinct Open entry first."""
+    keys = [
+        open_df['Tournament_Name'].fillna('').astype(str),
+        open_df['Match'].fillna('').astype(str),
+        v10_md_series(open_df).rename('_md'),
+    ]
+    ranked = []
+    for key, rows in open_df.groupby(keys, sort=True):
+        # Keep the original first row per ID and the existing widget order inside each card.
+        if 'ID' in rows:
+            rows = rows.drop_duplicates(subset=['ID'], keep='first')
+        times = rows.get('Date', pd.Series('', index=rows.index))
+        ids = rows.get('ID', pd.Series('', index=rows.index))
+        latest = max((_v162_follow_record_time(t, i) for t, i in zip(times, ids)), default=datetime.min)
+        ranked.append((latest, key, rows))
+    ranked.sort(key=lambda entry: entry[0], reverse=True)
+    return [(key, rows) for _, key, rows in ranked]
+
+
 def v162_render_follow_tab():
     """V16.2「👤 用家跟投」分頁：監察系統待結算注單 + 賽前分析結果，
     用家自行決定跟投 (自訂注碼) 或觀望。任何裝置可用 (含唯讀查看裝置)。"""
@@ -10080,7 +10124,8 @@ def v162_render_follow_tab():
     st.caption("💡 此分頁的數據全部來自雲端資料庫 (毋須執行賽前分析)：系統注單的"
                "模型概率 / 市場概率 / Edge / 閘門 / 近況 / 排名一目了然。勾選跟投並輸入"
                "注碼後寫入待結算注單，與系統注單**同一場自動結算**。用家跟投注單只作"
-               "你的記錄參考，**不供系統學習及分析** (已從模型訓練數據剔除)。")
+               "你的記錄參考，**不供系統學習及分析** (已從模型訓練數據剔除)。"
+               "比賽按最新待結算注單的輸入時間排列，最近輸入的在最頂。")
 
     # --- 主裝置狀態 ---
     try:
@@ -10109,39 +10154,13 @@ def v162_render_follow_tab():
                 "按已設定的每日排程結算。")
         return
 
-    groups = v10_match_groups(open_df)
-    if groups is None or groups.empty:
+    sections = _v162_follow_match_sections(open_df)
+    if not sections:
         st.info("📭 目前沒有待結算注單。")
         return
 
-    # 實注比賽排前 (用家關注優先)，其餘 ($0 模擬注) 其後
-    def _has_real(g):
-        try:
-            _m = v10_match_mask(open_df, g['Tournament_Name'], g['Match'], g['_md'])
-            _rows = open_df[_m]
-            return int((pd.to_numeric(_rows['System_Stake'], errors='coerce').fillna(0) > 0).sum())
-        except Exception:
-            return 0
-    groups = groups.to_dict('records')
-    for _g in groups:
-        _g['_real'] = _has_real(_g)
-    groups.sort(key=lambda g: (-g.get('_real', 0), str(g.get('_md') or '')))
-
-    _n_shown = 0
-    for g in groups:
-        _md = str(g.get('_md') or '')[:10]
-        _tourn = str(g.get('Tournament_Name') or '')
-        _match = str(g.get('Match') or '')
-        _rows = open_df[v10_match_mask(open_df, _tourn, _match, g['_md'])]
-        if _rows is None or _rows.empty:
-            continue
-        # V16.4：同 ID 重複列防護 — 萬一任何來源仍產生同 ID 兩列 (歷史競態
-        # 殘留)，顯示層按 ID 去重，checkbox/注碼欄 key 亦加序號，杜絕
-        # StreamlitDuplicateElementKey 整頁崩潰 (2026-11-18 用家實測事故)
-        try:
-            _rows = _rows.drop_duplicates(subset=['ID'], keep='first')
-        except Exception:
-            pass
+    for (_tourn, _match, _md), _rows in sections:
+        _md = _md[:10]
         _sys_stake = pd.to_numeric(_rows['System_Stake'], errors='coerce').fillna(0)
         _usr_stake = pd.to_numeric(_rows['User_Stake'], errors='coerce').fillna(0)
         _real_n = int((_sys_stake > 0).sum())
@@ -10257,9 +10276,6 @@ def v162_render_follow_tab():
                         st.warning("已略過 " + str(_skip_n) + " 注：" + "；".join(_skip_msg[:5]))
                     if _ok_n:
                         st.rerun()
-        _n_shown += 1
-    if _n_shown == 0:
-        st.info("📭 目前沒有待結算注單。")
 
 
 def v1511_render_sched_status():
