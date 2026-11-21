@@ -25,6 +25,7 @@ HOLD = timedelta(hours=2)
 FRESH = timedelta(seconds=60)
 LOOKBACK = timedelta(days=14)
 MAX_MATCHES = 8
+MIN_PROBE_SLOTS = 2  # Keep checking other matches even while stable finals get follow-ups.
 API = "https://tipsme-web.azurewebsites.net/api/Score"
 PAGE = "https://tipsme.hk/zh-HK/match/{}/live"
 STATE = 'public.fb_early_state_16413'
@@ -427,12 +428,34 @@ class Postgres:
                     FROM {BETS} WHERE "Status" = 'Open'
                     AND CAST("Match_Date" AS text) BETWEEN :lo AND :hi
                     AND btrim(CAST("Tipsme_Match_ID" AS text)) ~ :pattern
+                ), ranked AS (
+                    SELECT c.mid, s.last_attempt,
+                        CASE WHEN s.reason = 'normal_final'
+                              AND s.last_good BETWEEN :gap_floor AND :now
+                              AND s.last_good - s.first_good < :hold
+                             THEN s.first_good END AS observation_started
+                    FROM candidates c LEFT JOIN {STATE} s ON s.match_id = c.mid
+                    WHERE c.mid <> '' AND NOT coalesce(s.manual, false)
+                ), followups AS (
+                    -- Protect the oldest still-continuous, unfinished windows instead
+                    -- of letting a long round-robin queue repeatedly reset them.
+                    SELECT mid, last_attempt, observation_started FROM ranked
+                    WHERE observation_started IS NOT NULL
+                    ORDER BY observation_started, last_attempt, mid LIMIT :follow_limit
+                ), probes AS (
+                    SELECT r.mid, r.last_attempt FROM ranked r
+                    WHERE NOT EXISTS (SELECT 1 FROM followups f WHERE f.mid = r.mid)
+                    ORDER BY r.last_attempt NULLS FIRST, r.mid
+                    LIMIT (:limit - (SELECT count(*) FROM followups))
                 )
-                SELECT c.mid FROM candidates c LEFT JOIN {STATE} s ON s.match_id = c.mid
-                WHERE c.mid <> '' AND NOT coalesce(s.manual, false)
-                ORDER BY s.last_attempt NULLS FIRST, c.mid LIMIT :limit
+                SELECT mid FROM (
+                    SELECT mid, last_attempt, observation_started, 0 AS lane FROM followups
+                    UNION ALL
+                    SELECT mid, last_attempt, NULL, 1 FROM probes
+                ) q ORDER BY lane, observation_started, last_attempt NULLS FIRST, mid
                 '''), {'lo': (today - LOOKBACK).isoformat(), 'hi': today.isoformat(),
-                       'pattern': STRICT_ID, 'limit': MAX_MATCHES}).scalars().all()
+                       'pattern': STRICT_ID, 'limit': MAX_MATCHES, 'now': now, 'gap_floor': now - GAP,
+                       'hold': HOLD, 'follow_limit': MAX_MATCHES - MIN_PROBE_SLOTS}).scalars().all()
             conn.execute(text(f'UPDATE {LEASE} SET last_scan = :now WHERE singleton'), {'now': now})
             return now, hits
 
