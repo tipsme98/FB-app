@@ -112,6 +112,48 @@ class NativePostgres(unittest.TestCase):
                          [(group[0]['Initial_Odds'], 20, '1-0', '1')] * 2)
         self.assertEqual(self.store.review_day(self.ev.kickoff.date(), [fixture(self.ev)]), (set(), True))
 
+    def test_82_candidates_preserve_first_stability_window_and_room_for_new_probes(self):
+        """The observed production queue size, with synthetic finals and no ledger writes."""
+        mids = [str(int(self.ev.mid) + i) for i in range(82)]
+        self.sql(f'''INSERT INTO {es.BETS} ("ID", "Tipsme_Match_ID", "Status", "Match_Date")
+            SELECT 'queue-' || n, n, 'Open', :day FROM unnest(CAST(:mids AS text[])) AS n''',
+                 mids=mids, day=self.ev.kickoff.date())
+        seen, ready, new_per_scan = set(), {}, []
+        for scan in range(13):
+            if scan:
+                self.now += timedelta(minutes=11)  # scheduler jitter; do not assume exact cadence
+            lease, queue = self.store.claim('observe')
+            self.assertEqual(len(set(queue)), es.MAX_MATCHES)
+            new_per_scan.append(len(set(queue) - seen))
+            seen.update(queue)
+            for mid in queue:
+                if self.store.observe(lease, self.now, mid, replace(self.ev, mid=mid), 'normal_final'):
+                    ready.setdefault(mid, scan * 11)
+                    self.store.record_reason(lease, mid, 'would_settle')
+        self.assertEqual(ready.get(mids[0]), 121)
+        self.assertGreaterEqual(min(new_per_scan), 2)
+        self.assertEqual(self.sql(f"SELECT count(*) FROM {es.BETS} WHERE \"Status\"='Open'"), [(82,)])
+        self.assertEqual(self.sql(f'SELECT count(*) FROM {es.RECEIPT}'), [(0,)])
+
+    def test_follow_up_slots_exclude_expired_and_already_mature_observations(self):
+        # The two old observations should wait behind unseen probe candidates.
+        # Only the fresh, unfinished timer should be promoted.
+        special = [str(int(self.ev.mid) + i) for i in range(12)]
+        self.sql(f'''INSERT INTO {es.BETS} ("ID", "Tipsme_Match_ID", "Status", "Match_Date")
+            SELECT 'case-' || n, n, 'Open', :day FROM unnest(CAST(:mids AS text[])) AS n''',
+                 mids=special, day=self.ev.kickoff.date())
+        for mid, first_age, last_age in [(special[-3], 41, 31), (special[-2], 130, 10), (special[-1], 15, 5)]:
+            self.sql(f'''INSERT INTO {es.STATE}
+              (match_id, fingerprint, first_good, last_good, last_attempt, reason)
+              VALUES (:mid, repeat('a',64), :first, :last, :last, 'normal_final')''',
+              mid=mid, first=self.now - timedelta(minutes=first_age),
+              last=self.now - timedelta(minutes=last_age))
+        _, queue = self.store.claim('observe')
+        self.assertIn(special[-1], queue)
+        self.assertNotIn(special[-2], queue)
+        self.assertNotIn(special[-3], queue)
+        self.assertEqual(len(queue), es.MAX_MATCHES)
+
     def test_write_gate_itself_rejects_119_minutes_and_stale_recheck(self):
         self.insert(slip(ev=self.ev))
         self.tick()
