@@ -7,6 +7,7 @@ import re
 import io
 import requests
 import itertools
+import fb_app_early_settlement as _early16413
 from copy import deepcopy
 from tempfile import NamedTemporaryFile
 from datetime import datetime, timedelta, timezone
@@ -26,7 +27,8 @@ from uuid import uuid4
 # V16.4.10：分開顯示主分頁與批次狀態；核對賽日前才分析／提交，保留逐步進度。
 # V16.4.11：自動分析及入庫只讀本批次已核對的快照，不讀手動表單的 widget。
 # V16.4.12：排程以有效日期及正式庫核對確認完成，不把缺值或掃描結束當成功。
-FB_APP_RELEASE = 'V16.4.12'
+# V17：已存在注單的提前結算，預設關閉。
+FB_APP_RELEASE = 'V17'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -1006,6 +1008,8 @@ V1512_FP_COLS = ['ID', 'Status', 'Bet_Type', 'Selection', 'Initial_Line', 'Initi
                  'Date', 'Match', 'Home_Team', 'Away_Team', 'Half_Score',
                  'System_Payout', 'User_Payout', 'Tournament_Name', 'Tournament_Category',
                  'League_Size', 'Home_Rating', 'Away_Rating', 'Home_Form', 'Away_Form']
+_V16413_RESULT_FP = ['Tipsme_Match_ID', 'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner',
+                     'Home_Red', 'Away_Red', 'Home_Yellow', 'Away_Yellow']
 
 def _v1512_is_main_db(filename):
     """V15.12：是否主資料庫檔 (需要差量備份保護)。"""
@@ -1016,7 +1020,7 @@ def _v1512_fp(df):
     try:
         import hashlib
         from decimal import Decimal, InvalidOperation
-        cols = [c for c in V1512_FP_COLS if c in df.columns]
+        cols = [c for c in V1512_FP_COLS + _V16413_RESULT_FP if c in df.columns]
         d = df[cols].astype('object').where(df[cols].notna(), '').astype(str)
         def number_string(v):
             try:
@@ -1025,9 +1029,13 @@ def _v1512_fp(df):
             except InvalidOperation:
                 return v
         for col in ('Initial_Line', 'Initial_Odds', 'System_Stake', 'User_Stake', 'System_Profit',
-                    'User_Profit', 'Unit_Profit', 'System_Payout', 'User_Payout', 'League_Size'):
+                    'User_Profit', 'Unit_Profit', 'System_Payout', 'User_Payout', 'League_Size',
+                    *_V16413_RESULT_FP):
             if col in d:
                 d[col] = d[col].map(number_string)
+        if 'Match_Date' in d:
+            # PostgreSQL DATE can arrive as datetime64 midnight via pandas or date via a direct query.
+            d['Match_Date'] = d['Match_Date'].str.replace(r'^(\d{4}-\d{2}-\d{2}) 00:00:00$', r'\1', regex=True)
         ids = df['ID'].astype(str).tolist()
         vals = d.values.tolist()
         fp = {}
@@ -1137,6 +1145,18 @@ def _v1512_save_sql_main(df, table_name, *, delete_ids=(), restore_ids=()):
             conn.execute(text('LOCK TABLE public."football_bets" IN SHARE ROW EXCLUSIVE MODE'))
             if not changed_ids and not deleted:
                 return True
+            # Deliberate edits/deletes require a fresh snapshot of a receipted slip, even after disabling the runner.
+            _guard_ids = sorted(changed_ids | deleted)
+            for _offset in range(0, len(_guard_ids), 500):
+                _protected = _early16413.protected_current(conn, _guard_ids[_offset:_offset + 500])
+                if _protected:
+                    if len({str(r['ID']) for r in _protected}) != len(_protected):
+                        raise RuntimeError('已提前結算的注單有重複 ID；請核對正式庫')
+                    _current = _v1512_fp(enforce_columns(process_legacy_columns(pd.DataFrame(_protected)),
+                                                         DB_COLUMNS)) or {}
+                    if any(base.get(str(r['ID'])) != _current.get(str(r['ID']))
+                           or str(r['ID']) not in _current for r in _protected):
+                        raise RuntimeError('注單已在其他分頁提前結算或更新；請重開頁面並核對正式庫')
             conn.execute(text(f'CREATE TABLE IF NOT EXISTS public."{V164_TOMB_TABLE}" '
                               '("id" TEXT PRIMARY KEY, "deleted_at" TEXT)'))
             conn.execute(text(f'ALTER TABLE public."{V164_TOMB_TABLE}" ENABLE ROW LEVEL SECURITY'))
@@ -8810,6 +8830,11 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
     a = st.session_state.get('v15_auto')
     if not a or not a.get('active'):
         return
+    if a.get('sched') and _v16413_mode() in ('write', 'invalid'):
+        a['active'] = False
+        _v15_log(a, '05:00 覆檢不會繼續舊版自動結算批次；請核對正式庫。')
+        st.rerun()
+        return
     # V15.7：跨裝置互斥 — 狀態檔已被另一 session 接手 (sid 不符) 時自動停止本裝置，
     # 避免兩邊同時寫入 (不寫回狀態檔，以免覆蓋接手裝置的進度)
     if _v15_taken_over(a):
@@ -9345,6 +9370,91 @@ def _v16412_schedule_notice(day, window, msg):
     st.session_state['_v16412_schedule_notice'] = (day.isoformat(), window, msg)
 
 
+def _v16413_mode():
+    configured = os.environ.get('EARLY_SETTLE_MODE')
+    if configured is None and _has_secret('EARLY_SETTLE_MODE'):
+        configured = st.secrets['EARLY_SETTLE_MODE']
+    return _early16413.mode(configured)
+
+
+def _v16413_review_schedule(day, window, eligible):
+    """The write-mode 05:00 schedule is a reconciliation only, not a second writer."""
+    try:
+        engine = _v163_sql_engine()
+        if engine is None:
+            raise RuntimeError('missing SQL')
+        pending, consistent = _early16413.Postgres(engine, _v14_norm_team).review_day(day, eligible)
+        if pending or not consistent:
+            ids = '、'.join(sorted(pending)[:8]) or '無'
+            msg = (f'05:00 覆檢：{len(pending)} 場或舊注單組別待核對（{ids}），'
+                   f'提前結算憑證{"一致" if consistent else "有差異"}；未補建、未結算、未標記完成。')
+        elif _v1511_mark_done(day, window):
+            msg = '05:00 覆檢：正式庫與本日賽果及提前結算憑證一致，已記錄覆檢完成。'
+        else:
+            msg = '05:00 覆檢通過，但完成日期未獲確認。'
+    except Exception:
+        msg = '05:00 覆檢未能確認正式庫或提前結算憑證；未標記完成。'
+    _v16412_schedule_notice(day, window, msg)
+
+
+def _v16413_early_body():
+    run_mode = _v16413_mode()
+    if run_mode not in ('observe', 'write'):
+        return
+    if (not _v162_can_automate() or not _v10_settings_allow_automation()
+            or (st.session_state.get('v15_auto') or {}).get('active')
+            or st.session_state.get('editing_bet_id')
+            or st.session_state.get('_v16410_bet_unconfirmed')
+            or st.session_state.get('_v16412_settle_unconfirmed')):
+        return
+    now = get_hkt_now()
+    previous = st.session_state.get('_v16413_last_tick')
+    if previous is not None and timedelta(0) <= now - previous < timedelta(minutes=2):
+        return
+    st.session_state['_v16413_last_tick'] = now
+    engine = _v163_sql_engine()
+    if engine is None:
+        st.warning('提前結算未執行：沒有正式 PostgreSQL，未寫入任何注單。')
+        return
+    try:
+        scan = _early16413.early_scan(
+            _early16413.Postgres(engine, _v14_norm_team), _early16413.Tipsme(_v14_norm_team), run_mode,
+            lambda rows, ev, odds: _early16413.build_plan(
+                rows, ev, odds, norm=_v14_norm_team, calculate=calculate_settlement,
+                parse_line=_tipsme_cap_value, odds_entry=_tipsme_oh_entry,
+                merge_history=merge_odds_history_snapshots))
+        if scan:
+            st.session_state['_v16413_early_summary'] = {mid: code for mid, (code, _) in scan.items()}
+        written = set().union(*(ids for _, ids in scan.values()))
+        if written:
+            cloud = _v161_sql_read_bets(allow_empty=True)
+            current = st.session_state.get('df_db')
+            if cloud is not None and current is not None:
+                saved = cloud.loc[cloud['ID'].astype(str).isin(written)]
+                if len(saved) == len(written) and saved['Status'].eq('Settled').all():
+                    saved = enforce_columns(saved, DB_COLUMNS)
+                    remain = current.loc[~current['ID'].astype(str).isin(written)]
+                    st.session_state['df_db'] = pd.concat([remain, saved], ignore_index=True)
+                    st.session_state.setdefault('_v1641_sql_base', {}).update(_v1512_fp(saved) or {})
+                    st.rerun()
+            st.warning('提前結算已獲正式庫確認，畫面未刷新；請重開頁面，不要重送。')
+    except Exception as exc:
+        if _v15_is_control_exc(exc):
+            raise
+        st.warning('提前結算未能確認監察表或正式庫狀態；沒有使用 CSV 或 GitHub 後備寫入。')
+    summary = st.session_state.get('_v16413_early_summary')
+    if summary:
+        st.caption(f'提前結算 ({run_mode})：' + '；'.join(f'{mid} {code}' for mid, code in summary.items()))
+
+
+def _v16413_render_early():
+    run_mode = _v16413_mode()
+    if run_mode == 'invalid':
+        st.warning('EARLY_SETTLE_MODE 不正確；提前結算及 05:00 自動排程暫停。')
+    elif run_mode != 'off':
+        st.fragment(run_every=60)(_v16413_early_body)()
+
+
 def _v16412_finish_schedule(a):
     day = _v16412_date(a['rdate'])
     window = _v16412_window(a)
@@ -9373,6 +9483,9 @@ def _v1511_sched_try_start(df_db):
             st.session_state.get('_v16412_settle_unconfirmed')):
         return False
     if (st.session_state.get('v15_auto') or {}).get('active'):
+        return False
+    early_mode = _v16413_mode()
+    if early_mode == 'invalid':
         return False
     now = get_hkt_now()
     day = now.date() - timedelta(days=1)
@@ -9405,6 +9518,9 @@ def _v1511_sched_try_start(df_db):
     eligible = _v15_build_queue_date(sched, None, yday, cfg['t0'], cfg['t1'])
     if not eligible:
         _v16412_schedule_notice(day, window, '賽果來源未列出時段內完場賽事，未標記完成；稍後再查。')
+        return False
+    if early_mode == 'write':
+        _v16413_review_schedule(day, window, eligible)
         return False
     official = _v16412_authoritative_bets()
     if official is None:
@@ -11898,6 +12014,7 @@ def main():
     v15_render_remote_status()
     v1511_render_sched_status()   # V15.11：每日排程背景檢查 (每 5 分鐘)
     v16_render_clv_recorder()     # V16：開賽前 CLV 記錄器背景檢查 (每 5 分鐘)
+    _v16413_render_early()        # V17：預設關閉；活躍 Streamlit session
 
     t_pre, t_follow, t_inplay, t_settle, t_ai, t_time_pnl, t_clv = st.tabs(["📝 賽前建檔與投注", "👤 用家跟投", "⏱️ 即場賽事與預測", "⚖ 賽果結算與管理", "🤖 全局模型", "📅 時間維度盈虧記錄分析", "🎯 CLV 與本金模擬"])
 
