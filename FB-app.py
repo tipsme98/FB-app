@@ -7833,16 +7833,30 @@ def tipsme_fetch_bookmaker_odds(match_id):
         return None
     return out
 
-def tipsme_fetch_hkjc_odds(match_id):
+def tipsme_fetch_hkjc_odds(match_id, *, shadow_only=False):
     """讀取馬會全部玩法賠率變化 (Score/odds/hkjc API)"""
-    txt = _tipsme_get(f"{TIPSME_API_BASE}/Score/odds/hkjc/{match_id}")
-    if not txt:
-        return None
+    if shadow_only:
+        # Bounded supplementary request only. No retries/failover or changes to the
+        # production request broker / working host.
+        if not re.fullmatch(r"[1-9]\d{0,19}", str(match_id)):
+            return None
+        host = TIPSME_API_HOSTS[_TIPSME_WORKING_HOST['idx'] % len(TIPSME_API_HOSTS)]
+        try:
+            response = requests.get(f"{host}/Score/odds/hkjc/{match_id}", headers=TIPSME_HEADERS,
+                                    timeout=(2, 3), allow_redirects=False)
+            txt = response.text if response.status_code == 200 else None
+        except requests.RequestException:
+            txt = None
+    else:
+        txt = _tipsme_get(f"{TIPSME_API_BASE}/Score/odds/hkjc/{match_id}")
     try:
-        d = json.loads(txt)
-        return d if isinstance(d, dict) else None
+        d = json.loads(txt) if txt else None
     except Exception:
-        return None
+        d = None
+    data = d if isinstance(d, dict) else None
+    if data is not None or shadow_only:
+        _t30_shadow_relay("odds", data, match_id)
+    return data
 
 def _tipsme_oh_entry(eid, btype, rec_time, line, upper, lower):
     up, lw = float(upper), float(lower)
@@ -8384,6 +8398,7 @@ def tipsme_fetch_day_results(date_str, timeout=25, *, require_complete=False, ki
     except Exception:
         return None, f'無法辨認日期：{date_str}'
     by_id = {}
+    _shadow_conflicts = set()
     dates = (d0, d1)
     if kickoff_window:
         start, end = kickoff_window
@@ -8431,6 +8446,10 @@ def tipsme_fetch_day_results(date_str, timeout=25, *, require_complete=False, ki
                                          or _tipsme_hkt_kickoff(x) is None):
                     return None, f'賽果未讀齊：{_d} 第 {page} 頁有完場賽事缺 ID、隊名或香港時間。'
                 if str(mid).isdigit() and int(mid):
+                    if _t30_shadow_enabled() and require_complete and (prior := by_id.get(int(mid))):
+                        if (_tipsme_hkt_kickoff(prior), *(prior.get(k) for k in ('home','away','score','corner'))) != (
+                                _tipsme_hkt_kickoff(x), *(x.get(k) for k in ('home','away','score','corner'))):
+                            _shadow_conflicts.add(int(mid))
                     by_id.setdefault(int(mid), x)
             if not pp.get('hasNextPage'):
                 break
@@ -8476,6 +8495,8 @@ def tipsme_fetch_day_results(date_str, timeout=25, *, require_complete=False, ki
     matches.sort(key=lambda r: r.get('match_time') or 0)
     if not matches:
         return ([] if require_complete else None), f'{date_str} 沒有已完場比賽。'
+    if require_complete and _t30_shadow_enabled():
+        _t30_shadow_relay("results", [r for r in matches if r['hkjc_match_id'] not in _shadow_conflicts])
     return matches, (f'已讀取 {date_str} 全日賽果：{len(matches)} 場已完場比賽 (全部聯賽；'
                      f'Tipsme 賽果日期為滾動窗口，已自動合併相鄰兩天並以馬會 ID 去重)')
 
@@ -9905,7 +9926,8 @@ def tipsme_fetch_today_schedule():
     """V16：讀取 Tipsme 首頁 __NEXT_DATA__ 的 matchSchedules — 今日全部比賽
     (含未開賽)，每場含 matchId/主客隊/聯賽/開賽時間/isHkjc。賽果頁只列已完場，
     未開賽比賽的唯一來源是首頁。回傳 list (空 list = 讀取失敗)。"""
-    url = 'https://tipsme.hk/zh-HK/'
+    # Canonical URL: /zh-HK/ can return a 308 before the no-redirect curl fallback sees HTML.
+    url = 'https://tipsme.hk/zh-HK'
     html = _tipsme_fetch_page_html(url, marker='matchSchedules')
     if not html:
         return []
@@ -9926,12 +9948,18 @@ def tipsme_fetch_today_schedule():
                 if ko is None:
                     continue
                 ko = ko.replace(tzinfo=HKT)
+                shadow_fields = {}
+                if _t30_shadow_enabled():
+                    utc_ko = _tipsme_hkt_kickoff({'fullMatchTimeUtc': x.get('fullMatchTimeUtc')})
+                    hkt_ko = _tipsme_hkt_kickoff({'fullMatchTime': x.get('fullMatchTime')})
+                    shadow_fields = {'shadow_status': x.get('matchStatus'), 'shadow_is_hkjc': x.get('isHkjc'),
+                                     'shadow_kickoff_conflict': bool(utc_ko and hkt_ko and utc_ko != hkt_ko)}
                 out.append({'round': 0, 'day': ko.strftime('%Y-%m-%d'),
                             'hkjc_match_id': mid,
                             'home': str(x.get('home') or ''), 'away': str(x.get('away') or ''),
                             'league': str(x.get('leagueName') or ''),
                             'match_time': ko.timestamp(), 'finished': False,
-                            'is_hkjc': bool(x.get('isHkjc'))})
+                            'is_hkjc': bool(x.get('isHkjc')), **shadow_fields})
             except Exception:
                 continue
         return out
@@ -9945,6 +9973,7 @@ def _v16_today_cache():
     if c and (now.timestamp() - float(c.get('ts') or 0)) < 240:
         return c.get('matches') or []
     matches = tipsme_fetch_today_schedule()
+    _t30_shadow_relay("schedule", matches)
     if matches:
         st.session_state['_v16_sched_cache'] = {'ts': now.timestamp(), 'matches': matches}
         return matches
@@ -10181,6 +10210,171 @@ def _v18_clv_then_slot():
         if _v15_is_control_exc(exc):
             raise
         st.caption('時段結算：本次檢查未能完成；未確認的注單留待原每日排程。')
+
+
+def _t30_shadow_enabled():
+    # Explicit process setting + runner only; no implicit failover to a viewer.
+    return os.environ.get("FB_APP_SHADOW_MODE") == "observe" and _v162_is_runner()
+
+
+def _t30_shadow_context():
+    import fb_app_t30_shadow as shadow
+    key = (os.environ.get("FB_APP_SHADOW_DIR", ""), os.environ.get("FB_APP_SHADOW_PROFILE", ""))
+    current = st.session_state.get("_t30_shadow_context")
+    if current is None or current[0] != key:
+        store = shadow.Store(key[0])
+        profile = shadow.Profile.from_file(key[1]) if key[1] else None
+        current = (key, store, profile)
+        st.session_state["_t30_shadow_context"] = current
+    return current[1:]
+
+
+def _t30_shadow_relay(kind, value, match_id=None):
+    """Research errors never alter the existing return value or status of a production fetch."""
+    if not _t30_shadow_enabled():
+        return
+    try:
+        observed = get_hkt_now().timestamp()
+        store, profile = _t30_shadow_context()
+        if kind == "schedule":
+            store.ingest_schedule(value, observed)
+        elif kind == "odds":
+            store.capture(match_id, value, observed, profile)
+        elif kind == "results":
+            store.ingest_results(value, observed)
+    except Exception as exc:
+        if _v15_is_control_exc(exc):
+            raise
+        st.session_state["_t30_shadow_last_error"] = type(exc).__name__
+
+
+def _t30_shadow_tick():
+    import hashlib
+    import inspect
+    from pathlib import Path
+    import fb_app_parameter_lab as lab
+    from fb_app_t30_shadow import HistoryUnavailable
+
+    store, profile = _t30_shadow_context()
+    clock = lambda: get_hkt_now().timestamp()
+    if store.reserve("schedule-refresh", clock(), 240):
+        _v16_today_cache()  # Shared refresh. Its failure fallback is not sent as a new observation.
+    model_data = None
+    evidence = None
+
+    def score(fixture, now):
+        nonlocal model_data, evidence
+        if model_data is None:
+            raw = st.session_state.get("df_db")
+            required = {"Status", "Match_Date", "Home_Team", "Away_Team", "Home_Goal", "Away_Goal", "Odds_History"}
+            if raw is None or not required.issubset(raw.columns):
+                raise HistoryUnavailable("No history already loaded")
+            relevant = required | {"Home_Corner", "Away_Corner", "Home_Recent_Matches",
+                                   "Away_Recent_Matches", "Tournament_Name", "Bet_Type", "Tipsme_Match_ID"}
+            model_data = raw.loc[raw["Status"].eq("Settled"), sorted(relevant.intersection(raw.columns))].copy()
+            if model_data.empty:
+                model_data = None
+                raise HistoryUnavailable("No settled history already loaded")
+            digest = hashlib.sha256(model_data.to_json(orient="split", index=False, date_format="iso",
+                                                       double_precision=15).encode()).hexdigest()
+            engine_sha256 = hashlib.sha256(Path(inspect.getfile(lab)).read_bytes()).hexdigest()
+            evidence = dict(training_input_sha256=digest, engine_sha256=engine_sha256, engine=lab.LAB_VERSION)
+        return lab.score_fixture(model_data, fixture, now=pd.Timestamp(now.replace(tzinfo=None))), evidence
+
+    count = store.run_due(clock, profile, score)
+    match_id = store.next_fetch(clock(), profile)
+    if match_id:
+        tipsme_fetch_hkjc_odds(match_id, shadow_only=True)
+    return count, profile is not None
+
+
+def _t30_render_shadow():
+    if not _t30_shadow_enabled():
+        return
+
+    @st.fragment(run_every=30)
+    def tick():
+        if not _t30_shadow_enabled():
+            return
+        from fb_app_t30_shadow import decisions_csv
+
+        reasons = {
+            "source_unverified": "來源未核實",
+            "market_closed": "盤口已關閉",
+            "market_missing": "缺少盤口",
+            "market_status_unknown": "未能確認開放",
+            "invalid_two_sided_quote": "雙邊報價不完整或無效",
+            "quote_time_unknown": "缺少有效來源時間",
+            "quote_stale_or_after_cutoff": "報價不在採集時窗",
+            "quote_after_collection": "來源時間晚於採集",
+            "quote_fixture_mismatch": "報價屬另一場賽事",
+            "quote_conflict": "報價互相矛盾",
+            "quote_conflict_or_time_regression": "報價矛盾或時間倒退",
+            "fixture_not_verified_prematch": "未能確認尚未開賽",
+            "fixture_details_missing": "賽事資料不全",
+            "schedule_not_fresh": "賽程未能更新或本次未見該場",
+            "schedule_conflict": "賽程時間互相矛盾",
+            "identity_conflict": "賽事身份不符",
+            "rescheduled": "開賽時間已更改",
+            "no_cutoff_capture": "時窗內沒有採集紀錄",
+            "decision_window_missed": "超出決策時限",
+            "odds_unavailable": "未能取得報價",
+            "training_or_model_unavailable": "歷史資料或該盤模型不足",
+            "engine_rejected_inputs": "引擎未能接受資料或完成預測",
+        }
+        try:
+            count, configured = _t30_shadow_tick()
+        except Exception as exc:
+            if _v15_is_control_exc(exc):
+                raise
+            st.warning(f"T−30 影子本次未能執行（{type(exc).__name__}）；原流程不受影響。")
+            if "_t30_shadow_context" not in st.session_state:
+                return
+            count, configured = None, st.session_state["_t30_shadow_context"][2] is not None
+        state = "已載入來源設定；逐盤核對" if configured else "來源未核實；只記拒收，不出預測"
+        with st.expander("T−30 三盤本地影子｜" + state):
+            st.caption("讓球、入球大小、角球大小。只在主分頁保持連線時自動檢查，不是背景排程；不寫注單。")
+            if count is not None:
+                st.caption(f"上次完成檢查：{get_hkt_now():%Y-%m-%d %H:%M:%S}（香港）")
+            error = st.session_state.pop("_t30_shadow_last_error", None)
+            if error:
+                st.warning(f"影子紀錄有一次失敗（{error}）；原流程不受影響。")
+            try:
+                store, _ = _t30_shadow_context()
+                feed_state, feed_at = store.schedule_health(get_hkt_now().timestamp())
+                feed_text = {"waiting": "等候讀取", "unavailable": "未取得可用的新賽程",
+                             "loaded": "已讀取；不代表報價已核實"}[feed_state]
+                st.caption(f"賽程：{feed_text}" + (f"｜{feed_at}" if feed_at else ""))
+                rows = list(store.rows(recent=100))
+                if not rows:
+                    st.info("未有已鎖定的 T−30 紀錄。")
+                    return
+                view = []
+                for row in rows:
+                    reason = row["reason"]
+                    decision = row.get("forecast_建議")
+                    quarantined = row["fixture_state"] != "scheduled"
+                    label = (reasons.get(row["fixture_state"], "賽事已隔離") if quarantined else
+                             decision or reasons.get(reason, reason))
+                    view.append({"盤口": row["market"],
+                                 "狀態": f"拒收：{label}" if not decision or quarantined else f"預測：{label}",
+                                 "方向": None if quarantined else row.get("forecast_預測方向"),
+                                 "賽果": row.get("outcome") or ("有衝突，待核" if row["result_state"] == "conflict"
+                                                            else "待核") if decision and not quarantined else None,
+                                 "賽事": f'{row["home"]} 對 {row["away"]}', "開賽（香港）": row["kickoff"],
+                                 "主盤": row.get("quote_line"), "主／大賠率": row.get("quote_upper"),
+                                 "客／小賠率": row.get("quote_lower")})
+                st.caption("最近 100 場的已鎖定紀錄；窄畫面可橫向查看賽事及賠率。"
+                           "「略過」和「對照訊號」仍保留預測，不計模擬策略回報。")
+                st.dataframe(view, hide_index=True, width="stretch")
+                st.download_button("下載最近紀錄 CSV", decisions_csv(rows), "fb-app-t30-recent.csv",
+                                   "text/csv", key="_t30_shadow_csv", on_click="ignore")
+            except Exception as exc:
+                if _v15_is_control_exc(exc):
+                    raise
+                st.warning(f"暫時未能讀取影子紀錄（{type(exc).__name__}）。")
+    tick()
+
 
 def v16_render_clv_config():
     """V16：CLV 記錄器設定面板 (賽前 tab，每日排程設定下方)。"""
@@ -12312,6 +12506,7 @@ def main():
     v15_render_remote_status()
     v1511_render_sched_status()   # V15.11：每日排程背景檢查 (每 5 分鐘)
     v16_render_clv_recorder()     # V16：開賽前 CLV 記錄器背景檢查 (每 5 分鐘)
+    _t30_render_shadow()         # 預設關閉；只由指定主分頁執行三盤唯讀研究
 
     t_pre, t_follow, t_inplay, t_settle, t_ai, t_time_pnl, t_clv = st.tabs(["📝 賽前建檔與投注", "👤 用家跟投", "⏱️ 即場賽事與預測", "⚖ 賽果結算與管理", "🤖 全局模型", "📅 時間維度盈虧記錄分析", "🎯 CLV 與本金模擬"])
 
