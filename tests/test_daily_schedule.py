@@ -40,7 +40,7 @@ tipsme_fetch_match_info = lambda mid: dict(MATCH) if str(mid) == '999001' else N
 tipsme_fetch_h2h = lambda mid: None
 tipsme_fetch_bookmaker_odds = lambda mid: None
 tipsme_fetch_hkjc_odds = lambda mid: {'stub': True}
-tipsme_build_odds_history = lambda raw: (
+tipsme_build_odds_history = lambda raw, **kwargs: (
     [] if MODE == 'no_picks' else
     [{'id': 0, 'type': '入球大小', 'record_time': '11-20 23:30', 'line': 2.5,
       'upper': 1.88, 'lower': 1.88, 'unlock': True, 'margin': 1.06}], [])
