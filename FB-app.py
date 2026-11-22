@@ -27,7 +27,7 @@ from uuid import uuid4
 # V16.4.11：自動分析及入庫只讀本批次已核對的快照，不讀手動表單的 widget。
 # V16.4.12：排程以有效日期及正式庫核對確認完成，不把缺值或掃描結束當成功。
 # V18：香港固定時段可各自啟用，沿用既有結算；原每日排程及歷史補建保留。
-FB_APP_RELEASE = 'V18'
+FB_APP_RELEASE = 'V18.1'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -1553,20 +1553,26 @@ def _v1645_sql_read_bet_duplicates(match_id):
     """自動 BET 的唯讀防重預查；精確比對仍使用原有 Python 規則。"""
     if not match_id:
         return None
-    # 自動填充通常給標準正整數。其他形態保留原查詢及舊比對語義。
-    if not re.fullmatch(r'0|[1-9][0-9]{0,11}', match_id):
-        return _v161_sql_read_bets()
+    standard = re.fullmatch(r'0|[1-9][0-9]{0,11}', match_id) is not None
     try:
         engine = _v163_sql_engine()
         if engine is None:
             return None
         from sqlalchemy import text
+        projection = '''
+            SELECT "ID", "Tipsme_Match_ID", "Bet_Type", "Selection", "Initial_Line"
+            FROM public."football_bets"
+        '''
+        if not standard:
+            # 異形值仍讓原有 Python 正規化看全部列，只投影防重所用的五欄。
+            # 舊非標準分支在正式主表完全空白時保守回報不可確認，維持原行為。
+            with engine.connect() as conn:
+                rows = pd.read_sql_query(text(projection), conn)
+            return rows if not rows.empty else None
         # 普通十進位整數只傳本場；其他歷史表示法（如科學記號、非 ASCII
         # 空白/數字）保守地納入五欄候選，再由原有正規化決定是否同場。
         # 不把 ID 強制轉成數字，以免單一無效舊值令整個 SQL 失敗。
-        stmt = text(r'''
-            SELECT "ID", "Tipsme_Match_ID", "Bet_Type", "Selection", "Initial_Line"
-            FROM public."football_bets"
+        stmt = text(projection + r'''
             WHERE btrim(CAST("Tipsme_Match_ID" AS text)) <> ''
               AND (
                 btrim(CAST("Tipsme_Match_ID" AS text)) ~ :match_pattern
@@ -9431,6 +9437,45 @@ def _v16412_authoritative_bets():
         return None
 
 
+def _v18_daily_bet_precheck(day, *, engine=None):
+    """只讀每日排程預查的六欄；絕不用作 session 全表或差量寫入基準。"""
+    required = ('ID', 'Status', 'Match')
+    optional = ('Tipsme_Match_ID', 'Match_Date', 'Date')
+    try:
+        from sqlalchemy import text
+        if engine is None:
+            engine = _v163_sql_engine()
+        if engine is None or engine.dialect.name != 'postgresql':
+            return None
+        with engine.connect() as conn:
+            types = dict(conn.execute(text('''
+                SELECT attname, atttypid::regtype::text
+                FROM pg_catalog.pg_attribute
+                WHERE attrelid = 'public.football_bets'::regclass AND attnum > 0 AND NOT attisdropped
+                  AND attname IN ('ID', 'Status', 'Match', 'Tipsme_Match_ID', 'Match_Date', 'Date')
+            ''')).all())
+            if not set(required).issubset(types):
+                return None
+            # 舊表缺可選欄位時，用 NULL 保留舊 enforce_columns 的語義。
+            fields = ', '.join(f'b."{col}"' if col in types else f'NULL AS "{col}"'
+                               for col in (*required, *optional))
+            query = f'SELECT {fields} FROM public."football_bets" b'
+            params = {}
+            date_cols = [col for col in ('Match_Date', 'Date') if col in types]
+            # 只在日期型別可安全等價時下推日期；舊文字／帶時區格式必須保留
+            # 整個日期序列給原 pandas 解析，不將字串前綴當作權威賽日。
+            native = {'date', 'timestamp without time zone'}
+            if date_cols and all(types[col] in native for col in date_cols):
+                args = ', '.join(f'b."{col}"::date' for col in date_cols)
+                date_expr = f'COALESCE({args})' if len(date_cols) == 2 else args
+                query += f' WHERE {date_expr} = :day'
+                params['day'] = day
+            rows = pd.read_sql_query(text(query), conn, params=params)
+        return _v164_drop_tombs(rows)
+    except Exception:
+        return None
+
+
 def _v16412_match_rows(df, match, *, exact_id=False):
     """同香港賽日 + 來源 ID；無 ID 的舊注單須主客隊別名都一致。"""
     if df.empty:
@@ -9560,33 +9605,45 @@ def _v1511_try_daily():
     if not eligible:
         _v16412_schedule_notice(day, window, '賽果來源未列出時段內完場賽事，未標記完成；稍後再查。')
         return False
-    official = _v16412_authoritative_bets()
-    if official is None:
+    use_sql = _has_secret('DB_URL')
+    engine = _v163_sql_engine() if use_sql else None
+    projected = engine is not None and engine.dialect.name == 'postgresql'
+    precheck = _v18_daily_bet_precheck(day, engine=engine) if projected else _v16412_authoritative_bets()
+    if precheck is None:
         _v16412_schedule_notice(day, window, '未能讀取正式注單；未啟動寫入，稍後再查。')
         return False
-    q = [m for m in eligible if not _v16412_settled(_v16412_match_rows(official, m))]
+    q = [m for m in eligible if not _v16412_settled(_v16412_match_rows(precheck, m))]
+    # 完成後有未解決賽事，或寫入未獲確認時，不自動重送同一批次。
+    official = None
+    if q:
+        last = st.session_state.get('v15_auto') or {}
+        same_local = (last.get('sched') and not last.get('settlement_slot')
+                      and last.get('rdate') == yday and _v16412_window(last) == window)
+        try:
+            daily = pd.read_csv(DAILY_STATUS_FILE).iloc[0].to_dict()
+        except (OSError, ValueError, IndexError):
+            daily = None
+        same_remote = any(r and str(r.get('daily')) == '1'
+                          and not isinstance(r.get('settlement_slot'), str) and str(r.get('rdate')) == yday
+                          and str(r.get('win')) == window and _v15_status_phase(r) == 'closed'
+                          for r in (_s, daily))
+        if same_local or same_remote:
+            _v16412_schedule_notice(day, window, f'仍有 {len(q)} 場未確認完成；請核對正式庫及批次紀錄，未自動重送。')
+            return False
+        official = _v16412_authoritative_bets() if projected else precheck
+        if official is None:
+            _v16412_schedule_notice(day, window, '未能讀取正式注單；未啟動寫入，稍後再查。')
+            return False
+        if projected:
+            # 窄讀只作預查；啟動前依同一完整正式快照重算全部候選及寫入基準。
+            q = [m for m in eligible if not _v16412_settled(_v16412_match_rows(official, m))]
     if not q:
         ok = _v1511_mark_done(day, window)
         _v16412_schedule_notice(day, window, ('正式庫確認全部已結算。' if ok else
                                               '正式庫已核對，但排程完成日期未獲確認；稍後再查。'))
         return False
-    # 完成後有未解決賽事，或寫入未獲確認時，不自動重送同一批次。
-    last = st.session_state.get('v15_auto') or {}
-    same_local = (last.get('sched') and not last.get('settlement_slot')
-                  and last.get('rdate') == yday and _v16412_window(last) == window)
-    try:
-        daily = pd.read_csv(DAILY_STATUS_FILE).iloc[0].to_dict()
-    except (OSError, ValueError, IndexError):
-        daily = None
-    same_remote = any(r and str(r.get('daily')) == '1'
-                      and not isinstance(r.get('settlement_slot'), str) and str(r.get('rdate')) == yday
-                      and str(r.get('win')) == window and _v15_status_phase(r) == 'closed'
-                      for r in (_s, daily))
-    if same_local or same_remote:
-        _v16412_schedule_notice(day, window, f'仍有 {len(q)} 場未確認完成；請核對正式庫及批次紀錄，未自動重送。')
-        return False
     st.session_state['df_db'] = official
-    if _has_secret('DB_URL'):
+    if use_sql:
         st.session_state['_v1641_sql_base'] = _v1512_fp(official) or {}
         st.session_state['_v1641_fallback_base'] = False
     st.session_state['tipsme_schedule'] = sched
