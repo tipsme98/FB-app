@@ -23,6 +23,8 @@ def base(**overrides):
         "Initial_Line": 2.75, "Initial_Odds": 1.95, "Match_Date": KICK.date().isoformat(),
         "Date": ENTRY_AT.strftime("%Y-%m-%d %H:%M"), "Odds_History": "[]", "Status": "Settled",
         "System_Stake": 0.0, "User_Stake": 0.0, "Match": "合成場", "Note": "",
+        "System_Profit": 0.0, "User_Profit": 0.0, "User_Payout": 0.0,
+        "Unit_Profit": 0.0, "Result_Label": "走盤",
         "Home_Team": "主隊", "Away_Team": "客隊",
     }, **overrides)
 
@@ -155,13 +157,22 @@ class Archive(unittest.TestCase):
 
 
 class StreamlitPanel(unittest.TestCase):
-    def boot(self, rows):
-        names = {"CLV_GROUPS", "_V16_CLV_HOLDER", "_v16_db_content_sig", "_v16_clv_rows", "render_clv_section"}
-        wrapper = ("import pandas as pd\nimport streamlit as st\n"
+    shared = {"CLV_GROUPS", "_V16_CLV_HOLDER", "_v16_db_content_sig", "_v16_clv_rows"}
+
+    def boot(self, rows, *, full=False):
+        names = self.shared | {"render_clv_section"}
+        if full:
+            names |= {"render_clv_tab", "render_legacy_clv_section", "compute_legacy_bet_clv",
+                      "v9_clean_bt", "_oh_sort_ts", "parse_dt_for_comparison", "v10_parse_time",
+                      "get_hkt_now", "HKT", "render_monte_carlo_section", "build_mc_records",
+                      "run_bankroll_simulation"}
+        wrapper = ("import pandas as pd\nimport numpy as np\nimport streamlit as st\nimport json, re\n"
+                   "from datetime import datetime, timedelta, timezone\n"
                    "from fb_app_clv_cohorts import classify as classify_clv, ENTRY as CLV_ENTRY\n"
                    + "\n".join(ast.unparse(n) for n in nodes(names))
                    + f"\nframe = pd.DataFrame({rows!r}, index=list(range(719, 719+{len(rows)})))\n"
-                   + "render_clv_section(frame)\n"
+                   + ("def render_clv_closing_updater(*_): st.button('收盤更新測試替身')\n"
+                      "render_clv_tab(frame, None, None, 10000)\n" if full else "render_clv_section(frame)\n")
                    + "st.session_state['groups'] = _v16_clv_rows(frame).group.tolist()\n"
                    + "assert _v16_clv_rows(frame) is _v16_clv_rows(frame)\n"
                    + "if len(frame):\n"
@@ -169,6 +180,7 @@ class StreamlitPanel(unittest.TestCase):
                    + "    assert _v16_clv_rows(changed).group.eq('follow').all()\n")
         at = AppTest.from_string(wrapper).run()
         self.assertFalse(at.exception)
+        self.assertFalse(at.error)
         return at
 
     def test_reports_empty_as_missing_and_legitimate_zero_as_zero(self):
@@ -178,6 +190,72 @@ class StreamlitPanel(unittest.TestCase):
         at = self.boot([legacy, marked(quote(KICK-timedelta(minutes=2)))])
         self.assertEqual([m.value for m in at.metric], ["1 注", "+0.00%", "1 注"])
         self.assertEqual(at.session_state["groups"], ["historical_late", "snapshot"])
+
+    def test_restores_history_above_evidence_with_no_verified_samples(self):
+        def history(close):
+            # Reverse storage order to check date ordering; wrong lines must not be used.
+            return json.dumps([quote(KICK-timedelta(minutes=1), price=close),
+                               quote(KICK, price=1.10, line=3),
+                               quote(QUOTED)])
+
+        rows = [
+            base(ID="old", Date="2026-10-20 23:00", Match_Date="2026-10-20", Match="較早紀錄",
+                 Odds_History=history(1.95), Unit_Profit=-1),
+            base(ID="new", Match="較新紀錄", Odds_History=history(1.80), Unit_Profit=.95,
+                 System_Stake=10, System_Profit=9.5, Result_Label="全贏"),
+            base(ID="pending", Status="Pending", Odds_History=history(1.80)),
+            base(ID="single", Odds_History=json.dumps([quote(QUOTED)])),
+            base(ID="live", Bet_Type="入球大小 (即場)", Odds_History=history(1.80)),
+        ]
+        at = self.boot(rows, full=True)
+        headings = [m.value for m in at.markdown]
+        order = ["#### CLV (收盤線價值) 追蹤", "##### 分盤口類型 CLV 統計",
+                 "##### CLV 與賽果的關係", "##### 平均 CLV 按月趨勢",
+                 "##### 最近 15 注 CLV 明細", "#### 🎲 蒙地卡羅本金模擬", "#### 賽前快照證據分組（V18.1）"]
+        self.assertEqual(sorted(headings.index(heading) for heading in order),
+                         [headings.index(heading) for heading in order])
+        self.assertEqual(len(at.get("vega_lite_chart")), 1)
+        self.assertEqual([m.value for m in at.metric],
+                         ["2 注", "+4.17%", "+4.17%", "50.0%",
+                          "1", "100.0%", "+0.95U", "1", "0.0%", "-1.00U",
+                          "0 注", "無估計", "無樣本"])
+        self.assertEqual(at.dataframe[0].value.loc[0, "實注單位盈虧"], "+0.95U")
+        self.assertEqual(at.dataframe[1].value["Match"].tolist(), ["較新紀錄", "較早紀錄"])
+        self.assertEqual(at.dataframe[1].value["CLV"].tolist(), [8.33, 0.0])
+        evidence = at.dataframe[2].value
+        self.assertEqual(evidence["全部注數"].sum(), 5)
+        self.assertEqual(evidence["已結算"].sum(), 4)
+        at.selectbox(key="mc_account").select("User").run()
+        self.assertFalse(at.exception)
+        self.assertFalse(at.error)
+        self.assertTrue(any("User 帳戶" in m.value for m in at.info))
+
+    def test_preview_excel_and_csv_keep_missing_distinct_from_zero(self):
+        preview, = nodes({"preview_db_dialog"})
+        # Run the actual bets tab, avoiding unrelated management and any data writes.
+        preview.body = preview.body[:2]
+        preview.decorator_list = []
+        names = self.shared | {"_v16_search_mask", "_V16_LIGHT_SEARCH_COLS", "_V16_JSON_HEAVY_COLS"}
+        rows = [base(ID="old", Odds_History=json.dumps([quote(QUOTED), quote(ENTRY_AT)])),
+                marked(quote(KICK-timedelta(minutes=2)))]
+        setup = ("import io\nimport pandas as pd\nimport streamlit as st\n"
+                   "from unittest.mock import patch\n"
+                   "from fb_app_clv_cohorts import classify as classify_clv, ENTRY as CLV_ENTRY\n"
+                   + "\n".join(ast.unparse(n) for n in [*nodes(names), preview])
+                   + f"\nframe = pd.DataFrame({rows!r})\n")
+        for fmt, reader in (("xlsx", "read_excel"), ("csv", "read_csv")):
+            force_csv = ", patch.object(pd.DataFrame, 'to_excel', side_effect=RuntimeError)" if fmt == "csv" else ""
+            run = (f"with patch.object(st, 'download_button') as download{force_csv}:\n"
+                   "    preview_db_dialog(frame, None, None, None, None, None)\n"
+                   "    args = download.call_args.args\n"
+                   f"    assert args[2].endswith('.{fmt}')\n"
+                   f"    st.session_state['export'] = pd.{reader}(io.BytesIO(args[1]))\n")
+            at = AppTest.from_string(setup + run).run()
+            self.assertFalse(at.exception)
+            for table in (at.dataframe[0].value, at.session_state["export"]):
+                self.assertTrue(pd.isna(table.loc[0, "CLV%"]))
+                self.assertEqual(table.loc[1, "CLV%"], 0.0)
+                self.assertEqual(table.loc[1, "CLV_組別"], "可核對賽前快照")
 
 
 if __name__ == "__main__":

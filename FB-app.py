@@ -2061,6 +2061,45 @@ def compute_bet_clv(r):
     return classify_clv(r).clv
 
 
+def compute_legacy_bet_clv(r):
+    """V18 display-only metric: last same-line history quote, not verified closing evidence."""
+    try:
+        bt_raw = str(r.get('Bet_Type', ''))
+        if '即場' in bt_raw:
+            return None
+        bt = v9_clean_bt(bt_raw)
+        sel = str(r.get('Selection', ''))
+        if sel not in ('Home', 'Away', 'Over', 'Under'):
+            return None
+        ln = round(float(r.get('Initial_Line', 0.0)), 3)
+        odds = float(r.get('Initial_Odds'))
+        if not odds or odds <= 1.0:
+            return None
+        oh = json.loads(str(r.get('Odds_History', '[]')))
+        if not isinstance(oh, list) or len(oh) < 2:
+            return None
+        key = 'upper' if sel in ('Home', 'Over') else 'lower'
+        matched = []
+        for pos, h in enumerate(oh):
+            try:
+                raw_type = str(h.get('type', ''))
+                if '即場' in raw_type or v9_clean_bt(raw_type) != bt:
+                    continue
+                if round(float(h.get('line', 0.0)), 3) != ln:
+                    continue
+                v = float(h.get(key))
+                if v > 1.0:
+                    matched.append((pos, h, v))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        if len(matched) < 2:
+            return None
+        matched.sort(key=lambda item: (_oh_sort_ts(item[1], item[0]), item[0]))
+        return odds / matched[-1][2] - 1.0
+    except Exception:
+        return None
+
+
 def merge_odds_history_snapshots(existing_json, new_snaps):
     """把新的賠率快照合併入既有 Odds_History (只增不刪，依時間重排)。
     回傳 (新 JSON 字串, 新增數目)；完全相同 (類型/盤口線/時間/賠率) 的快照會被略過，
@@ -2212,6 +2251,71 @@ def render_clv_closing_updater(db_file, db_table):
         st.markdown("**最新快照（未必符合主 CLV）**")
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
+def render_legacy_clv_section(df_settled):
+    """Restore the V18 dashboard without mixing its sample with the evidence panel."""
+    st.markdown("#### CLV (收盤線價值) 追蹤")
+    st.caption("V18 歷史口徑：入注賠率 ÷ 同線末筆歷史賠率 − 1。正數代表所記錄的入注價較高。"
+               "末筆不一定是入注之後的報價；收盤回填亦可能得到 0%。此指標比較價格，不是預測命中率。")
+    if df_settled is None or df_settled.empty:
+        st.info("尚無已結算注單，無法計算 CLV。")
+        return
+    d = df_settled.copy()
+    d['CLV'] = pd.to_numeric(d.apply(compute_legacy_bet_clv, axis=1), errors='coerce')
+    valid = d[d['CLV'].notna()].copy()
+    if valid.empty:
+        st.info("現有已結算注單的同線賠率紀錄不足，未能計算 V18 歷史 CLV。")
+        return
+    values = valid['CLV']
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("可計算 CLV 的注單", f"{len(valid)} 注")
+    c2.metric("平均 CLV", f"{values.mean() * 100:+.2f}%")
+    c3.metric("CLV 中位數", f"{values.median() * 100:+.2f}%")
+    c4.metric("跑贏收盤線比率", f"{values.gt(0).mean() * 100:.1f}%")
+    if values.eq(0).mean() > 0.5:
+        st.info(f"有 {int(values.eq(0).sum()):,} 注的 V18 歷史 CLV 等於 0%。若末筆就是入注價或屬收盤回填，"
+                "0% 並不表示市場價格沒變。請另看下方的賽前快照證據分組。")
+
+    valid['_bt'] = valid['Bet_Type'].astype(str).apply(v9_clean_bt)
+    st.markdown("##### 分盤口類型 CLV 統計")
+    market_rows = []
+    for bt, g in valid.groupby('_bt'):
+        staked = pd.to_numeric(g['System_Stake'], errors='coerce').gt(0)
+        unit_sum = pd.to_numeric(g.loc[staked, 'Unit_Profit'], errors='coerce').sum()
+        market_rows.append({'盤口類型': bt, '注數': len(g),
+                            '平均CLV': f"{g['CLV'].mean() * 100:+.2f}%",
+                            '跑贏收盤率': f"{g['CLV'].gt(0).mean() * 100:.0f}%",
+                            '實注單位盈虧': f"{unit_sum:+.2f}U"})
+    st.dataframe(pd.DataFrame(market_rows), width="stretch", hide_index=True)
+
+    st.markdown("##### CLV 與賽果的關係")
+    st.caption("下面是這批已結算注單（含模擬注）的歷史結果，不是模型的樣本外精準度或長期盈利證明。")
+    ev1, ev2 = st.columns(2)
+    for col, label, part in ((ev1, "CLV 為正", valid[values.gt(0)]),
+                             (ev2, "CLV 為零或負", valid[values.le(0)])):
+        with col:
+            st.markdown(f"**{label}**")
+            if part.empty:
+                st.write("無樣本")
+                continue
+            unit = pd.to_numeric(part['Unit_Profit'], errors='coerce')
+            m1, m2, m3 = st.columns(3)
+            m1.metric("注數", f"{len(part)}")
+            m2.metric("命中率 (贏半或以上)", f"{unit.gt(0).mean() * 100:.1f}%")
+            m3.metric("單位盈虧", f"{unit.sum():+.2f}U")
+
+    valid['_month'] = valid['Match_Date'].fillna('').astype(str).str[:7]
+    monthly = valid[valid['_month'].ne('')].groupby('_month')['CLV'].mean().sort_index()
+    if not monthly.empty:
+        st.markdown("##### 平均 CLV 按月趨勢")
+        st.line_chart(pd.DataFrame({'平均CLV%': (monthly * 100).round(2)}), width="stretch")
+
+    st.markdown("##### 最近 15 注 CLV 明細")
+    cols = ['Date', 'Match', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 'CLV', 'Result_Label']
+    recent = valid.sort_values('Date', ascending=False).head(15).reindex(columns=cols)
+    recent['CLV'] = (recent['CLV'] * 100).round(2)
+    st.dataframe(recent, width="stretch", hide_index=True)
+
+
 CLV_GROUPS = {
     'snapshot': '可核對賽前快照',
     'historical_late': '歷史：賽日後登記（可能為收盤回填）',
@@ -2226,8 +2330,9 @@ CLV_GROUPS = {
 
 
 def render_clv_section(df):
-    st.markdown("#### CLV：只用可核對的賽前快照")
-    st.caption("原始價格 CLV = 記錄入注賠率 ÷ 同場、同方向、同線的近收盤賠率 − 1。"
+    st.markdown("#### 賽前快照證據分組（V18.1）")
+    st.caption("本區顯示報價證據覆蓋，並非預測命中率。"
+               "原始價格 CLV = 記錄入注賠率 ÷ 同場、同方向、同線的近收盤賠率 − 1。"
                "對照用完場後取得、開賽前 15 分鐘內且晚於入注的最後一筆合規報價。"
                "這是可核對的收盤近似，不是馬會成交證明、去水 EV 或盈利保證。")
     if df is None or df.empty:
@@ -2262,6 +2367,27 @@ def render_clv_section(df):
     cols = ['Date', 'Match', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', '對照賠率', '對照時間', 'CLV%']
     st.dataframe(valid.sort_values('Date', ascending=False).head(15)[cols].round({'CLV%': 2}),
                  width="stretch", hide_index=True)
+
+
+def render_clv_tab(df, db_file, db_table, sys_bankroll):
+    st.subheader("CLV (收盤線價值) 追蹤與蒙地卡羅本金模擬")
+    render_clv_closing_updater(db_file, db_table)
+    st.divider()
+    settled = df[df['Status'].eq('Settled')] if not df.empty else df.copy()
+    try:
+        render_legacy_clv_section(settled)
+    except Exception as e:
+        st.error(f"V18 歷史 CLV 追蹤發生錯誤：{e}")
+    st.divider()
+    try:
+        render_monte_carlo_section(settled, sys_bankroll)
+    except Exception as e:
+        st.error(f"蒙地卡羅模擬發生錯誤：{e}")
+    st.divider()
+    try:
+        render_clv_section(df)
+    except Exception as e:
+        st.error(f"賽前快照證據分組發生錯誤：{e}")
 
 
 def build_mc_records(df_settled, start_bankroll, stake_col='System_Stake', profit_col='System_Profit'):
@@ -14232,21 +14358,7 @@ def main():
         render_time_dimension_pnl_tab(df_settled_tdp, sys_bankroll, sys_max_stake)
 
     with t_clv:
-        st.subheader("CLV 追蹤與蒙地卡羅本金模擬")
-        st.caption("CLV 比較入注與近收盤價格；歷史本金模擬獨立顯示，不是主 CLV 的盈利驗證。")
-        _df_all_clv = st.session_state.df_db
-        render_clv_closing_updater(db_file, db_table)
-        st.divider()
-        _df_settled_clv = _df_all_clv[_df_all_clv['Status'] == 'Settled'].copy() if not _df_all_clv.empty else _df_all_clv.copy()
-        try:
-            render_clv_section(_df_all_clv)
-        except Exception as e:
-            st.error(f"CLV 追蹤發生錯誤：{e}")
-        st.divider()
-        try:
-            render_monte_carlo_section(_df_settled_clv, sys_bankroll)
-        except Exception as e:
-            st.error(f"蒙地卡羅模擬發生錯誤：{e}")
+        render_clv_tab(st.session_state.df_db, db_file, db_table, sys_bankroll)
 
     with t_ai:
         st.subheader("🤖 全局模型與績效分析")
