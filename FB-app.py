@@ -7,7 +7,6 @@ import re
 import io
 import requests
 import itertools
-import fb_app_early_settlement as _early16413
 from copy import deepcopy
 from tempfile import NamedTemporaryFile
 from datetime import datetime, timedelta, timezone
@@ -27,8 +26,8 @@ from uuid import uuid4
 # V16.4.10：分開顯示主分頁與批次狀態；核對賽日前才分析／提交，保留逐步進度。
 # V16.4.11：自動分析及入庫只讀本批次已核對的快照，不讀手動表單的 widget。
 # V16.4.12：排程以有效日期及正式庫核對確認完成，不把缺值或掃描結束當成功。
-# V17：已存在注單的提前結算，預設關閉。
-FB_APP_RELEASE = 'V17'
+# V18：香港固定時段可各自啟用，沿用既有結算；原每日排程及歷史補建保留。
+FB_APP_RELEASE = 'V18'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -1008,8 +1007,8 @@ V1512_FP_COLS = ['ID', 'Status', 'Bet_Type', 'Selection', 'Initial_Line', 'Initi
                  'Date', 'Match', 'Home_Team', 'Away_Team', 'Half_Score',
                  'System_Payout', 'User_Payout', 'Tournament_Name', 'Tournament_Category',
                  'League_Size', 'Home_Rating', 'Away_Rating', 'Home_Form', 'Away_Form']
-_V16413_RESULT_FP = ['Tipsme_Match_ID', 'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner',
-                     'Home_Red', 'Away_Red', 'Home_Yellow', 'Away_Yellow']
+_RESULT_FP = ['Tipsme_Match_ID', 'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner',
+              'Home_Red', 'Away_Red', 'Home_Yellow', 'Away_Yellow']
 
 def _v1512_is_main_db(filename):
     """V15.12：是否主資料庫檔 (需要差量備份保護)。"""
@@ -1020,7 +1019,7 @@ def _v1512_fp(df):
     try:
         import hashlib
         from decimal import Decimal, InvalidOperation
-        cols = [c for c in V1512_FP_COLS + _V16413_RESULT_FP if c in df.columns]
+        cols = [c for c in V1512_FP_COLS + _RESULT_FP if c in df.columns]
         d = df[cols].astype('object').where(df[cols].notna(), '').astype(str)
         def number_string(v):
             try:
@@ -1030,7 +1029,7 @@ def _v1512_fp(df):
                 return v
         for col in ('Initial_Line', 'Initial_Odds', 'System_Stake', 'User_Stake', 'System_Profit',
                     'User_Profit', 'Unit_Profit', 'System_Payout', 'User_Payout', 'League_Size',
-                    *_V16413_RESULT_FP):
+                    *_RESULT_FP):
             if col in d:
                 d[col] = d[col].map(number_string)
         if 'Match_Date' in d:
@@ -1107,6 +1106,43 @@ def _v1512_backup_pending(df):
     except Exception:
         pass
 
+def _v18_check_slot_rows(conn, expected):
+    """Under the existing main-table write lock, reject changed, missing or duplicate rows."""
+    from sqlalchemy import text, bindparam
+    stmt = text('SELECT * FROM public."football_bets" WHERE "ID" IN :ids'
+                ).bindparams(bindparam('ids', expanding=True))
+    ordered = sorted(expected)
+    for offset in range(0, len(ordered), 500):
+        ids = ordered[offset:offset + 500]
+        rows = list(conn.execute(stmt, {'ids': ids}).mappings())
+        if len(rows) != len(ids) or any(r['Status'] != 'Open' for r in rows):
+            return False
+        current = _v1512_fp(enforce_columns(process_legacy_columns(pd.DataFrame(rows)), DB_COLUMNS))
+        if current != {rid: expected[rid] for rid in ids}:
+            return False
+    return True
+
+
+_V18_SETTLEMENT_COLUMNS = (
+    'Status', 'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner', 'Home_Red', 'Away_Red',
+    'Home_Yellow', 'Away_Yellow', 'Half_Score', 'System_Profit', 'User_Profit',
+    'System_Payout', 'User_Payout', 'Unit_Profit', 'Result_Label', 'Odds_History',
+)
+
+
+def _v18_update_slot_rows(conn, changed):
+    """Update only settlement fields; never replace an existing bet or its analysis inputs."""
+    from sqlalchemy import text
+    cols = [col for col in _V18_SETTLEMENT_COLUMNS if col in changed]
+    set_fields = ', '.join(f'"{col}" = :v{i}' for i, col in enumerate(cols))
+    stmt = text(f"""UPDATE public."football_bets" SET {set_fields}
+                    WHERE "ID" = :rid AND "Status" = 'Open'""")
+    for rid, *values in changed[['ID', *cols]].itertuples(index=False, name=None):
+        params = {f'v{i}': (None if pd.isna(value) else value) for i, value in enumerate(values)}
+        if conn.execute(stmt, dict(params, rid=str(rid))).rowcount != 1:
+            raise RuntimeError('未能唯一更新待結算注單；整場交易已取消')
+
+
 def _v1512_save_sql_main(df, table_name, *, delete_ids=(), restore_ids=()):
     """主表安全寫入：缺列不是刪除；所有列替換、墓碑及 Undo 同一 PostgreSQL 交易。"""
     try:
@@ -1131,6 +1167,10 @@ def _v1512_save_sql_main(df, table_name, *, delete_ids=(), restore_ids=()):
         changed = df.loc[ids.isin(changed_ids)].copy()
         if changed['ID'].astype(str).duplicated().any():
             raise ValueError('待寫入注單包含重複 ID；原資料未變更')
+        slot_expected = st.session_state.get('_v18_slot_expected')
+        if slot_expected is not None and (not slot_expected or from_fallback or deleted or restored
+                or set(changed_ids) != set(slot_expected) or not changed['Status'].eq('Settled').all()):
+            raise ValueError('時段結算的待寫入注單與核對範圍不符；請核對正式庫')
         def batched(conn, query, values):
             values = sorted(values)
             stmt = text(query).bindparams(bindparam('ids', expanding=True))
@@ -1145,21 +1185,12 @@ def _v1512_save_sql_main(df, table_name, *, delete_ids=(), restore_ids=()):
             conn.execute(text('LOCK TABLE public."football_bets" IN SHARE ROW EXCLUSIVE MODE'))
             if not changed_ids and not deleted:
                 return True
-            # Deliberate edits/deletes require a fresh snapshot of a receipted slip, even after disabling the runner.
-            _guard_ids = sorted(changed_ids | deleted)
-            for _offset in range(0, len(_guard_ids), 500):
-                _protected = _early16413.protected_current(conn, _guard_ids[_offset:_offset + 500])
-                if _protected:
-                    if len({str(r['ID']) for r in _protected}) != len(_protected):
-                        raise RuntimeError('已提前結算的注單有重複 ID；請核對正式庫')
-                    _current = _v1512_fp(enforce_columns(process_legacy_columns(pd.DataFrame(_protected)),
-                                                         DB_COLUMNS)) or {}
-                    if any(base.get(str(r['ID'])) != _current.get(str(r['ID']))
-                           or str(r['ID']) not in _current for r in _protected):
-                        raise RuntimeError('注單已在其他分頁提前結算或更新；請重開頁面並核對正式庫')
-            conn.execute(text(f'CREATE TABLE IF NOT EXISTS public."{V164_TOMB_TABLE}" '
-                              '("id" TEXT PRIMARY KEY, "deleted_at" TEXT)'))
-            conn.execute(text(f'ALTER TABLE public."{V164_TOMB_TABLE}" ENABLE ROW LEVEL SECURITY'))
+            if slot_expected is not None and not _v18_check_slot_rows(conn, slot_expected):
+                raise RuntimeError('時段結算的正式注單已變更；請重新載入並核對，不要重送')
+            if slot_expected is None:
+                conn.execute(text(f'CREATE TABLE IF NOT EXISTS public."{V164_TOMB_TABLE}" '
+                                  '("id" TEXT PRIMARY KEY, "deleted_at" TEXT)'))
+                conn.execute(text(f'ALTER TABLE public."{V164_TOMB_TABLE}" ENABLE ROW LEVEL SECURITY'))
             if deleted:
                 now = get_hkt_now().strftime('%Y-%m-%d %H:%M:%S')
                 conn.execute(text(f'INSERT INTO public."{V164_TOMB_TABLE}" ("id", "deleted_at") '
@@ -1169,13 +1200,17 @@ def _v1512_save_sql_main(df, table_name, *, delete_ids=(), restore_ids=()):
                 batched(conn, f'DELETE FROM public."{V164_TOMB_TABLE}" WHERE "id" IN :ids', restored)
             tombs = {str(r[0]) for r in conn.execute(
                 text(f'SELECT "id" FROM public."{V164_TOMB_TABLE}"'))}
+            if slot_expected is not None and set(slot_expected) & tombs:
+                raise RuntimeError('時段結算包含已刪除注單；未寫入')
             changed = changed.loc[~changed['ID'].astype(str).isin(tombs)]
             write_ids = set(changed['ID'].astype(str))
             if write_ids:
                 tbl_cols = {c['name'] for c in _sa_inspect(conn).get_columns(table_name, schema='public')}
                 for c in changed.columns:
                     if c not in tbl_cols:
-                        if c not in DB_COLUMNS:
+                        if slot_expected is not None and c not in _V18_SETTLEMENT_COLUMNS:
+                            continue
+                        if slot_expected is not None or c not in DB_COLUMNS:
                             raise ValueError(f'非主表欄位：{c}')
                         conn.execute(text(f'ALTER TABLE public."football_bets" ADD COLUMN "{c}" TEXT'))
                 # 未知或只在舊快照出現的 ID 不能覆蓋當前 SQL；已結算不能被其他
@@ -1205,7 +1240,8 @@ def _v1512_save_sql_main(df, table_name, *, delete_ids=(), restore_ids=()):
                 keep = write_ids - (restored & states.keys())
                 changed = changed.loc[changed['ID'].astype(str).isin(keep)]
                 write_ids = keep
-                if {'Tournament_Name', 'Tournament_Category', 'League_Size', 'Home_Rating', 'Away_Rating'} <= set(changed):
+                if slot_expected is None and {'Tournament_Name', 'Tournament_Category', 'League_Size',
+                                               'Home_Rating', 'Away_Rating'} <= set(changed):
                     if _sa_inspect(conn).has_table('football_settings', schema='public'):
                         rule_rows = conn.execute(text(f'''SELECT "Key", "Value" FROM {_V10_SQL_TABLE}
                                                          WHERE "Key" LIKE 'TS|%' '''))
@@ -1220,12 +1256,15 @@ def _v1512_save_sql_main(df, table_name, *, delete_ids=(), restore_ids=()):
                         old = existing_dates.get(str(changed.at[idx, 'ID']))
                         if not is_missing_match_date(old) and is_missing_match_date(changed.at[idx, 'Match_Date']):
                             changed.at[idx, 'Match_Date'] = str(old)[:10]
-            batched(conn, 'DELETE FROM public."football_bets" WHERE "ID" IN :ids', deleted | write_ids)
-            if write_ids:
-                for col in changed.columns:
-                    if changed[col].dtype == 'object':
-                        changed[col] = changed[col].map(lambda x: str(x) if pd.notna(x) else None)
-                changed.to_sql(table_name, conn, schema='public', if_exists='append', index=False)
+            if slot_expected is not None:
+                _v18_update_slot_rows(conn, changed)
+            else:
+                batched(conn, 'DELETE FROM public."football_bets" WHERE "ID" IN :ids', deleted | write_ids)
+                if write_ids:
+                    for col in changed.columns:
+                        if changed[col].dtype == 'object':
+                            changed[col] = changed[col].map(lambda x: str(x) if pd.notna(x) else None)
+                    changed.to_sql(table_name, conn, schema='public', if_exists='append', index=False)
         # 僅在 COMMIT 成功後記錄 SQL 基準；備份成功不能推進 SQL 基準。
         st.session_state['_v1641_sql_base'] = {**{i:h for i,h in base.items() if i not in deleted},
                                              **{i:fp[i] for i in write_ids}}
@@ -8323,7 +8362,7 @@ def tipsme_fetch_season_schedule(url, timeout=25):
         return None, f'讀取賽程頁失敗: {e}'
 
 
-def tipsme_fetch_day_results(date_str, timeout=25, *, require_complete=False):
+def tipsme_fetch_day_results(date_str, timeout=25, *, require_complete=False, kickoff_window=None):
     """V15.10 賽果日期模式：讀取指定日曆日 (香港時間 00:00–23:59) 全部聯賽的已完場比賽。
     Tipsme 賽果頁 (/zh-HK/results?date=D&page=N) 的「日期」是 [D-1 16:00, D 16:00) 的
     滾動窗口 (2026-11-16 實測)，因此完整覆蓋日曆日 D 需讀取 D 與 D+1 兩天再合併
@@ -8339,7 +8378,15 @@ def tipsme_fetch_day_results(date_str, timeout=25, *, require_complete=False):
     except Exception:
         return None, f'無法辨認日期：{date_str}'
     by_id = {}
-    for _d in (d0.strftime('%Y-%m-%d'), d1.strftime('%Y-%m-%d')):
+    dates = (d0, d1)
+    if kickoff_window:
+        start, end = kickoff_window
+        # Do not require an irrelevant (possibly future) date page for morning slots.
+        if end < '16:00':
+            dates = (d0,)
+        elif start >= '16:00':
+            dates = (d1,)
+    for _d in (d.strftime('%Y-%m-%d') for d in dates):
         page = 1
         while page <= 40:
             url = f'https://tipsme.hk/zh-HK/results?date={_d}&page={page}'
@@ -8570,7 +8617,10 @@ def _v15_finish_summary(a):
     a['active'] = False
     a['finished'] = True
     a.pop('prepared', None)
-    if a.get('sched') and a.get('rdate'):
+    if a.get('settlement_slot'):
+        a['slot_verified'] = not _failed and a.get('done', 0) == len(_q)
+        _v15_log(a, '時段批次結束；未完場或未成功結算的賽事不在本時段重送，留待翌日原排程／人工核對。')
+    elif a.get('sched') and a.get('rdate'):
         _v16412_finish_schedule(a)
     _v15_save_remote(a)
 
@@ -8830,11 +8880,6 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
     a = st.session_state.get('v15_auto')
     if not a or not a.get('active'):
         return
-    if a.get('sched') and _v16413_mode() in ('write', 'invalid'):
-        a['active'] = False
-        _v15_log(a, '05:00 覆檢不會繼續舊版自動結算批次；請核對正式庫。')
-        st.rerun()
-        return
     # V15.7：跨裝置互斥 — 狀態檔已被另一 session 接手 (sid 不符) 時自動停止本裝置，
     # 避免兩邊同時寫入 (不寫回狀態檔，以免覆蓋接手裝置的進度)
     if _v15_taken_over(a):
@@ -8896,7 +8941,7 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
                 _v15_skip_match(a, m, '填充', '未能刷新正式注單做防重核對；未寫入注單。')
                 return
         _dt = _v15_sched_date(m)
-        _dup = (_v16412_match_rows(df_db, m) if a.get('sched') else
+        _dup = (_v16412_match_rows(df_db, m, exact_id=bool(a.get('settlement_slot'))) if a.get('sched') else
                 v14_find_duplicate_match(df_db, m['home'], m['away'], _dt, tipsme_id=m.get('hkjc_match_id')))
         if _dup is not None and not _dup.empty:
             if (_dup['Status'].astype(str) == 'Open').any():
@@ -8916,6 +8961,9 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
             a['tries'] = 0
             _v15_save_remote(a)
             st.rerun()
+            return
+        if a.get('settlement_slot'):
+            _v15_skip_match(a, m, '時段結算', '找不到符合的既有注單；本時段不補建注單。')
             return
         _murl = f"https://tipsme.hk/zh-HK/match/{m['hkjc_match_id']}/chat"
         with st.spinner(f"🤖 自動填充 ({a['idx'] + 1}/{len(q)})：{_v15_mlabel(m)} {m['home']} vs {m['away']} ..."):
@@ -8981,7 +9029,7 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
 
     if step in ('SETTLE_READ', 'SETTLE_CONFIRM'):
         if a.get('sched'):
-            _rows = _v16412_match_rows(df_db, m)
+            _rows = _v16412_match_rows(df_db, m, exact_id=bool(a.get('settlement_slot')))
             _group = v10_match_groups(_rows[_rows['Status'].eq('Open')])
             _lab = None
             if len(_group) == 1:
@@ -9043,8 +9091,12 @@ def _v15_save_remote(a, *, publish=True):
             'updated_ts': int(now.timestamp()),
             'log': json.dumps((a.get('log') or [])[-15:], ensure_ascii=False),
         }
+        if a.get('settlement_slot'):
+            _row['settlement_slot'] = a['settlement_slot']
+            _row['slot_verified'] = '1' if a.get('slot_verified') else '0'
         frame = pd.DataFrame([_row])
-        for path in ([AUTO_STATUS_FILE, DAILY_STATUS_FILE] if a.get('sched') else [AUTO_STATUS_FILE]):
+        for path in ([AUTO_STATUS_FILE, DAILY_STATUS_FILE]
+                     if a.get('sched') and not a.get('settlement_slot') else [AUTO_STATUS_FILE]):
             with NamedTemporaryFile(mode='w', encoding='utf-8', newline='', delete=False,
                                     dir=os.path.dirname(os.path.abspath(path)), prefix='.auto-status-') as f:
                 tmp = f.name
@@ -9132,7 +9184,10 @@ def _v15_render_remote_body():
         if not _recent or not _log:
             return
         _result = ("已掃描，有場次待跟進" if _n(_s.get('failed')) else "已完成") if str(_s.get('finished')) == '1' else "已停止或結束"
-        if str(_s.get('daily')) == '1':
+        if isinstance(_s.get('settlement_slot'), str) and _s['settlement_slot']:
+            _result = ("時段結算已核對本批次注單" if str(_s.get('slot_verified')) == '1'
+                       else "已停止或掃描結束（時段結算；未確認項目須核對）")
+        elif str(_s.get('daily')) == '1':
             _result = "已確認完成" if str(_s.get('daily_verified')) == '1' else "已停止或掃描結束（排程未確認完成）"
         st.info(f"最近批次{_result}（{_upd} 香港）：結算 {_n(_s.get('done'))} 場、"
                 f"寫入 {_n(_s.get('bets'))} 注、待手動 {_n(_s.get('failed'))} 場。")
@@ -9190,6 +9245,13 @@ SCHED_COLUMNS = ['Key', 'Value']
 SCHED_TABLE = 'football_schedule'
 SCHED_DEFAULTS = {'enabled': '0', 'time': '09:30', 't0': '00:00', 't1': '23:59',
                   'last_run': '', 'last_run_win': ''}
+_V18_SLOTS = {
+    '03:00': ('00:00', '02:59'), '06:00': ('03:00', '05:59'),
+    '09:00': ('06:00', '08:59'), '12:00': ('09:00', '11:59'),
+    '15:00': ('12:00', '14:59'), '18:00': ('15:00', '17:59'),
+    '21:00': ('18:00', '20:59'), '00:00': ('21:00', '23:59'),
+}
+_V18_SLOT_RETRY_SECONDS = 15 * 60
 
 
 def _v16412_date(value):
@@ -9215,6 +9277,15 @@ def _v16412_schedule_config(values):
         cfg['last_run'] = day.isoformat()
         if re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d-(?:[01]\d|2[0-3]):[0-5]\d', win):
             cfg['last_run_win'] = win
+    if 'settlement_slots' in values:
+        selected = set(str(values.get('settlement_slots') or '').split(',')) if isinstance(
+            values.get('settlement_slots'), str) else set()
+        cfg['settlement_slots'] = ','.join(slot for slot in _V18_SLOTS if slot in selected)
+    claimed = str(values.get('settlement_slot_claim') or '') if isinstance(
+        values.get('settlement_slot_claim'), str) else ''
+    if (len(claimed) == 16 and claimed[10] == ' ' and claimed[11:] in _V18_SLOTS
+            and _v16412_date(claimed[:10])):
+        cfg['settlement_slot_claim'] = claimed
     return cfg
 
 
@@ -9251,24 +9322,74 @@ def _v1511_sched_load(*, fresh=False):
     return cfg
 
 
-def _v1511_sched_save(cfg):
+def _v18_schedule_sql_table(conn):
+    from sqlalchemy import text
+    if conn.dialect.name == 'postgresql':
+        conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+        conn.execute(text('LOCK TABLE public."football_schedule" IN SHARE ROW EXCLUSIVE MODE'))
+        return 'public."football_schedule"'
+    return '"football_schedule"'
+
+
+def _v18_schedule_sql_values(conn, table):
+    from sqlalchemy import text
+    rows = list(conn.execute(text(f'SELECT "Key", "Value" FROM {table}')))
+    values = dict(rows)
+    if len(rows) != len(values):
+        raise ValueError('排程設定有重複鍵')
+    return values
+
+
+def _v18_schedule_sql_put(conn, table, updates, old):
+    from sqlalchemy import text
+    for key, value in updates.items():
+        if key not in old:
+            conn.execute(text(f'INSERT INTO {table} ("Key", "Value") VALUES (:key, :value)'),
+                         {'key': key, 'value': value})
+        elif old[key] != value:
+            conn.execute(text(f'UPDATE {table} SET "Value" = :value WHERE "Key" = :key'),
+                         {'key': key, 'value': value})
+
+
+def _v1511_sched_save(cfg, *, settings_only=False):
     """只以正式儲存的寫入回應及重新讀取結果確認，不寫本地後備。"""
     try:
         cfg = _v16412_schedule_config(cfg)
-        frame = pd.DataFrame(cfg.items(), columns=SCHED_COLUMNS)
+        cfg.pop('settlement_slot_claim', None)
+        settings = {'enabled', 'time', 't0', 't1', 'settlement_slots'}
         st.session_state['_v1511_sched_cache'] = None
         if _has_secret('DB_URL'):
             engine = _v163_sql_engine()
             if engine is None:
                 return False
+            from sqlalchemy import inspect
             with engine.begin() as conn:
-                frame.to_sql(SCHED_TABLE, conn, if_exists='replace', index=False)
+                schema = 'public' if conn.dialect.name == 'postgresql' else None
+                if not inspect(conn).has_table(SCHED_TABLE, schema=schema):
+                    if cfg.get('settlement_slots'):
+                        return False  # 新時段不建立資料表。
+                    pd.DataFrame(cfg.items(), columns=SCHED_COLUMNS).to_sql(
+                        SCHED_TABLE, conn, schema=schema, if_exists='fail', index=False)
+                else:
+                    table = _v18_schedule_sql_table(conn)
+                    old = _v18_schedule_sql_values(conn, table)
+                    if settings_only:
+                        updates = {k: v for k, v in cfg.items() if k in settings}
+                    else:
+                        current = _v16412_schedule_config(old)
+                        if any(current[k] != cfg[k] for k in ('enabled', 'time', 't0', 't1')):
+                            return False
+                        updates = {k: cfg[k] for k in ('last_run', 'last_run_win')}
+                    _v18_schedule_sql_put(conn, table, updates, old)
         elif _has_secret('GITHUB_TOKEN') and _has_secret('GITHUB_REPO'):
+            frame = pd.DataFrame(cfg.items(), columns=SCHED_COLUMNS)
             if not save_db_github(frame, st.secrets['GITHUB_REPO'], SCHED_FILE, st.secrets['GITHUB_TOKEN']):
                 return False
         else:
             return False
-        confirmed = _v1511_sched_load(fresh=True) == cfg
+        actual = _v1511_sched_load(fresh=True)
+        checked = settings if settings_only else {'enabled', 'time', 't0', 't1', 'last_run', 'last_run_win'}
+        confirmed = bool(actual) and all(actual.get(k) == cfg[k] for k in checked & cfg.keys())
         if not confirmed:
             st.session_state['_v1511_sched_cache'] = None
         return confirmed
@@ -9310,7 +9431,7 @@ def _v16412_authoritative_bets():
         return None
 
 
-def _v16412_match_rows(df, match):
+def _v16412_match_rows(df, match, *, exact_id=False):
     """同香港賽日 + 來源 ID；無 ID 的舊注單須主客隊別名都一致。"""
     if df.empty:
         return df
@@ -9325,6 +9446,8 @@ def _v16412_match_rows(df, match):
         return tuple(map(_v14_norm_team, parts))
     both = df['Match'].map(pair).map(
         lambda p: p == (_v14_norm_team(match['home']), _v14_norm_team(match['away'])))
+    if exact_id:
+        return df[(ids == str(match['hkjc_match_id'])) & both]
     return df[(ids == str(match['hkjc_match_id'])) |
               (ids.str.lower().isin(('', 'none', 'nan', '<na>')) & both)]
 
@@ -9370,91 +9493,6 @@ def _v16412_schedule_notice(day, window, msg):
     st.session_state['_v16412_schedule_notice'] = (day.isoformat(), window, msg)
 
 
-def _v16413_mode():
-    configured = os.environ.get('EARLY_SETTLE_MODE')
-    if configured is None and _has_secret('EARLY_SETTLE_MODE'):
-        configured = st.secrets['EARLY_SETTLE_MODE']
-    return _early16413.mode(configured)
-
-
-def _v16413_review_schedule(day, window, eligible):
-    """The write-mode 05:00 schedule is a reconciliation only, not a second writer."""
-    try:
-        engine = _v163_sql_engine()
-        if engine is None:
-            raise RuntimeError('missing SQL')
-        pending, consistent = _early16413.Postgres(engine, _v14_norm_team).review_day(day, eligible)
-        if pending or not consistent:
-            ids = '、'.join(sorted(pending)[:8]) or '無'
-            msg = (f'05:00 覆檢：{len(pending)} 場或舊注單組別待核對（{ids}），'
-                   f'提前結算憑證{"一致" if consistent else "有差異"}；未補建、未結算、未標記完成。')
-        elif _v1511_mark_done(day, window):
-            msg = '05:00 覆檢：正式庫與本日賽果及提前結算憑證一致，已記錄覆檢完成。'
-        else:
-            msg = '05:00 覆檢通過，但完成日期未獲確認。'
-    except Exception:
-        msg = '05:00 覆檢未能確認正式庫或提前結算憑證；未標記完成。'
-    _v16412_schedule_notice(day, window, msg)
-
-
-def _v16413_early_body():
-    run_mode = _v16413_mode()
-    if run_mode not in ('observe', 'write'):
-        return
-    if (not _v162_can_automate() or not _v10_settings_allow_automation()
-            or (st.session_state.get('v15_auto') or {}).get('active')
-            or st.session_state.get('editing_bet_id')
-            or st.session_state.get('_v16410_bet_unconfirmed')
-            or st.session_state.get('_v16412_settle_unconfirmed')):
-        return
-    now = get_hkt_now()
-    previous = st.session_state.get('_v16413_last_tick')
-    if previous is not None and timedelta(0) <= now - previous < timedelta(minutes=2):
-        return
-    st.session_state['_v16413_last_tick'] = now
-    engine = _v163_sql_engine()
-    if engine is None:
-        st.warning('提前結算未執行：沒有正式 PostgreSQL，未寫入任何注單。')
-        return
-    try:
-        scan = _early16413.early_scan(
-            _early16413.Postgres(engine, _v14_norm_team), _early16413.Tipsme(_v14_norm_team), run_mode,
-            lambda rows, ev, odds: _early16413.build_plan(
-                rows, ev, odds, norm=_v14_norm_team, calculate=calculate_settlement,
-                parse_line=_tipsme_cap_value, odds_entry=_tipsme_oh_entry,
-                merge_history=merge_odds_history_snapshots))
-        if scan:
-            st.session_state['_v16413_early_summary'] = {mid: code for mid, (code, _) in scan.items()}
-        written = set().union(*(ids for _, ids in scan.values()))
-        if written:
-            cloud = _v161_sql_read_bets(allow_empty=True)
-            current = st.session_state.get('df_db')
-            if cloud is not None and current is not None:
-                saved = cloud.loc[cloud['ID'].astype(str).isin(written)]
-                if len(saved) == len(written) and saved['Status'].eq('Settled').all():
-                    saved = enforce_columns(saved, DB_COLUMNS)
-                    remain = current.loc[~current['ID'].astype(str).isin(written)]
-                    st.session_state['df_db'] = pd.concat([remain, saved], ignore_index=True)
-                    st.session_state.setdefault('_v1641_sql_base', {}).update(_v1512_fp(saved) or {})
-                    st.rerun()
-            st.warning('提前結算已獲正式庫確認，畫面未刷新；請重開頁面，不要重送。')
-    except Exception as exc:
-        if _v15_is_control_exc(exc):
-            raise
-        st.warning('提前結算未能確認監察表或正式庫狀態；沒有使用 CSV 或 GitHub 後備寫入。')
-    summary = st.session_state.get('_v16413_early_summary')
-    if summary:
-        st.caption(f'提前結算 ({run_mode})：' + '；'.join(f'{mid} {code}' for mid, code in summary.items()))
-
-
-def _v16413_render_early():
-    run_mode = _v16413_mode()
-    if run_mode == 'invalid':
-        st.warning('EARLY_SETTLE_MODE 不正確；提前結算及 05:00 自動排程暫停。')
-    elif run_mode != 'off':
-        st.fragment(run_every=60)(_v16413_early_body)()
-
-
 def _v16412_finish_schedule(a):
     day = _v16412_date(a['rdate'])
     window = _v16412_window(a)
@@ -9475,18 +9513,21 @@ def _v16412_finish_schedule(a):
     _v15_log(a, f'⏰ {msg}')
 
 
-def _v1511_sched_try_start(df_db):
-    """只在執行裝置已就緒及到時後嘗試前一日；每個日期／時段至少間隔 5 分鐘。"""
+def _v18_runner_ready(df_db):
     if df_db is None or not _v162_can_automate() or not _v10_settings_allow_automation():
         return False
     if (st.session_state.get('_v16410_bet_unconfirmed') or
             st.session_state.get('_v16412_settle_unconfirmed')):
         return False
-    if (st.session_state.get('v15_auto') or {}).get('active'):
-        return False
-    early_mode = _v16413_mode()
-    if early_mode == 'invalid':
-        return False
+    return not (st.session_state.get('v15_auto') or {}).get('active')
+
+
+def _v1511_sched_try_start(df_db):
+    """只在執行裝置已就緒及到時後嘗試前一日；每個日期／時段至少間隔 5 分鐘。"""
+    return _v18_runner_ready(df_db) and _v1511_try_daily()
+
+
+def _v1511_try_daily():
     now = get_hkt_now()
     day = now.date() - timedelta(days=1)
     cfg = _v1511_sched_load()
@@ -9519,9 +9560,6 @@ def _v1511_sched_try_start(df_db):
     if not eligible:
         _v16412_schedule_notice(day, window, '賽果來源未列出時段內完場賽事，未標記完成；稍後再查。')
         return False
-    if early_mode == 'write':
-        _v16413_review_schedule(day, window, eligible)
-        return False
     official = _v16412_authoritative_bets()
     if official is None:
         _v16412_schedule_notice(day, window, '未能讀取正式注單；未啟動寫入，稍後再查。')
@@ -9534,12 +9572,14 @@ def _v1511_sched_try_start(df_db):
         return False
     # 完成後有未解決賽事，或寫入未獲確認時，不自動重送同一批次。
     last = st.session_state.get('v15_auto') or {}
-    same_local = last.get('sched') and last.get('rdate') == yday and _v16412_window(last) == window
+    same_local = (last.get('sched') and not last.get('settlement_slot')
+                  and last.get('rdate') == yday and _v16412_window(last) == window)
     try:
         daily = pd.read_csv(DAILY_STATUS_FILE).iloc[0].to_dict()
     except (OSError, ValueError, IndexError):
         daily = None
-    same_remote = any(r and str(r.get('daily')) == '1' and str(r.get('rdate')) == yday
+    same_remote = any(r and str(r.get('daily')) == '1'
+                      and not isinstance(r.get('settlement_slot'), str) and str(r.get('rdate')) == yday
                       and str(r.get('win')) == window and _v15_status_phase(r) == 'closed'
                       for r in (_s, daily))
     if same_local or same_remote:
@@ -9562,13 +9602,170 @@ def _v1511_sched_try_start(df_db):
     _v15_save_remote(st.session_state['v15_auto'])
     return True
 
+
+def _v18_slot_due(now, cfg):
+    """Only the most recent boundary; midnight refers to the preceding Hong Kong day."""
+    end = now.replace(hour=now.hour // 3 * 3, minute=0, second=0, microsecond=0)
+    trigger = end.strftime('%H:%M')
+    if trigger not in (cfg.get('settlement_slots') or '').split(','):
+        return None
+    key = end.strftime('%Y-%m-%d %H:%M')
+    if key <= cfg.get('settlement_slot_claim', ''):
+        return None
+    day = (end - timedelta(hours=3)).date()
+    return key, day, *_V18_SLOTS[trigger]
+
+
+def _v18_claim_slot(engine, key):
+    """Persist an at-most-one start on the existing Key/Value table, before starting a writer."""
+    try:
+        with engine.begin() as conn:
+            if conn.dialect.name != 'postgresql':
+                return False
+            table = _v18_schedule_sql_table(conn)
+            values = _v18_schedule_sql_values(conn, table)
+            due = _v18_slot_due(get_hkt_now(), _v16412_schedule_config(values))
+            if not due or due[0] != key:
+                return False
+            _v18_schedule_sql_put(conn, table, {'settlement_slot_claim': key}, values)
+        st.session_state['_v1511_sched_cache'] = None
+        return True
+    except Exception:
+        st.session_state['_v1511_sched_cache'] = None
+        return False
+
+
+def _v18_open_match_ids(engine, day):
+    """Cheap preflight: matches only, without loading model features or odds histories."""
+    from sqlalchemy import text
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text('''
+                SELECT DISTINCT b."Tipsme_Match_ID"
+                FROM public."football_bets" b
+                WHERE b."Match_Date"::text = :day AND b."Status" = 'Open'
+                  AND NOT EXISTS (SELECT 1 FROM public."football_bets_deleted" d
+                                  WHERE d."id" = b."ID")
+            '''), {'day': day.isoformat()})
+            ids = (str(r[0]).strip() for r in rows)
+            return {re.sub(r'\.0+$', '', v) for v in ids if re.fullmatch(r'[1-9]\d{0,11}(?:\.0+)?', v)}
+    except Exception:
+        return None
+
+
+def _v18_try_slot():
+    if (not _has_secret('DB_URL') or st.session_state.get('editing_bet_id')
+            or st.session_state.get('_v16410_bet_unconfirmed')
+            or st.session_state.get('_v16412_settle_unconfirmed')):
+        return False
+    now = get_hkt_now()
+    cfg = _v1511_sched_load()
+    due = _v18_slot_due(now, cfg) if cfg else None
+    if not due:
+        return False
+    key, day, t0, t1 = due
+    attempt = st.session_state.get('_v18_slot_attempt')
+    if attempt and attempt[0] == key and now.timestamp() - attempt[1] < _V18_SLOT_RETRY_SECONDS:
+        return False
+    if _v15_status_phase(_v15_load_remote()) in ('running', 'unknown'):
+        return False
+    st.session_state['_v18_slot_attempt'] = (key, now.timestamp())
+    engine = _v163_sql_engine()
+    if engine is None or engine.dialect.name != 'postgresql':
+        return False
+    mids = _v18_open_match_ids(engine, day)
+    if not mids:
+        return False
+    ymd = day.isoformat()
+    sched, _ = tipsme_fetch_day_results(ymd, require_complete=True, kickoff_window=(t0, t1))
+    if not sched:
+        return False
+    eligible = [m for m in _v15_build_queue_date(sched, None, ymd, t0, t1)
+                if str(m['hkjc_match_id']) in mids
+                and all(m.get(k) is not None for k in ('home_goal', 'away_goal', 'home_corner', 'away_corner'))]
+    if not eligible:
+        return False
+    official = _v16412_authoritative_bets()
+    if official is None:
+        return False
+    queue = [m for m in eligible if _v16412_match_rows(official, m, exact_id=True)['Status'].eq('Open').any()]
+    fp = _v1512_fp(official) if queue else None
+    if not queue or not fp or _v15_status_phase(_v15_load_remote()) in ('running', 'unknown'):
+        return False
+    if not _v18_claim_slot(engine, key):
+        return False
+    st.session_state.update(df_db=official, _v1641_sql_base=fp, _v1641_fallback_base=False)
+    # Do not replace a manually loaded season's schedule in the settlement-only path.
+    st.session_state['v15_auto'] = {
+        'active': True, 'mode': 'date', 'rdate': ymd, 'sched': True, 'settlement_slot': key,
+        't0': t0, 't1': t1, 'rounds': [], 'queue': queue, 'idx': 0, 'step': 'FILL',
+        'log': [], 'tries': 0, 'err': 0, 'done': 0, 'bets': 0, 'failed': [], 'sid': _v15_new_sid(),
+    }
+    _v15_log(f'時段結算：{ymd} {t0}–{t1}（香港）有 {len(queue)} 場待核對並結算，不補建注單。')
+    _v15_save_remote(st.session_state['v15_auto'])
+    return True
+
+
+def _v18_slot_check_result(info, match):
+    """Require an actual match-detail response, not a copy of the results listing."""
+    if not info or not info.get('finished') or str(info.get('match_id')) != str(match['hkjc_match_id']):
+        return False
+    kickoff = info.get('kickoff')
+    if not isinstance(kickoff, datetime):
+        return False
+    ko_hkt = kickoff.astimezone(HKT) if kickoff.tzinfo else kickoff.replace(tzinfo=HKT)
+    if int(ko_hkt.timestamp()) // 60 != int(match['match_time']) // 60:
+        return False
+    if any(_v14_norm_team(info.get(k)) != _v14_norm_team(match.get(k)) for k in ('home', 'away')):
+        return False
+    for s, h, a in (('score', 'home_goal', 'away_goal'), ('corner', 'home_corner', 'away_corner'),
+                    ('half_score', 'home_half', 'away_half')):
+        pair = _tipsme_score_pair(info.get(s))
+        if None in pair or pair != (match.get(h), match.get(a)):
+            return False
+    return True
+
+
+def _v18_slot_close(rows, core, info):
+    """Do not consume a slot settlement if it would miss a same-line pre-kickoff price."""
+    if rows['Bet_Type'].astype(str).str.contains('即場').all():
+        return []
+    kickoff = info['kickoff']
+    if kickoff.tzinfo:
+        kickoff = kickoff.astimezone(HKT)
+    kickoff = kickoff.replace(tzinfo=None, second=0, microsecond=0)
+    safe, markets = [], set()
+    for quote in core or []:
+        try:
+            stamp = v10_parse_time(quote.get('record_time', ''), 'md', kickoff)
+            upper, lower = float(quote['upper']), float(quote['lower'])
+            line = round(float(quote['line']), 3)
+            if (stamp is None or stamp >= kickoff or not np.isfinite(line)
+                    or not (1 < upper < float('inf') and 1 < lower < float('inf'))):
+                continue
+            safe.append(quote)
+            markets.add((v9_clean_bt(quote['type']), line))
+        except (TypeError, ValueError, KeyError, AttributeError):
+            continue
+    # Match the existing CLV merger's team-name rule so a quote won't be approved and then silently skipped.
+    norm = lambda v: re.sub(r'[\s\-_·•]', '', str(v or ''))
+    for row in rows.loc[~rows['Bet_Type'].astype(str).str.contains('即場')].to_dict('records'):
+        try:
+            if ((v9_clean_bt(row['Bet_Type']), round(float(row['Initial_Line']), 3)) not in markets
+                    or any(norm(row[k]) != norm(info[v]) for k, v in (('Home_Team', 'home'), ('Away_Team', 'away')))):
+                return None
+        except (TypeError, ValueError, KeyError):
+            return None
+    return safe
+
+
 def _v1511_sched_body():
     """V15.11 排程背景檢查 (fragment 每 5 分鐘自動執行；每次頁面載入亦會執行)。"""
     cfg = _v1511_sched_load()
     if cfg is None:
         st.caption('⏰ 每日排程：未能確認雲端設定。')
         return
-    if cfg['enabled'] != '1':
+    if cfg['enabled'] != '1' and not cfg.get('settlement_slots'):
         return
     try:
         if _v1511_sched_try_start(st.session_state.get('df_db')):
@@ -9580,7 +9777,12 @@ def _v1511_sched_body():
         st.caption('⏰ 每日排程：本次檢查未能完成，稍後再查。')
         return
     cfg = _v1511_sched_load()
-    if cfg is None or cfg['enabled'] != '1':
+    if cfg is None:
+        return
+    if cfg.get('settlement_slots'):
+        claimed = cfg.get('settlement_slot_claim') or '未取得'
+        st.caption(f"時段結算（香港）：{cfg['settlement_slots']}；最近取得執行權：{claimed}（不代表已結算）。")
+    if cfg['enabled'] != '1':
         return
     _now = get_hkt_now()
     day = _now.date() - timedelta(days=1)
@@ -9592,7 +9794,7 @@ def _v1511_sched_body():
                    f"明日自動處理 {_now.strftime('%Y-%m-%d')} 的賽果)")
     elif st.session_state.get('_v16412_settle_unconfirmed') or st.session_state.get('_v16410_bet_unconfirmed'):
         st.warning(f"⏰ 每日排程：{_yday} 有寫入未獲確認；請核對正式庫，勿重送。")
-    elif a.get('active') and a.get('sched') and a.get('rdate') == _yday:
+    elif a.get('active') and a.get('sched') and not a.get('settlement_slot') and a.get('rdate') == _yday:
         st.caption(f'⏰ 每日排程：正在處理 {_yday} {_v16412_window(a)} 的賽果。')
     elif notice and notice[:2] == (_yday, _v16412_window(cfg)):
         st.caption(f'⏰ 每日排程：{_yday} {notice[2]}')
@@ -9908,9 +10110,20 @@ def v16_render_clv_recorder():
     except Exception:
         _frag = None
     if _frag is not None:
-        _frag(_v16_clv_body)()
+        _frag(_v18_clv_then_slot)()
     else:
-        _v16_clv_body()
+        _v18_clv_then_slot()
+
+
+def _v18_clv_then_slot():
+    _v16_clv_body()  # Prioritize the existing CLV snapshots and pre-match recording.
+    try:
+        if _v18_runner_ready(st.session_state.get('df_db')) and _v18_try_slot():
+            st.rerun()
+    except Exception as exc:
+        if _v15_is_control_exc(exc):
+            raise
+        st.caption('時段結算：本次檢查未能完成；未確認的注單留待原每日排程。')
 
 def v16_render_clv_config():
     """V16：CLV 記錄器設定面板 (賽前 tab，每日排程設定下方)。"""
@@ -10553,7 +10766,7 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
             v15_render_auto_panel(df_db)
 
         # --- V15.11 每日自動排程設定 (獨立於投注策略設定，儲存於 football_schedule_db.csv) ---
-        with st.expander("⏰ 每日自動排程 (定時自動讀取前一天賽果並輸入)"):
+        with st.expander("⏰ 自動結算排程（原每日排程及選用時段）"):
             _cfg = _v1511_sched_load() or SCHED_DEFAULTS
             _en = st.checkbox("啟用每日自動排程", value=str(_cfg.get('enabled')) == '1', key="v1511_en")
             _ct, _c0, _c1 = st.columns(3)
@@ -10563,14 +10776,26 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
                                  value=datetime.strptime(str(_cfg.get('t0') or '00:00'), '%H:%M').time())
             _w1 = _c1.time_input("時段結束", key="v1511_t1",
                                  value=datetime.strptime(str(_cfg.get('t1') or '23:59'), '%H:%M').time())
+            _choices = [f"{trigger} → {'前一日 ' if trigger == '00:00' else ''}{t0}–{t1}"
+                        for trigger, (t0, t1) in _V18_SLOTS.items()]
+            _enabled_slots = (_cfg.get('settlement_slots') or '').split(',')
+            _selected = st.multiselect("額外結算時段（香港時間，可選多個）", _choices,
+                                       default=[c for c in _choices if c[:5] in _enabled_slots],
+                                       key="v18_settlement_slots", disabled=not _has_secret('DB_URL'))
+            st.caption("額外時段只結算所選開賽範圍內已確認完場的既有注單，不補建；"
+                       "未完場、缺賽果或賽前同線賠率的賽事由翌日原排程或人工核對。"
+                       "不選時段即維持原狀；建議保留全日的原每日排程補漏。"
+                       "須有合資格分頁在線，並非獨立常駐排程。")
             if st.button("💾 儲存排程設定", key="v1511_save", use_container_width=True):
                 _new_cfg = {'enabled': '1' if _en else '0',
                             'time': _tm.strftime('%H:%M'), 't0': _w0.strftime('%H:%M'),
                             't1': _w1.strftime('%H:%M'),
                             'last_run': _cfg['last_run'], 'last_run_win': _cfg['last_run_win']}
+                if _has_secret('DB_URL') and (_selected or 'settlement_slots' in _cfg):
+                    _new_cfg['settlement_slots'] = ','.join(c[:5] for c in _selected)
                 if _new_cfg['t0'] > _new_cfg['t1']:
                     st.error("開始時間不可遲於結束時間。")
-                elif _v1511_sched_save(_new_cfg):
+                elif _v1511_sched_save(_new_cfg, settings_only=True):
                     st.toast("✅ 排程已儲存到雲端，所有裝置同步生效。", icon="⏰")
                     st.rerun()
                 else:
@@ -12030,7 +12255,6 @@ def main():
     v15_render_remote_status()
     v1511_render_sched_status()   # V15.11：每日排程背景檢查 (每 5 分鐘)
     v16_render_clv_recorder()     # V16：開賽前 CLV 記錄器背景檢查 (每 5 分鐘)
-    _v16413_render_early()        # V17：預設關閉；活躍 Streamlit session
 
     t_pre, t_follow, t_inplay, t_settle, t_ai, t_time_pnl, t_clv = st.tabs(["📝 賽前建檔與投注", "👤 用家跟投", "⏱️ 即場賽事與預測", "⚖ 賽果結算與管理", "🤖 全局模型", "📅 時間維度盈虧記錄分析", "🎯 CLV 與本金模擬"])
 
@@ -13567,7 +13791,7 @@ def main():
                                 if _try and _try.get('finished'):
                                     _sinfo, _src = _try, '注單記錄的比賽 ID'
                             # --- 來源 2/3：賽程數據 (本工作階段已載入，或即時貼連結讀取) ---
-                            if _sinfo is None:
+                            if _sinfo is None and not (_daily_settle and _sa15.get('settlement_slot')):
                                 _sched = st.session_state.get('tipsme_schedule')
                                 if not _sched and _sched_link2:
                                     with st.spinner("讀取賽程頁 (整季所有輪次)..."):
@@ -13612,6 +13836,8 @@ def main():
                             # --- 套用賽果 (與貼鏈結模式同一機制) ---
                             if _sinfo and _sinfo.get('finished'):
                                 if _daily_settle:
+                                    if _sa15.get('settlement_slot') and not _v18_slot_check_result(_sinfo, _daily_settle):
+                                        _v15_skip_match(_sa15, _daily_settle, '時段結算', '比賽明細與賽果列表不符，未結算。')
                                     _sko = _sinfo.get('kickoff')
                                     _goals = _tipsme_score_pair(_sinfo.get('score'))
                                     _corners = _tipsme_score_pair(_sinfo.get('corner'))
@@ -13639,6 +13865,11 @@ def main():
                                                 st.toast(f"🎯 已同時更新收盤價：{len(_upd_s)} 張注單共新增 {_add_s} 個快照", icon="🎯")
                                     except Exception:
                                         pass
+                                if _daily_settle and _sa15.get('settlement_slot'):
+                                    _verified_close = _v18_slot_close(target_bets, _sa15.get('closing'), _sinfo)
+                                    if _verified_close is None:
+                                        _v15_skip_match(_sa15, _daily_settle, '時段結算', '賽前同盤口及盤線賠率未核實，交原每日排程補漏。')
+                                    _sa15['closing'] = _verified_close
                                 st.session_state['tipsme_settle_apply'] = True
                                 # V14.12：自動模式 — 先與賽程頁賽果交叉核對，無誤才自動結算
                                 if _v15_on('SETTLE_READ'):
@@ -13839,6 +14070,16 @@ def main():
                 # V14.12：_v15_on('SETTLE_CONFIRM') 令自動模式走完全相同的手動結算路徑
                 if st.button("⚖️ 確定結算此賽事所有注單", type="primary", use_container_width=True) or _v15_on('SETTLE_CONFIRM'):
                     try:
+                        if _daily_settle and _sa15.get('settlement_slot'):
+                            _exact = _v16412_match_rows(target_bets, _daily_settle, exact_id=True)
+                            if (target_bets.empty or len(_exact) != len(target_bets)
+                                    or not _v18_slot_check_result(_ts_use, _daily_settle)
+                                    or _tipsme_score_pair(settle_half) != _tipsme_score_pair(_ts_use.get('half_score'))
+                                    or (settle_hred, settle_ared, settle_hyel, settle_ayel) != tuple(
+                                        int(_ts_use.get(k) or 0) for k in (
+                                            'home_red', 'away_red', 'home_yellow', 'away_yellow'))):
+                                _v15_skip_match(_sa15, _daily_settle, '時段結算',
+                                                '待結算注單或輸入未與核對後資料完全相符。')
                         if _daily_settle and (not _ts_use or
                                 _tipsme_score_pair(_ts_use.get('score')) != (settle_hg, settle_ag) or
                                 (None not in _tipsme_score_pair(_ts_use.get('corner')) and
@@ -13910,7 +14151,13 @@ def main():
                             settlement.at[idx, 'Result_Label'] = res_label
 
                         try:
-                            _settle_ok = bool(save_db(settlement, db_file, db_table, keep_local_on_failure=False))
+                            if _daily_settle and _sa15.get('settlement_slot'):
+                                st.session_state['_v18_slot_expected'] = (
+                                    _v1512_fp(st.session_state.df_db.loc[idx_to_settle]) or {})
+                            try:
+                                _settle_ok = bool(save_db(settlement, db_file, db_table, keep_local_on_failure=False))
+                            finally:
+                                st.session_state.pop('_v18_slot_expected', None)
                             if _settle_ok and _daily_settle:
                                 _settle_ok = _v16412_settlement_recorded(settlement.loc[idx_to_settle])
                         except Exception as exc:
