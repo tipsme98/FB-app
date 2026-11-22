@@ -1,0 +1,2769 @@
+diff --git a/FB-app manual.md b/FB-app manual.md
+index 64312c7..f21d21b 100644
+--- a/FB-app manual.md	
++++ b/FB-app manual.md	
+@@ -1,4 +1,18 @@
+-# V17｜賽後提前結算（預設關閉）
++# V18｜三小時時段結算與 05:00 補漏
++
++2026-11-22 香港時間。本地候選，未推送 GitHub、未部署、未改正式資料。以 [029 最後核對的 GitHub 基線](https://github.com/tipsme98/FB-app/commit/fe91b922c44e666e1bc2a408c47a506d02a37601) 為準，保留 [PR #6 跟注排序](https://github.com/tipsme98/FB-app/pull/6)。
++
++- **已移除：** V17 賽後兩小時計時、觀察、寫入模式、憑證覆檢程式、舊遷移檔與其專用測試。賽前兩小時 CLV 快照是另一功能，沒有移除。程式回退不會刪改資料。
++- **新選項：** 側欄「自動結算排程」可逐個選取 00:00、03:00、06:00、09:00、12:00、15:00、18:00、21:00；預設不選。時段按香港開賽時間劃分，不按完場時間。00:00 處理前一晚 21:00–23:59；其他觸發處理同日之前三小時。
++- **結算範圍：** 只結算已建檔、同 ID／香港賽日、已核實完場的 `Open` 注單，不為未建檔場次製造樣本。讀取賽果列表及同場明細，核對半場、全場及角球；賽前注單須有同盤線的開賽前收盤價。未完場、資料不足或未獲正式庫確認均不報完成。時段取得執行權不等於結算成功。
++- **每日排程：** 建議保留翌日 05:00 結算前一日 00:00–23:59，補結及建原本會生成的學習樣本。時段結算不寫每日完成標記。賽前自動入庫、手動操作、CLV、分析模型、注碼及派彩公式沿用原機制。
++- **依賴及限制：** 使用既有 `DB_URL` 和 `football_schedule` 設定表，無新表、欄位、密鑰或 Supabase 遷移。既有 `football_bets`、`football_bets_deleted` 仍須可讀；新時段的設定與寫入若不能查證則不執行。[Streamlit 定時檢查](https://docs.streamlit.io/develop/api-reference/execution-flow/st.fragment) 約每五分鐘，須有活躍且可執行的分頁；[Cloud 休眠](https://docs.streamlit.io/deploy/streamlit-community-cloud/manage-your-app) 或關頁時不保證準點，也不補跑過期時段。
++
++部署前驗證、排程對照、停用及回退見 `V18 驗證與操作.md`；最新 PDF 保留 029 歷史佐證，不能把歷史的遷移和兩小時步驟當作現行指引。
++
++<hr>
++
++# 歷史紀錄：V17 賽後提前結算（V18 已移除）
+ 
+ 2026-11-21 香港時間。V17 是以 [V16.4.12 已核對程式](https://github.com/tipsme98/FB-app/commit/0d66641135444888b47b636934d4804629493965) 為基線重建的 V16.4.13 候選之正式版本名稱，功能邏輯不變。本次 GitHub 發布不包含執行正式 Supabase 遷移、啟用提早寫入、修改排程設定或補錄注單。GitHub 合併、Cloud 正式 App 載入和正式資料庫驗收是不同狀態，以最新 PDF 的個別核對紀錄為準。
+ 
+diff --git a/FB-app.py b/FB-app.py
+index 50874b1..546653c 100644
+--- a/FB-app.py
++++ b/FB-app.py
+@@ -7,7 +7,6 @@ import re
+ import io
+ import requests
+ import itertools
+-import fb_app_early_settlement as _early16413
+ from copy import deepcopy
+ from tempfile import NamedTemporaryFile
+ from datetime import datetime, timedelta, timezone
+@@ -27,8 +26,8 @@ from uuid import uuid4
+ # V16.4.10：分開顯示主分頁與批次狀態；核對賽日前才分析／提交，保留逐步進度。
+ # V16.4.11：自動分析及入庫只讀本批次已核對的快照，不讀手動表單的 widget。
+ # V16.4.12：排程以有效日期及正式庫核對確認完成，不把缺值或掃描結束當成功。
+-# V17：已存在注單的提前結算，預設關閉。
+-FB_APP_RELEASE = 'V17'
++# V18：香港固定時段可各自啟用，沿用既有結算；原每日排程及歷史補建保留。
++FB_APP_RELEASE = 'V18'
+ # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
+ #
+ #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
+@@ -1008,8 +1007,8 @@ V1512_FP_COLS = ['ID', 'Status', 'Bet_Type', 'Selection', 'Initial_Line', 'Initi
+                  'Date', 'Match', 'Home_Team', 'Away_Team', 'Half_Score',
+                  'System_Payout', 'User_Payout', 'Tournament_Name', 'Tournament_Category',
+                  'League_Size', 'Home_Rating', 'Away_Rating', 'Home_Form', 'Away_Form']
+-_V16413_RESULT_FP = ['Tipsme_Match_ID', 'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner',
+-                     'Home_Red', 'Away_Red', 'Home_Yellow', 'Away_Yellow']
++_RESULT_FP = ['Tipsme_Match_ID', 'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner',
++              'Home_Red', 'Away_Red', 'Home_Yellow', 'Away_Yellow']
+ 
+ def _v1512_is_main_db(filename):
+     """V15.12：是否主資料庫檔 (需要差量備份保護)。"""
+@@ -1020,7 +1019,7 @@ def _v1512_fp(df):
+     try:
+         import hashlib
+         from decimal import Decimal, InvalidOperation
+-        cols = [c for c in V1512_FP_COLS + _V16413_RESULT_FP if c in df.columns]
++        cols = [c for c in V1512_FP_COLS + _RESULT_FP if c in df.columns]
+         d = df[cols].astype('object').where(df[cols].notna(), '').astype(str)
+         def number_string(v):
+             try:
+@@ -1030,7 +1029,7 @@ def _v1512_fp(df):
+                 return v
+         for col in ('Initial_Line', 'Initial_Odds', 'System_Stake', 'User_Stake', 'System_Profit',
+                     'User_Profit', 'Unit_Profit', 'System_Payout', 'User_Payout', 'League_Size',
+-                    *_V16413_RESULT_FP):
++                    *_RESULT_FP):
+             if col in d:
+                 d[col] = d[col].map(number_string)
+         if 'Match_Date' in d:
+@@ -1107,6 +1106,43 @@ def _v1512_backup_pending(df):
+     except Exception:
+         pass
+ 
++def _v18_check_slot_rows(conn, expected):
++    """Under the existing main-table write lock, reject changed, missing or duplicate rows."""
++    from sqlalchemy import text, bindparam
++    stmt = text('SELECT * FROM public."football_bets" WHERE "ID" IN :ids'
++                ).bindparams(bindparam('ids', expanding=True))
++    ordered = sorted(expected)
++    for offset in range(0, len(ordered), 500):
++        ids = ordered[offset:offset + 500]
++        rows = list(conn.execute(stmt, {'ids': ids}).mappings())
++        if len(rows) != len(ids) or any(r['Status'] != 'Open' for r in rows):
++            return False
++        current = _v1512_fp(enforce_columns(process_legacy_columns(pd.DataFrame(rows)), DB_COLUMNS))
++        if current != {rid: expected[rid] for rid in ids}:
++            return False
++    return True
++
++
++_V18_SETTLEMENT_COLUMNS = (
++    'Status', 'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner', 'Home_Red', 'Away_Red',
++    'Home_Yellow', 'Away_Yellow', 'Half_Score', 'System_Profit', 'User_Profit',
++    'System_Payout', 'User_Payout', 'Unit_Profit', 'Result_Label', 'Odds_History',
++)
++
++
++def _v18_update_slot_rows(conn, changed):
++    """Update only settlement fields; never replace an existing bet or its analysis inputs."""
++    from sqlalchemy import text
++    cols = [col for col in _V18_SETTLEMENT_COLUMNS if col in changed]
++    set_fields = ', '.join(f'"{col}" = :v{i}' for i, col in enumerate(cols))
++    stmt = text(f"""UPDATE public."football_bets" SET {set_fields}
++                    WHERE "ID" = :rid AND "Status" = 'Open'""")
++    for rid, *values in changed[['ID', *cols]].itertuples(index=False, name=None):
++        params = {f'v{i}': (None if pd.isna(value) else value) for i, value in enumerate(values)}
++        if conn.execute(stmt, dict(params, rid=str(rid))).rowcount != 1:
++            raise RuntimeError('未能唯一更新待結算注單；整場交易已取消')
++
++
+ def _v1512_save_sql_main(df, table_name, *, delete_ids=(), restore_ids=()):
+     """主表安全寫入：缺列不是刪除；所有列替換、墓碑及 Undo 同一 PostgreSQL 交易。"""
+     try:
+@@ -1131,6 +1167,10 @@ def _v1512_save_sql_main(df, table_name, *, delete_ids=(), restore_ids=()):
+         changed = df.loc[ids.isin(changed_ids)].copy()
+         if changed['ID'].astype(str).duplicated().any():
+             raise ValueError('待寫入注單包含重複 ID；原資料未變更')
++        slot_expected = st.session_state.get('_v18_slot_expected')
++        if slot_expected is not None and (not slot_expected or from_fallback or deleted or restored
++                or set(changed_ids) != set(slot_expected) or not changed['Status'].eq('Settled').all()):
++            raise ValueError('時段結算的待寫入注單與核對範圍不符；請核對正式庫')
+         def batched(conn, query, values):
+             values = sorted(values)
+             stmt = text(query).bindparams(bindparam('ids', expanding=True))
+@@ -1145,21 +1185,12 @@ def _v1512_save_sql_main(df, table_name, *, delete_ids=(), restore_ids=()):
+             conn.execute(text('LOCK TABLE public."football_bets" IN SHARE ROW EXCLUSIVE MODE'))
+             if not changed_ids and not deleted:
+                 return True
+-            # Deliberate edits/deletes require a fresh snapshot of a receipted slip, even after disabling the runner.
+-            _guard_ids = sorted(changed_ids | deleted)
+-            for _offset in range(0, len(_guard_ids), 500):
+-                _protected = _early16413.protected_current(conn, _guard_ids[_offset:_offset + 500])
+-                if _protected:
+-                    if len({str(r['ID']) for r in _protected}) != len(_protected):
+-                        raise RuntimeError('已提前結算的注單有重複 ID；請核對正式庫')
+-                    _current = _v1512_fp(enforce_columns(process_legacy_columns(pd.DataFrame(_protected)),
+-                                                         DB_COLUMNS)) or {}
+-                    if any(base.get(str(r['ID'])) != _current.get(str(r['ID']))
+-                           or str(r['ID']) not in _current for r in _protected):
+-                        raise RuntimeError('注單已在其他分頁提前結算或更新；請重開頁面並核對正式庫')
+-            conn.execute(text(f'CREATE TABLE IF NOT EXISTS public."{V164_TOMB_TABLE}" '
+-                              '("id" TEXT PRIMARY KEY, "deleted_at" TEXT)'))
+-            conn.execute(text(f'ALTER TABLE public."{V164_TOMB_TABLE}" ENABLE ROW LEVEL SECURITY'))
++            if slot_expected is not None and not _v18_check_slot_rows(conn, slot_expected):
++                raise RuntimeError('時段結算的正式注單已變更；請重新載入並核對，不要重送')
++            if slot_expected is None:
++                conn.execute(text(f'CREATE TABLE IF NOT EXISTS public."{V164_TOMB_TABLE}" '
++                                  '("id" TEXT PRIMARY KEY, "deleted_at" TEXT)'))
++                conn.execute(text(f'ALTER TABLE public."{V164_TOMB_TABLE}" ENABLE ROW LEVEL SECURITY'))
+             if deleted:
+                 now = get_hkt_now().strftime('%Y-%m-%d %H:%M:%S')
+                 conn.execute(text(f'INSERT INTO public."{V164_TOMB_TABLE}" ("id", "deleted_at") '
+@@ -1169,13 +1200,17 @@ def _v1512_save_sql_main(df, table_name, *, delete_ids=(), restore_ids=()):
+                 batched(conn, f'DELETE FROM public."{V164_TOMB_TABLE}" WHERE "id" IN :ids', restored)
+             tombs = {str(r[0]) for r in conn.execute(
+                 text(f'SELECT "id" FROM public."{V164_TOMB_TABLE}"'))}
++            if slot_expected is not None and set(slot_expected) & tombs:
++                raise RuntimeError('時段結算包含已刪除注單；未寫入')
+             changed = changed.loc[~changed['ID'].astype(str).isin(tombs)]
+             write_ids = set(changed['ID'].astype(str))
+             if write_ids:
+                 tbl_cols = {c['name'] for c in _sa_inspect(conn).get_columns(table_name, schema='public')}
+                 for c in changed.columns:
+                     if c not in tbl_cols:
+-                        if c not in DB_COLUMNS:
++                        if slot_expected is not None and c not in _V18_SETTLEMENT_COLUMNS:
++                            continue
++                        if slot_expected is not None or c not in DB_COLUMNS:
+                             raise ValueError(f'非主表欄位：{c}')
+                         conn.execute(text(f'ALTER TABLE public."football_bets" ADD COLUMN "{c}" TEXT'))
+                 # 未知或只在舊快照出現的 ID 不能覆蓋當前 SQL；已結算不能被其他
+@@ -1205,7 +1240,8 @@ def _v1512_save_sql_main(df, table_name, *, delete_ids=(), restore_ids=()):
+                 keep = write_ids - (restored & states.keys())
+                 changed = changed.loc[changed['ID'].astype(str).isin(keep)]
+                 write_ids = keep
+-                if {'Tournament_Name', 'Tournament_Category', 'League_Size', 'Home_Rating', 'Away_Rating'} <= set(changed):
++                if slot_expected is None and {'Tournament_Name', 'Tournament_Category', 'League_Size',
++                                               'Home_Rating', 'Away_Rating'} <= set(changed):
+                     if _sa_inspect(conn).has_table('football_settings', schema='public'):
+                         rule_rows = conn.execute(text(f'''SELECT "Key", "Value" FROM {_V10_SQL_TABLE}
+                                                          WHERE "Key" LIKE 'TS|%' '''))
+@@ -1220,12 +1256,15 @@ def _v1512_save_sql_main(df, table_name, *, delete_ids=(), restore_ids=()):
+                         old = existing_dates.get(str(changed.at[idx, 'ID']))
+                         if not is_missing_match_date(old) and is_missing_match_date(changed.at[idx, 'Match_Date']):
+                             changed.at[idx, 'Match_Date'] = str(old)[:10]
+-            batched(conn, 'DELETE FROM public."football_bets" WHERE "ID" IN :ids', deleted | write_ids)
+-            if write_ids:
+-                for col in changed.columns:
+-                    if changed[col].dtype == 'object':
+-                        changed[col] = changed[col].map(lambda x: str(x) if pd.notna(x) else None)
+-                changed.to_sql(table_name, conn, schema='public', if_exists='append', index=False)
++            if slot_expected is not None:
++                _v18_update_slot_rows(conn, changed)
++            else:
++                batched(conn, 'DELETE FROM public."football_bets" WHERE "ID" IN :ids', deleted | write_ids)
++                if write_ids:
++                    for col in changed.columns:
++                        if changed[col].dtype == 'object':
++                            changed[col] = changed[col].map(lambda x: str(x) if pd.notna(x) else None)
++                    changed.to_sql(table_name, conn, schema='public', if_exists='append', index=False)
+         # 僅在 COMMIT 成功後記錄 SQL 基準；備份成功不能推進 SQL 基準。
+         st.session_state['_v1641_sql_base'] = {**{i:h for i,h in base.items() if i not in deleted},
+                                              **{i:fp[i] for i in write_ids}}
+@@ -8323,7 +8362,7 @@ def tipsme_fetch_season_schedule(url, timeout=25):
+         return None, f'讀取賽程頁失敗: {e}'
+ 
+ 
+-def tipsme_fetch_day_results(date_str, timeout=25, *, require_complete=False):
++def tipsme_fetch_day_results(date_str, timeout=25, *, require_complete=False, kickoff_window=None):
+     """V15.10 賽果日期模式：讀取指定日曆日 (香港時間 00:00–23:59) 全部聯賽的已完場比賽。
+     Tipsme 賽果頁 (/zh-HK/results?date=D&page=N) 的「日期」是 [D-1 16:00, D 16:00) 的
+     滾動窗口 (2026-11-16 實測)，因此完整覆蓋日曆日 D 需讀取 D 與 D+1 兩天再合併
+@@ -8339,7 +8378,15 @@ def tipsme_fetch_day_results(date_str, timeout=25, *, require_complete=False):
+     except Exception:
+         return None, f'無法辨認日期：{date_str}'
+     by_id = {}
+-    for _d in (d0.strftime('%Y-%m-%d'), d1.strftime('%Y-%m-%d')):
++    dates = (d0, d1)
++    if kickoff_window:
++        start, end = kickoff_window
++        # Do not require an irrelevant (possibly future) date page for morning slots.
++        if end < '16:00':
++            dates = (d0,)
++        elif start >= '16:00':
++            dates = (d1,)
++    for _d in (d.strftime('%Y-%m-%d') for d in dates):
+         page = 1
+         while page <= 40:
+             url = f'https://tipsme.hk/zh-HK/results?date={_d}&page={page}'
+@@ -8570,7 +8617,10 @@ def _v15_finish_summary(a):
+     a['active'] = False
+     a['finished'] = True
+     a.pop('prepared', None)
+-    if a.get('sched') and a.get('rdate'):
++    if a.get('settlement_slot'):
++        a['slot_verified'] = not _failed and a.get('done', 0) == len(_q)
++        _v15_log(a, '時段批次結束；未完場或未成功結算的賽事不在本時段重送，留待翌日原排程／人工核對。')
++    elif a.get('sched') and a.get('rdate'):
+         _v16412_finish_schedule(a)
+     _v15_save_remote(a)
+ 
+@@ -8830,11 +8880,6 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
+     a = st.session_state.get('v15_auto')
+     if not a or not a.get('active'):
+         return
+-    if a.get('sched') and _v16413_mode() in ('write', 'invalid'):
+-        a['active'] = False
+-        _v15_log(a, '05:00 覆檢不會繼續舊版自動結算批次；請核對正式庫。')
+-        st.rerun()
+-        return
+     # V15.7：跨裝置互斥 — 狀態檔已被另一 session 接手 (sid 不符) 時自動停止本裝置，
+     # 避免兩邊同時寫入 (不寫回狀態檔，以免覆蓋接手裝置的進度)
+     if _v15_taken_over(a):
+@@ -8896,7 +8941,7 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
+                 _v15_skip_match(a, m, '填充', '未能刷新正式注單做防重核對；未寫入注單。')
+                 return
+         _dt = _v15_sched_date(m)
+-        _dup = (_v16412_match_rows(df_db, m) if a.get('sched') else
++        _dup = (_v16412_match_rows(df_db, m, exact_id=bool(a.get('settlement_slot'))) if a.get('sched') else
+                 v14_find_duplicate_match(df_db, m['home'], m['away'], _dt, tipsme_id=m.get('hkjc_match_id')))
+         if _dup is not None and not _dup.empty:
+             if (_dup['Status'].astype(str) == 'Open').any():
+@@ -8917,6 +8962,9 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
+             _v15_save_remote(a)
+             st.rerun()
+             return
++        if a.get('settlement_slot'):
++            _v15_skip_match(a, m, '時段結算', '找不到符合的既有注單；本時段不補建注單。')
++            return
+         _murl = f"https://tipsme.hk/zh-HK/match/{m['hkjc_match_id']}/chat"
+         with st.spinner(f"🤖 自動填充 ({a['idx'] + 1}/{len(q)})：{_v15_mlabel(m)} {m['home']} vs {m['away']} ..."):
+             ok, msg, fd = tipsme_auto_fill(_murl, df_db, opts_tournaments, opts_teams, schedule_match=m)
+@@ -8981,7 +9029,7 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
+ 
+     if step in ('SETTLE_READ', 'SETTLE_CONFIRM'):
+         if a.get('sched'):
+-            _rows = _v16412_match_rows(df_db, m)
++            _rows = _v16412_match_rows(df_db, m, exact_id=bool(a.get('settlement_slot')))
+             _group = v10_match_groups(_rows[_rows['Status'].eq('Open')])
+             _lab = None
+             if len(_group) == 1:
+@@ -9043,8 +9091,12 @@ def _v15_save_remote(a, *, publish=True):
+             'updated_ts': int(now.timestamp()),
+             'log': json.dumps((a.get('log') or [])[-15:], ensure_ascii=False),
+         }
++        if a.get('settlement_slot'):
++            _row['settlement_slot'] = a['settlement_slot']
++            _row['slot_verified'] = '1' if a.get('slot_verified') else '0'
+         frame = pd.DataFrame([_row])
+-        for path in ([AUTO_STATUS_FILE, DAILY_STATUS_FILE] if a.get('sched') else [AUTO_STATUS_FILE]):
++        for path in ([AUTO_STATUS_FILE, DAILY_STATUS_FILE]
++                     if a.get('sched') and not a.get('settlement_slot') else [AUTO_STATUS_FILE]):
+             with NamedTemporaryFile(mode='w', encoding='utf-8', newline='', delete=False,
+                                     dir=os.path.dirname(os.path.abspath(path)), prefix='.auto-status-') as f:
+                 tmp = f.name
+@@ -9132,7 +9184,10 @@ def _v15_render_remote_body():
+         if not _recent or not _log:
+             return
+         _result = ("已掃描，有場次待跟進" if _n(_s.get('failed')) else "已完成") if str(_s.get('finished')) == '1' else "已停止或結束"
+-        if str(_s.get('daily')) == '1':
++        if isinstance(_s.get('settlement_slot'), str) and _s['settlement_slot']:
++            _result = ("時段結算已核對本批次注單" if str(_s.get('slot_verified')) == '1'
++                       else "已停止或掃描結束（時段結算；未確認項目須核對）")
++        elif str(_s.get('daily')) == '1':
+             _result = "已確認完成" if str(_s.get('daily_verified')) == '1' else "已停止或掃描結束（排程未確認完成）"
+         st.info(f"最近批次{_result}（{_upd} 香港）：結算 {_n(_s.get('done'))} 場、"
+                 f"寫入 {_n(_s.get('bets'))} 注、待手動 {_n(_s.get('failed'))} 場。")
+@@ -9190,6 +9245,13 @@ SCHED_COLUMNS = ['Key', 'Value']
+ SCHED_TABLE = 'football_schedule'
+ SCHED_DEFAULTS = {'enabled': '0', 'time': '09:30', 't0': '00:00', 't1': '23:59',
+                   'last_run': '', 'last_run_win': ''}
++_V18_SLOTS = {
++    '03:00': ('00:00', '02:59'), '06:00': ('03:00', '05:59'),
++    '09:00': ('06:00', '08:59'), '12:00': ('09:00', '11:59'),
++    '15:00': ('12:00', '14:59'), '18:00': ('15:00', '17:59'),
++    '21:00': ('18:00', '20:59'), '00:00': ('21:00', '23:59'),
++}
++_V18_SLOT_RETRY_SECONDS = 15 * 60
+ 
+ 
+ def _v16412_date(value):
+@@ -9215,6 +9277,15 @@ def _v16412_schedule_config(values):
+         cfg['last_run'] = day.isoformat()
+         if re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d-(?:[01]\d|2[0-3]):[0-5]\d', win):
+             cfg['last_run_win'] = win
++    if 'settlement_slots' in values:
++        selected = set(str(values.get('settlement_slots') or '').split(',')) if isinstance(
++            values.get('settlement_slots'), str) else set()
++        cfg['settlement_slots'] = ','.join(slot for slot in _V18_SLOTS if slot in selected)
++    claimed = str(values.get('settlement_slot_claim') or '') if isinstance(
++        values.get('settlement_slot_claim'), str) else ''
++    if (len(claimed) == 16 and claimed[10] == ' ' and claimed[11:] in _V18_SLOTS
++            and _v16412_date(claimed[:10])):
++        cfg['settlement_slot_claim'] = claimed
+     return cfg
+ 
+ 
+@@ -9251,24 +9322,74 @@ def _v1511_sched_load(*, fresh=False):
+     return cfg
+ 
+ 
+-def _v1511_sched_save(cfg):
++def _v18_schedule_sql_table(conn):
++    from sqlalchemy import text
++    if conn.dialect.name == 'postgresql':
++        conn.execute(text("SET LOCAL lock_timeout = '3s'"))
++        conn.execute(text('LOCK TABLE public."football_schedule" IN SHARE ROW EXCLUSIVE MODE'))
++        return 'public."football_schedule"'
++    return '"football_schedule"'
++
++
++def _v18_schedule_sql_values(conn, table):
++    from sqlalchemy import text
++    rows = list(conn.execute(text(f'SELECT "Key", "Value" FROM {table}')))
++    values = dict(rows)
++    if len(rows) != len(values):
++        raise ValueError('排程設定有重複鍵')
++    return values
++
++
++def _v18_schedule_sql_put(conn, table, updates, old):
++    from sqlalchemy import text
++    for key, value in updates.items():
++        if key not in old:
++            conn.execute(text(f'INSERT INTO {table} ("Key", "Value") VALUES (:key, :value)'),
++                         {'key': key, 'value': value})
++        elif old[key] != value:
++            conn.execute(text(f'UPDATE {table} SET "Value" = :value WHERE "Key" = :key'),
++                         {'key': key, 'value': value})
++
++
++def _v1511_sched_save(cfg, *, settings_only=False):
+     """只以正式儲存的寫入回應及重新讀取結果確認，不寫本地後備。"""
+     try:
+         cfg = _v16412_schedule_config(cfg)
+-        frame = pd.DataFrame(cfg.items(), columns=SCHED_COLUMNS)
++        cfg.pop('settlement_slot_claim', None)
++        settings = {'enabled', 'time', 't0', 't1', 'settlement_slots'}
+         st.session_state['_v1511_sched_cache'] = None
+         if _has_secret('DB_URL'):
+             engine = _v163_sql_engine()
+             if engine is None:
+                 return False
++            from sqlalchemy import inspect
+             with engine.begin() as conn:
+-                frame.to_sql(SCHED_TABLE, conn, if_exists='replace', index=False)
++                schema = 'public' if conn.dialect.name == 'postgresql' else None
++                if not inspect(conn).has_table(SCHED_TABLE, schema=schema):
++                    if cfg.get('settlement_slots'):
++                        return False  # 新時段不建立資料表。
++                    pd.DataFrame(cfg.items(), columns=SCHED_COLUMNS).to_sql(
++                        SCHED_TABLE, conn, schema=schema, if_exists='fail', index=False)
++                else:
++                    table = _v18_schedule_sql_table(conn)
++                    old = _v18_schedule_sql_values(conn, table)
++                    if settings_only:
++                        updates = {k: v for k, v in cfg.items() if k in settings}
++                    else:
++                        current = _v16412_schedule_config(old)
++                        if any(current[k] != cfg[k] for k in ('enabled', 'time', 't0', 't1')):
++                            return False
++                        updates = {k: cfg[k] for k in ('last_run', 'last_run_win')}
++                    _v18_schedule_sql_put(conn, table, updates, old)
+         elif _has_secret('GITHUB_TOKEN') and _has_secret('GITHUB_REPO'):
++            frame = pd.DataFrame(cfg.items(), columns=SCHED_COLUMNS)
+             if not save_db_github(frame, st.secrets['GITHUB_REPO'], SCHED_FILE, st.secrets['GITHUB_TOKEN']):
+                 return False
+         else:
+             return False
+-        confirmed = _v1511_sched_load(fresh=True) == cfg
++        actual = _v1511_sched_load(fresh=True)
++        checked = settings if settings_only else {'enabled', 'time', 't0', 't1', 'last_run', 'last_run_win'}
++        confirmed = bool(actual) and all(actual.get(k) == cfg[k] for k in checked & cfg.keys())
+         if not confirmed:
+             st.session_state['_v1511_sched_cache'] = None
+         return confirmed
+@@ -9310,7 +9431,7 @@ def _v16412_authoritative_bets():
+         return None
+ 
+ 
+-def _v16412_match_rows(df, match):
++def _v16412_match_rows(df, match, *, exact_id=False):
+     """同香港賽日 + 來源 ID；無 ID 的舊注單須主客隊別名都一致。"""
+     if df.empty:
+         return df
+@@ -9325,6 +9446,8 @@ def _v16412_match_rows(df, match):
+         return tuple(map(_v14_norm_team, parts))
+     both = df['Match'].map(pair).map(
+         lambda p: p == (_v14_norm_team(match['home']), _v14_norm_team(match['away'])))
++    if exact_id:
++        return df[(ids == str(match['hkjc_match_id'])) & both]
+     return df[(ids == str(match['hkjc_match_id'])) |
+               (ids.str.lower().isin(('', 'none', 'nan', '<na>')) & both)]
+ 
+@@ -9370,91 +9493,6 @@ def _v16412_schedule_notice(day, window, msg):
+     st.session_state['_v16412_schedule_notice'] = (day.isoformat(), window, msg)
+ 
+ 
+-def _v16413_mode():
+-    configured = os.environ.get('EARLY_SETTLE_MODE')
+-    if configured is None and _has_secret('EARLY_SETTLE_MODE'):
+-        configured = st.secrets['EARLY_SETTLE_MODE']
+-    return _early16413.mode(configured)
+-
+-
+-def _v16413_review_schedule(day, window, eligible):
+-    """The write-mode 05:00 schedule is a reconciliation only, not a second writer."""
+-    try:
+-        engine = _v163_sql_engine()
+-        if engine is None:
+-            raise RuntimeError('missing SQL')
+-        pending, consistent = _early16413.Postgres(engine, _v14_norm_team).review_day(day, eligible)
+-        if pending or not consistent:
+-            ids = '、'.join(sorted(pending)[:8]) or '無'
+-            msg = (f'05:00 覆檢：{len(pending)} 場或舊注單組別待核對（{ids}），'
+-                   f'提前結算憑證{"一致" if consistent else "有差異"}；未補建、未結算、未標記完成。')
+-        elif _v1511_mark_done(day, window):
+-            msg = '05:00 覆檢：正式庫與本日賽果及提前結算憑證一致，已記錄覆檢完成。'
+-        else:
+-            msg = '05:00 覆檢通過，但完成日期未獲確認。'
+-    except Exception:
+-        msg = '05:00 覆檢未能確認正式庫或提前結算憑證；未標記完成。'
+-    _v16412_schedule_notice(day, window, msg)
+-
+-
+-def _v16413_early_body():
+-    run_mode = _v16413_mode()
+-    if run_mode not in ('observe', 'write'):
+-        return
+-    if (not _v162_can_automate() or not _v10_settings_allow_automation()
+-            or (st.session_state.get('v15_auto') or {}).get('active')
+-            or st.session_state.get('editing_bet_id')
+-            or st.session_state.get('_v16410_bet_unconfirmed')
+-            or st.session_state.get('_v16412_settle_unconfirmed')):
+-        return
+-    now = get_hkt_now()
+-    previous = st.session_state.get('_v16413_last_tick')
+-    if previous is not None and timedelta(0) <= now - previous < timedelta(minutes=2):
+-        return
+-    st.session_state['_v16413_last_tick'] = now
+-    engine = _v163_sql_engine()
+-    if engine is None:
+-        st.warning('提前結算未執行：沒有正式 PostgreSQL，未寫入任何注單。')
+-        return
+-    try:
+-        scan = _early16413.early_scan(
+-            _early16413.Postgres(engine, _v14_norm_team), _early16413.Tipsme(_v14_norm_team), run_mode,
+-            lambda rows, ev, odds: _early16413.build_plan(
+-                rows, ev, odds, norm=_v14_norm_team, calculate=calculate_settlement,
+-                parse_line=_tipsme_cap_value, odds_entry=_tipsme_oh_entry,
+-                merge_history=merge_odds_history_snapshots))
+-        if scan:
+-            st.session_state['_v16413_early_summary'] = {mid: code for mid, (code, _) in scan.items()}
+-        written = set().union(*(ids for _, ids in scan.values()))
+-        if written:
+-            cloud = _v161_sql_read_bets(allow_empty=True)
+-            current = st.session_state.get('df_db')
+-            if cloud is not None and current is not None:
+-                saved = cloud.loc[cloud['ID'].astype(str).isin(written)]
+-                if len(saved) == len(written) and saved['Status'].eq('Settled').all():
+-                    saved = enforce_columns(saved, DB_COLUMNS)
+-                    remain = current.loc[~current['ID'].astype(str).isin(written)]
+-                    st.session_state['df_db'] = pd.concat([remain, saved], ignore_index=True)
+-                    st.session_state.setdefault('_v1641_sql_base', {}).update(_v1512_fp(saved) or {})
+-                    st.rerun()
+-            st.warning('提前結算已獲正式庫確認，畫面未刷新；請重開頁面，不要重送。')
+-    except Exception as exc:
+-        if _v15_is_control_exc(exc):
+-            raise
+-        st.warning('提前結算未能確認監察表或正式庫狀態；沒有使用 CSV 或 GitHub 後備寫入。')
+-    summary = st.session_state.get('_v16413_early_summary')
+-    if summary:
+-        st.caption(f'提前結算 ({run_mode})：' + '；'.join(f'{mid} {code}' for mid, code in summary.items()))
+-
+-
+-def _v16413_render_early():
+-    run_mode = _v16413_mode()
+-    if run_mode == 'invalid':
+-        st.warning('EARLY_SETTLE_MODE 不正確；提前結算及 05:00 自動排程暫停。')
+-    elif run_mode != 'off':
+-        st.fragment(run_every=60)(_v16413_early_body)()
+-
+-
+ def _v16412_finish_schedule(a):
+     day = _v16412_date(a['rdate'])
+     window = _v16412_window(a)
+@@ -9475,18 +9513,21 @@ def _v16412_finish_schedule(a):
+     _v15_log(a, f'⏰ {msg}')
+ 
+ 
+-def _v1511_sched_try_start(df_db):
+-    """只在執行裝置已就緒及到時後嘗試前一日；每個日期／時段至少間隔 5 分鐘。"""
++def _v18_runner_ready(df_db):
+     if df_db is None or not _v162_can_automate() or not _v10_settings_allow_automation():
+         return False
+     if (st.session_state.get('_v16410_bet_unconfirmed') or
+             st.session_state.get('_v16412_settle_unconfirmed')):
+         return False
+-    if (st.session_state.get('v15_auto') or {}).get('active'):
+-        return False
+-    early_mode = _v16413_mode()
+-    if early_mode == 'invalid':
+-        return False
++    return not (st.session_state.get('v15_auto') or {}).get('active')
++
++
++def _v1511_sched_try_start(df_db):
++    """只在執行裝置已就緒及到時後嘗試前一日；每個日期／時段至少間隔 5 分鐘。"""
++    return _v18_runner_ready(df_db) and _v1511_try_daily()
++
++
++def _v1511_try_daily():
+     now = get_hkt_now()
+     day = now.date() - timedelta(days=1)
+     cfg = _v1511_sched_load()
+@@ -9519,9 +9560,6 @@ def _v1511_sched_try_start(df_db):
+     if not eligible:
+         _v16412_schedule_notice(day, window, '賽果來源未列出時段內完場賽事，未標記完成；稍後再查。')
+         return False
+-    if early_mode == 'write':
+-        _v16413_review_schedule(day, window, eligible)
+-        return False
+     official = _v16412_authoritative_bets()
+     if official is None:
+         _v16412_schedule_notice(day, window, '未能讀取正式注單；未啟動寫入，稍後再查。')
+@@ -9534,12 +9572,14 @@ def _v1511_sched_try_start(df_db):
+         return False
+     # 完成後有未解決賽事，或寫入未獲確認時，不自動重送同一批次。
+     last = st.session_state.get('v15_auto') or {}
+-    same_local = last.get('sched') and last.get('rdate') == yday and _v16412_window(last) == window
++    same_local = (last.get('sched') and not last.get('settlement_slot')
++                  and last.get('rdate') == yday and _v16412_window(last) == window)
+     try:
+         daily = pd.read_csv(DAILY_STATUS_FILE).iloc[0].to_dict()
+     except (OSError, ValueError, IndexError):
+         daily = None
+-    same_remote = any(r and str(r.get('daily')) == '1' and str(r.get('rdate')) == yday
++    same_remote = any(r and str(r.get('daily')) == '1'
++                      and not isinstance(r.get('settlement_slot'), str) and str(r.get('rdate')) == yday
+                       and str(r.get('win')) == window and _v15_status_phase(r) == 'closed'
+                       for r in (_s, daily))
+     if same_local or same_remote:
+@@ -9562,13 +9602,170 @@ def _v1511_sched_try_start(df_db):
+     _v15_save_remote(st.session_state['v15_auto'])
+     return True
+ 
++
++def _v18_slot_due(now, cfg):
++    """Only the most recent boundary; midnight refers to the preceding Hong Kong day."""
++    end = now.replace(hour=now.hour // 3 * 3, minute=0, second=0, microsecond=0)
++    trigger = end.strftime('%H:%M')
++    if trigger not in (cfg.get('settlement_slots') or '').split(','):
++        return None
++    key = end.strftime('%Y-%m-%d %H:%M')
++    if key <= cfg.get('settlement_slot_claim', ''):
++        return None
++    day = (end - timedelta(hours=3)).date()
++    return key, day, *_V18_SLOTS[trigger]
++
++
++def _v18_claim_slot(engine, key):
++    """Persist an at-most-one start on the existing Key/Value table, before starting a writer."""
++    try:
++        with engine.begin() as conn:
++            if conn.dialect.name != 'postgresql':
++                return False
++            table = _v18_schedule_sql_table(conn)
++            values = _v18_schedule_sql_values(conn, table)
++            due = _v18_slot_due(get_hkt_now(), _v16412_schedule_config(values))
++            if not due or due[0] != key:
++                return False
++            _v18_schedule_sql_put(conn, table, {'settlement_slot_claim': key}, values)
++        st.session_state['_v1511_sched_cache'] = None
++        return True
++    except Exception:
++        st.session_state['_v1511_sched_cache'] = None
++        return False
++
++
++def _v18_open_match_ids(engine, day):
++    """Cheap preflight: matches only, without loading model features or odds histories."""
++    from sqlalchemy import text
++    try:
++        with engine.connect() as conn:
++            rows = conn.execute(text('''
++                SELECT DISTINCT b."Tipsme_Match_ID"
++                FROM public."football_bets" b
++                WHERE b."Match_Date"::text = :day AND b."Status" = 'Open'
++                  AND NOT EXISTS (SELECT 1 FROM public."football_bets_deleted" d
++                                  WHERE d."id" = b."ID")
++            '''), {'day': day.isoformat()})
++            ids = (str(r[0]).strip() for r in rows)
++            return {re.sub(r'\.0+$', '', v) for v in ids if re.fullmatch(r'[1-9]\d{0,11}(?:\.0+)?', v)}
++    except Exception:
++        return None
++
++
++def _v18_try_slot():
++    if (not _has_secret('DB_URL') or st.session_state.get('editing_bet_id')
++            or st.session_state.get('_v16410_bet_unconfirmed')
++            or st.session_state.get('_v16412_settle_unconfirmed')):
++        return False
++    now = get_hkt_now()
++    cfg = _v1511_sched_load()
++    due = _v18_slot_due(now, cfg) if cfg else None
++    if not due:
++        return False
++    key, day, t0, t1 = due
++    attempt = st.session_state.get('_v18_slot_attempt')
++    if attempt and attempt[0] == key and now.timestamp() - attempt[1] < _V18_SLOT_RETRY_SECONDS:
++        return False
++    if _v15_status_phase(_v15_load_remote()) in ('running', 'unknown'):
++        return False
++    st.session_state['_v18_slot_attempt'] = (key, now.timestamp())
++    engine = _v163_sql_engine()
++    if engine is None or engine.dialect.name != 'postgresql':
++        return False
++    mids = _v18_open_match_ids(engine, day)
++    if not mids:
++        return False
++    ymd = day.isoformat()
++    sched, _ = tipsme_fetch_day_results(ymd, require_complete=True, kickoff_window=(t0, t1))
++    if not sched:
++        return False
++    eligible = [m for m in _v15_build_queue_date(sched, None, ymd, t0, t1)
++                if str(m['hkjc_match_id']) in mids
++                and all(m.get(k) is not None for k in ('home_goal', 'away_goal', 'home_corner', 'away_corner'))]
++    if not eligible:
++        return False
++    official = _v16412_authoritative_bets()
++    if official is None:
++        return False
++    queue = [m for m in eligible if _v16412_match_rows(official, m, exact_id=True)['Status'].eq('Open').any()]
++    fp = _v1512_fp(official) if queue else None
++    if not queue or not fp or _v15_status_phase(_v15_load_remote()) in ('running', 'unknown'):
++        return False
++    if not _v18_claim_slot(engine, key):
++        return False
++    st.session_state.update(df_db=official, _v1641_sql_base=fp, _v1641_fallback_base=False)
++    # Do not replace a manually loaded season's schedule in the settlement-only path.
++    st.session_state['v15_auto'] = {
++        'active': True, 'mode': 'date', 'rdate': ymd, 'sched': True, 'settlement_slot': key,
++        't0': t0, 't1': t1, 'rounds': [], 'queue': queue, 'idx': 0, 'step': 'FILL',
++        'log': [], 'tries': 0, 'err': 0, 'done': 0, 'bets': 0, 'failed': [], 'sid': _v15_new_sid(),
++    }
++    _v15_log(f'時段結算：{ymd} {t0}–{t1}（香港）有 {len(queue)} 場待核對並結算，不補建注單。')
++    _v15_save_remote(st.session_state['v15_auto'])
++    return True
++
++
++def _v18_slot_check_result(info, match):
++    """Require an actual match-detail response, not a copy of the results listing."""
++    if not info or not info.get('finished') or str(info.get('match_id')) != str(match['hkjc_match_id']):
++        return False
++    kickoff = info.get('kickoff')
++    if not isinstance(kickoff, datetime):
++        return False
++    ko_hkt = kickoff.astimezone(HKT) if kickoff.tzinfo else kickoff.replace(tzinfo=HKT)
++    if int(ko_hkt.timestamp()) // 60 != int(match['match_time']) // 60:
++        return False
++    if any(_v14_norm_team(info.get(k)) != _v14_norm_team(match.get(k)) for k in ('home', 'away')):
++        return False
++    for s, h, a in (('score', 'home_goal', 'away_goal'), ('corner', 'home_corner', 'away_corner'),
++                    ('half_score', 'home_half', 'away_half')):
++        pair = _tipsme_score_pair(info.get(s))
++        if None in pair or pair != (match.get(h), match.get(a)):
++            return False
++    return True
++
++
++def _v18_slot_close(rows, core, info):
++    """Do not consume a slot settlement if it would miss a same-line pre-kickoff price."""
++    if rows['Bet_Type'].astype(str).str.contains('即場').all():
++        return []
++    kickoff = info['kickoff']
++    if kickoff.tzinfo:
++        kickoff = kickoff.astimezone(HKT)
++    kickoff = kickoff.replace(tzinfo=None, second=0, microsecond=0)
++    safe, markets = [], set()
++    for quote in core or []:
++        try:
++            stamp = v10_parse_time(quote.get('record_time', ''), 'md', kickoff)
++            upper, lower = float(quote['upper']), float(quote['lower'])
++            line = round(float(quote['line']), 3)
++            if (stamp is None or stamp >= kickoff or not np.isfinite(line)
++                    or not (1 < upper < float('inf') and 1 < lower < float('inf'))):
++                continue
++            safe.append(quote)
++            markets.add((v9_clean_bt(quote['type']), line))
++        except (TypeError, ValueError, KeyError, AttributeError):
++            continue
++    # Match the existing CLV merger's team-name rule so a quote won't be approved and then silently skipped.
++    norm = lambda v: re.sub(r'[\s\-_·•]', '', str(v or ''))
++    for row in rows.loc[~rows['Bet_Type'].astype(str).str.contains('即場')].to_dict('records'):
++        try:
++            if ((v9_clean_bt(row['Bet_Type']), round(float(row['Initial_Line']), 3)) not in markets
++                    or any(norm(row[k]) != norm(info[v]) for k, v in (('Home_Team', 'home'), ('Away_Team', 'away')))):
++                return None
++        except (TypeError, ValueError, KeyError):
++            return None
++    return safe
++
++
+ def _v1511_sched_body():
+     """V15.11 排程背景檢查 (fragment 每 5 分鐘自動執行；每次頁面載入亦會執行)。"""
+     cfg = _v1511_sched_load()
+     if cfg is None:
+         st.caption('⏰ 每日排程：未能確認雲端設定。')
+         return
+-    if cfg['enabled'] != '1':
++    if cfg['enabled'] != '1' and not cfg.get('settlement_slots'):
+         return
+     try:
+         if _v1511_sched_try_start(st.session_state.get('df_db')):
+@@ -9580,7 +9777,12 @@ def _v1511_sched_body():
+         st.caption('⏰ 每日排程：本次檢查未能完成，稍後再查。')
+         return
+     cfg = _v1511_sched_load()
+-    if cfg is None or cfg['enabled'] != '1':
++    if cfg is None:
++        return
++    if cfg.get('settlement_slots'):
++        claimed = cfg.get('settlement_slot_claim') or '未取得'
++        st.caption(f"時段結算（香港）：{cfg['settlement_slots']}；最近取得執行權：{claimed}（不代表已結算）。")
++    if cfg['enabled'] != '1':
+         return
+     _now = get_hkt_now()
+     day = _now.date() - timedelta(days=1)
+@@ -9592,7 +9794,7 @@ def _v1511_sched_body():
+                    f"明日自動處理 {_now.strftime('%Y-%m-%d')} 的賽果)")
+     elif st.session_state.get('_v16412_settle_unconfirmed') or st.session_state.get('_v16410_bet_unconfirmed'):
+         st.warning(f"⏰ 每日排程：{_yday} 有寫入未獲確認；請核對正式庫，勿重送。")
+-    elif a.get('active') and a.get('sched') and a.get('rdate') == _yday:
++    elif a.get('active') and a.get('sched') and not a.get('settlement_slot') and a.get('rdate') == _yday:
+         st.caption(f'⏰ 每日排程：正在處理 {_yday} {_v16412_window(a)} 的賽果。')
+     elif notice and notice[:2] == (_yday, _v16412_window(cfg)):
+         st.caption(f'⏰ 每日排程：{_yday} {notice[2]}')
+@@ -9908,9 +10110,20 @@ def v16_render_clv_recorder():
+     except Exception:
+         _frag = None
+     if _frag is not None:
+-        _frag(_v16_clv_body)()
++        _frag(_v18_clv_then_slot)()
+     else:
+-        _v16_clv_body()
++        _v18_clv_then_slot()
++
++
++def _v18_clv_then_slot():
++    _v16_clv_body()  # Prioritize the existing CLV snapshots and pre-match recording.
++    try:
++        if _v18_runner_ready(st.session_state.get('df_db')) and _v18_try_slot():
++            st.rerun()
++    except Exception as exc:
++        if _v15_is_control_exc(exc):
++            raise
++        st.caption('時段結算：本次檢查未能完成；未確認的注單留待原每日排程。')
+ 
+ def v16_render_clv_config():
+     """V16：CLV 記錄器設定面板 (賽前 tab，每日排程設定下方)。"""
+@@ -10553,7 +10766,7 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
+             v15_render_auto_panel(df_db)
+ 
+         # --- V15.11 每日自動排程設定 (獨立於投注策略設定，儲存於 football_schedule_db.csv) ---
+-        with st.expander("⏰ 每日自動排程 (定時自動讀取前一天賽果並輸入)"):
++        with st.expander("⏰ 自動結算排程（原每日排程及選用時段）"):
+             _cfg = _v1511_sched_load() or SCHED_DEFAULTS
+             _en = st.checkbox("啟用每日自動排程", value=str(_cfg.get('enabled')) == '1', key="v1511_en")
+             _ct, _c0, _c1 = st.columns(3)
+@@ -10563,14 +10776,26 @@ def render_tipsme_fill_section(opts_tournaments, opts_teams, df_db):
+                                  value=datetime.strptime(str(_cfg.get('t0') or '00:00'), '%H:%M').time())
+             _w1 = _c1.time_input("時段結束", key="v1511_t1",
+                                  value=datetime.strptime(str(_cfg.get('t1') or '23:59'), '%H:%M').time())
++            _choices = [f"{trigger} → {'前一日 ' if trigger == '00:00' else ''}{t0}–{t1}"
++                        for trigger, (t0, t1) in _V18_SLOTS.items()]
++            _enabled_slots = (_cfg.get('settlement_slots') or '').split(',')
++            _selected = st.multiselect("額外結算時段（香港時間，可選多個）", _choices,
++                                       default=[c for c in _choices if c[:5] in _enabled_slots],
++                                       key="v18_settlement_slots", disabled=not _has_secret('DB_URL'))
++            st.caption("額外時段只結算所選開賽範圍內已確認完場的既有注單，不補建；"
++                       "未完場、缺賽果或賽前同線賠率的賽事由翌日原排程或人工核對。"
++                       "不選時段即維持原狀；建議保留全日的原每日排程補漏。"
++                       "須有合資格分頁在線，並非獨立常駐排程。")
+             if st.button("💾 儲存排程設定", key="v1511_save", use_container_width=True):
+                 _new_cfg = {'enabled': '1' if _en else '0',
+                             'time': _tm.strftime('%H:%M'), 't0': _w0.strftime('%H:%M'),
+                             't1': _w1.strftime('%H:%M'),
+                             'last_run': _cfg['last_run'], 'last_run_win': _cfg['last_run_win']}
++                if _has_secret('DB_URL') and (_selected or 'settlement_slots' in _cfg):
++                    _new_cfg['settlement_slots'] = ','.join(c[:5] for c in _selected)
+                 if _new_cfg['t0'] > _new_cfg['t1']:
+                     st.error("開始時間不可遲於結束時間。")
+-                elif _v1511_sched_save(_new_cfg):
++                elif _v1511_sched_save(_new_cfg, settings_only=True):
+                     st.toast("✅ 排程已儲存到雲端，所有裝置同步生效。", icon="⏰")
+                     st.rerun()
+                 else:
+@@ -12030,7 +12255,6 @@ def main():
+     v15_render_remote_status()
+     v1511_render_sched_status()   # V15.11：每日排程背景檢查 (每 5 分鐘)
+     v16_render_clv_recorder()     # V16：開賽前 CLV 記錄器背景檢查 (每 5 分鐘)
+-    _v16413_render_early()        # V17：預設關閉；活躍 Streamlit session
+ 
+     t_pre, t_follow, t_inplay, t_settle, t_ai, t_time_pnl, t_clv = st.tabs(["📝 賽前建檔與投注", "👤 用家跟投", "⏱️ 即場賽事與預測", "⚖ 賽果結算與管理", "🤖 全局模型", "📅 時間維度盈虧記錄分析", "🎯 CLV 與本金模擬"])
+ 
+@@ -13567,7 +13791,7 @@ def main():
+                                 if _try and _try.get('finished'):
+                                     _sinfo, _src = _try, '注單記錄的比賽 ID'
+                             # --- 來源 2/3：賽程數據 (本工作階段已載入，或即時貼連結讀取) ---
+-                            if _sinfo is None:
++                            if _sinfo is None and not (_daily_settle and _sa15.get('settlement_slot')):
+                                 _sched = st.session_state.get('tipsme_schedule')
+                                 if not _sched and _sched_link2:
+                                     with st.spinner("讀取賽程頁 (整季所有輪次)..."):
+@@ -13612,6 +13836,8 @@ def main():
+                             # --- 套用賽果 (與貼鏈結模式同一機制) ---
+                             if _sinfo and _sinfo.get('finished'):
+                                 if _daily_settle:
++                                    if _sa15.get('settlement_slot') and not _v18_slot_check_result(_sinfo, _daily_settle):
++                                        _v15_skip_match(_sa15, _daily_settle, '時段結算', '比賽明細與賽果列表不符，未結算。')
+                                     _sko = _sinfo.get('kickoff')
+                                     _goals = _tipsme_score_pair(_sinfo.get('score'))
+                                     _corners = _tipsme_score_pair(_sinfo.get('corner'))
+@@ -13639,6 +13865,11 @@ def main():
+                                                 st.toast(f"🎯 已同時更新收盤價：{len(_upd_s)} 張注單共新增 {_add_s} 個快照", icon="🎯")
+                                     except Exception:
+                                         pass
++                                if _daily_settle and _sa15.get('settlement_slot'):
++                                    _verified_close = _v18_slot_close(target_bets, _sa15.get('closing'), _sinfo)
++                                    if _verified_close is None:
++                                        _v15_skip_match(_sa15, _daily_settle, '時段結算', '賽前同盤口及盤線賠率未核實，交原每日排程補漏。')
++                                    _sa15['closing'] = _verified_close
+                                 st.session_state['tipsme_settle_apply'] = True
+                                 # V14.12：自動模式 — 先與賽程頁賽果交叉核對，無誤才自動結算
+                                 if _v15_on('SETTLE_READ'):
+@@ -13839,6 +14070,16 @@ def main():
+                 # V14.12：_v15_on('SETTLE_CONFIRM') 令自動模式走完全相同的手動結算路徑
+                 if st.button("⚖️ 確定結算此賽事所有注單", type="primary", use_container_width=True) or _v15_on('SETTLE_CONFIRM'):
+                     try:
++                        if _daily_settle and _sa15.get('settlement_slot'):
++                            _exact = _v16412_match_rows(target_bets, _daily_settle, exact_id=True)
++                            if (target_bets.empty or len(_exact) != len(target_bets)
++                                    or not _v18_slot_check_result(_ts_use, _daily_settle)
++                                    or _tipsme_score_pair(settle_half) != _tipsme_score_pair(_ts_use.get('half_score'))
++                                    or (settle_hred, settle_ared, settle_hyel, settle_ayel) != tuple(
++                                        int(_ts_use.get(k) or 0) for k in (
++                                            'home_red', 'away_red', 'home_yellow', 'away_yellow'))):
++                                _v15_skip_match(_sa15, _daily_settle, '時段結算',
++                                                '待結算注單或輸入未與核對後資料完全相符。')
+                         if _daily_settle and (not _ts_use or
+                                 _tipsme_score_pair(_ts_use.get('score')) != (settle_hg, settle_ag) or
+                                 (None not in _tipsme_score_pair(_ts_use.get('corner')) and
+@@ -13910,7 +14151,13 @@ def main():
+                             settlement.at[idx, 'Result_Label'] = res_label
+ 
+                         try:
+-                            _settle_ok = bool(save_db(settlement, db_file, db_table, keep_local_on_failure=False))
++                            if _daily_settle and _sa15.get('settlement_slot'):
++                                st.session_state['_v18_slot_expected'] = (
++                                    _v1512_fp(st.session_state.df_db.loc[idx_to_settle]) or {})
++                            try:
++                                _settle_ok = bool(save_db(settlement, db_file, db_table, keep_local_on_failure=False))
++                            finally:
++                                st.session_state.pop('_v18_slot_expected', None)
+                             if _settle_ok and _daily_settle:
+                                 _settle_ok = _v16412_settlement_recorded(settlement.loc[idx_to_settle])
+                         except Exception as exc:
+diff --git a/V17 驗證與操作.md b/V17 驗證與操作.md
+index 8563e43..6ced9a5 100644
+--- a/V17 驗證與操作.md	
++++ b/V17 驗證與操作.md	
+@@ -1,5 +1,7 @@
+ # FB-app V17｜驗證與操作
+ 
++> 歷史紀錄。V18 已移除本頁描述的兩小時功能；不要執行下列模式、遷移或測試指令。現行做法見 `V18 驗證與操作.md`。
++
+ 2026-11-21 香港時間。將由 [V16.4.12 合併提交](https://github.com/tipsme98/FB-app/commit/0d66641135444888b47b636934d4804629493965) 重建的 V16.4.13 候選命名為 V17，未更改功能行為。V16.4.12 主程式基線 SHA-256 為 `f92385a149046a61b8a6a875045ea119acd1bb6e1f95dc6fb0c31cdff0500ae4`。本次 GitHub 發布不包含正式 Supabase 遷移、注單／排程設定修改或補錄 11 月 20 日的賽事；GitHub 合併與 Streamlit 正式載入須分開驗證。
+ 
+ ## 重現測試
+diff --git a/V18 驗證與操作.md b/V18 驗證與操作.md
+new file mode 100644
+index 0000000..a5cb7b5
+--- /dev/null
++++ b/V18 驗證與操作.md	
+@@ -0,0 +1,52 @@
++# FB-app V18｜驗證與操作
++
++2026-11-22 香港時間。V18 是本地候選，以 [GitHub `fe91b92`](https://github.com/tipsme98/FB-app/commit/fe91b922c44e666e1bc2a408c47a506d02a37601) 為基線；沒有推送、部署、讀寫正式庫或更改正式排程。
++
++## 如何設定
++
++在「自動結算排程」維持「啟用每日自動排程」、`05:00`、`00:00–23:59`，然後按需要勾選「額外結算時段」及儲存。新時段預設全不選；建議首次只選 06:00，待自然觸發及正式庫讀回驗證後再加。
++
++| 觸發（香港） | 按香港開賽時間選場 |
++|---|---|
++| 03:00 | 當日 00:00–02:59 |
++| 06:00 | 當日 03:00–05:59 |
++| 09:00 | 當日 06:00–08:59 |
++| 12:00 | 當日 09:00–11:59 |
++| 15:00 | 當日 12:00–14:59 |
++| 18:00 | 當日 15:00–17:59 |
++| 21:00 | 當日 18:00–20:59 |
++| 00:00 | **前一日** 21:00–23:59 |
++
++## 運行規則
++
++- **執行分頁：** 原每日排程和賽前 CLV 優先；同一執行分頁已有批次時不搶佔。沿用 [Streamlit fragment](https://docs.streamlit.io/develop/api-reference/execution-flow/st.fragment) 約五分鐘檢查，不新增常駐服務。[Cloud 休眠](https://docs.streamlit.io/deploy/streamlit-community-cloud/manage-your-app) 或分頁不在線時，不保證整點；只嘗試當前最近的三小時邊界，不補跑已過的時段。尚未取得時段執行權時，合資格分頁的檢查至少間隔 15 分鐘；一旦取得執行權，該時段不會另開第二批。這不是完成標記。
++- **候選注單：** 先查同香港賽日的 `Open` 賽事 ID，排除現有墓碑。按香港開賽時間篩選，Tipsme 賽果頁沿用程式原有的 16:00 滾動分頁假設，只讀相關日期。列表與同場明細必須相符，才處理同 ID、同日及同隊伍的完整待結算組。混入缺 ID／不同 ID 等難以分辨的組別、未完場或資料不足均跳過。賽前注單須有同玩法、同盤線及早於開賽整分鐘的有效收盤價；即場注單不受此賽前價格條件限制。
++- **儲存與學習：** 沿用現有 `DB_URL`、`football_schedule`、`football_bets`、`football_bets_deleted`。在既有 `Key`／`Value` 設定表只更新相關列，不置換表；`settlement_slots` 為選項，`settlement_slot_claim` 為最近取得執行權的時段。主表交易重核 `Open`、指紋、重複 ID 及墓碑，只更新結算及必要的收盤快照欄，提交後另行讀回該注單。無新增表、欄、角色、密鑰、遷移或付費服務。新時段不建新注單，不寫每日完成標記；原每日補結、建學習樣本、模型暖機和派彩公式保留。部分未完場可能要等翌日 05:00 或人工。
++
++## 重現測試
++
++從候選倉庫根目錄執行，使用測試附件 `legacy026/` 或已驗證的 026 發布包。只使用合成資料、本地檔案和臨時 PostgreSQL，不要放入正式 `secrets.toml`。把 `FIXTURES` 設為包含 `baseline/` 與兩個 `test_fb_app_*.py` 的絕對路徑。
++
++```bash
++FIXTURES=/absolute/path/to/legacy026
++python -m venv .venv
++. .venv/bin/activate
++python -m pip install -r requirements.txt
++python -m py_compile FB-app.py fb_app_parameter_lab.py
++FB_APP_DAILY_OLD="$FIXTURES/baseline/FB-app_V16.4.11.py" PYTHONPATH="$PWD" \
++  python -m unittest discover -s tests -v
++PYTHONPATH="$PWD:$FIXTURES" FB_APP_CANDIDATE="$PWD/FB-app.py" \
++FB_APP_INCIDENT_VERSION="$FIXTURES/baseline/FB-app_V16.4.10.py" \
++FB_APP_V1649="$FIXTURES/baseline/FB-app_V16.4.9.py" \
++  python -m unittest -v test_fb_app_16411 test_fb_app_16410.Helpers
++bash tests/run_slot_postgres.sh /absolute/path/to/postgresql/bin
++```
++
++最後一項需要非 root 使用者及原生 PostgreSQL 的 `initdb`、`pg_ctl`、`createdb`。腳本不監聽 TCP、不接受外部連線，只使用私有 Unix socket 和一次性資料庫；直接 `discover` 時這批測試略過。
++
++## 安全上線與回退
++
++- **部署前：** 將改動套到最新 `main` 的獨立分支，避免覆寫仍在更新的正式 CSV；確認程式、刪檔、詳細測試及設定表相容性。核准前不合併到會自動部署的 `main`。不要執行歷史 `16413_early_settlement.sql` 或啟用 `EARLY_SETTLE_MODE`。
++- **部署後：** 先確認介面顯示 V18、新時段預設未選、05:00 設定無變；核實實際 App 角色可以照現行方式讀取及寫入既有主表與排程表，但不要為求通過任意改權限。先用隔離資料驗收；其後獲批准才在正式環境勾選時段。以同場 ID／香港日期、已落庫比分／角球／CLV、注碼／賠率原值和每日標記核對。只有「取得執行權」或共享進度，不是正式成功證據。
++- **出問題：** 取消全部額外時段並儲存，保留 05:00。若批次已開始，先停止新排程並核對在途交易；顯示未獲儲存確認時按 ID 核對正式資料，不要盲目重送。若須回退程式，以新提交回復核對過的功能基線，不回捲 `main`、不還原 CSV 或刪資料。回退到 V17 時確認原兩小時功能保持關閉，不執行舊遷移。
++- **備份界線：** 029 有範圍內備份的隔離還原報告；本輪只核對既有報告及手冊，未取得原加密歸檔或解密金鑰，也未重新還原正式資料。若要交接可還原備份，另以安全途徑安排金鑰／加密檔移交，不把密碼寫入手冊或 Github。
+diff --git a/fb_app_early_settlement.py b/fb_app_early_settlement.py
+deleted file mode 100644
+index d01977c..0000000
+--- a/fb_app_early_settlement.py
++++ /dev/null
+@@ -1,686 +0,0 @@
+-"""V17: conservative settlement of existing slips only, never creates a bet."""
+-
+-import hashlib
+-import json
+-import math
+-import re
+-from concurrent.futures import ThreadPoolExecutor
+-from dataclasses import asdict, dataclass
+-from datetime import date, datetime, timedelta, timezone
+-
+-import requests
+-
+-try:
+-    from sqlalchemy import bindparam, text
+-except ImportError:
+-    # Legacy CSV-only use can still start; observe/write require the existing SQL dependencies.
+-    bindparam = text = None
+-
+-
+-HKT = timezone(timedelta(hours=8))
+-UTC = timezone.utc
+-POLL = timedelta(minutes=10)
+-GAP = timedelta(minutes=30)
+-HOLD = timedelta(hours=2)
+-FRESH = timedelta(seconds=60)
+-LOOKBACK = timedelta(days=14)
+-MAX_MATCHES = 8
+-MIN_PROBE_SLOTS = 2  # Keep checking other matches even while stable finals get follow-ups.
+-API = "https://tipsme-web.azurewebsites.net/api/Score"
+-PAGE = "https://tipsme.hk/zh-HK/match/{}/live"
+-STATE = 'public.fb_early_state_16413'
+-RECEIPT = 'public.fb_early_receipt_16413'
+-LEASE = 'public.fb_early_lease_16413'
+-BETS = 'public."football_bets"'
+-TOMBS = 'public."football_bets_deleted"'
+-STRICT_ID = r'^[+]?0*[0-9]{1,12}([.]0+)?$'
+-IDENTITY = ('ID', 'Status', 'Tipsme_Match_ID', 'Match_Date', 'Home_Team', 'Away_Team', 'Match')
+-INPUTS = ('Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 'System_Stake', 'User_Stake')
+-RESULT = ('Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner', 'Home_Red', 'Away_Red',
+-          'Home_Yellow', 'Away_Yellow', 'Half_Score', 'System_Profit', 'User_Profit',
+-          'System_Payout', 'User_Payout', 'Unit_Profit', 'Result_Label')
+-COLUMNS = IDENTITY + INPUTS + RESULT + ('Odds_History',)
+-MARKETS = {'讓球': ('hdpOdds', 'home_cap', 'home_win_odds', 'away_win_odds', ('Home', 'Away')),
+-           '入球大小': ('hiloOdds', 'number_of_goals', 'big_odds', 'small_odds', ('Over', 'Under')),
+-           '角球大小': ('chiloOdds', 'number_of_corners', 'big_odds', 'small_odds', ('Over', 'Under'))}
+-ABNORMAL = re.compile(r'腰斬|取消|改期|延期|押後|暫停|暂停|中斷|中断|中止|加時|加时|十二碼|点球大战|'
+-                      r'abandon|cancel|postpon|suspend|interrupt|extra[ -]time|shoot[ -]?out', re.I)
+-NEXT = re.compile(r'<script\b[^>]*\bid=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', re.S)
+-
+-
+-class Review(ValueError):
+-    """A controlled fail-closed outcome; code is safe for logs and UI."""
+-
+-    def __init__(self, code, *, manual=False):
+-        super().__init__(code)
+-        self.code = code
+-        self.manual = manual
+-
+-
+-def mode(value):
+-    value = str(value or 'off').strip().lower()
+-    return value if value in ('off', 'observe', 'write') else 'invalid'
+-
+-
+-def identifier(value):
+-    s = str(value or '').strip()
+-    if not re.fullmatch(STRICT_ID, s):
+-        return None
+-    return s.split('.')[0].lstrip('+').lstrip('0') or None
+-
+-
+-def explicit_date(value):
+-    try:
+-        return date.fromisoformat(str(value)) if re.fullmatch(r'\d{4}-\d{2}-\d{2}', str(value)) else None
+-    except ValueError:
+-        return None
+-
+-
+-def digest(value):
+-    return hashlib.sha256(json.dumps(value, default=str, sort_keys=True,
+-                                     ensure_ascii=False).encode()).hexdigest()
+-
+-
+-def pair(value):
+-    m = re.fullmatch(r'(\d{1,2})\s*[-:]\s*(\d{1,2})', str(value or '').strip())
+-    if not m:
+-        raise Review('missing_or_invalid_score')
+-    return tuple(map(int, m.groups()))
+-
+-
+-def provider_time(value):
+-    try:
+-        stamp = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+-        if 'T' not in str(value):
+-            raise ValueError
+-        return (stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)).astimezone(HKT)
+-    except (TypeError, ValueError, OverflowError) as exc:
+-        raise Review('provider_time') from exc
+-
+-
+-@dataclass(frozen=True)
+-class Evidence:
+-    mid: str
+-    home: str
+-    away: str
+-    kickoff: datetime
+-    goals: tuple
+-    half: tuple
+-    corners: tuple
+-    cards: tuple
+-
+-    @property
+-    def key(self):
+-        return digest(asdict(self))
+-
+-
+-def _score_record(record, mid, norm):
+-    if any(ABNORMAL.search(str(record.get(k) or '')) for k in
+-           ('liveTime', 'matchStatus', 'additionalTime')) or record.get('extraScore') not in ('',):
+-        # Missing extraScore is unknown, not positive evidence of extra time.
+-        raise Review('extra_time_or_abnormal_status',
+-                     manual=bool(record.get('extraScore')) or any(
+-                         ABNORMAL.search(str(record.get(k) or '')) and
+-                         not re.search(r'延期|押後|暫停|暂停|中斷|中断|改期|postpon|suspend|interrupt',
+-                                       str(record.get(k) or ''), re.I)
+-                         for k in ('liveTime', 'matchStatus', 'additionalTime')))
+-    if str(record.get('matchStatus')) != '8' or record.get('liveTime') not in ('完', 'FT'):
+-        raise Review('not_normal_final')
+-    home, away = norm(record.get('home')), norm(record.get('away'))
+-    if identifier(record.get('matchId')) != mid or not home or not away or home == away:
+-        raise Review('provider_identity')
+-    kickoff = provider_time(record.get('fullMatchTimeUtc'))
+-    try:
+-        local = datetime.strptime(record['fullMatchTime'], '%m/%d/%Y %H:%M:%S').replace(tzinfo=HKT)
+-    except (KeyError, ValueError, TypeError) as exc:
+-        raise Review('local_kickoff') from exc
+-    if kickoff != local:
+-        raise Review('kickoff_disagreement')
+-    goals, half, corners = (pair(record.get(x)) for x in ('score', 'halfScore', 'corner'))
+-    if any(h > f for h, f in zip(half, goals)):
+-        raise Review('impossible_half_score')
+-    cards = tuple(str(record.get(k)) for k in ('homeRedCard', 'awayRedCard', 'homeYellowCard', 'awayYellowCard'))
+-    if any(not re.fullmatch(r'\d{1,2}', v) for v in cards):
+-        raise Review('missing_cards')
+-    return Evidence(mid, home, away, kickoff, goals, half, corners, tuple(map(int, cards)))
+-
+-
+-def parse_final(mid, api, html, norm):
+-    """Two Tipsme surfaces, plus regulation event and statistics evidence on /live."""
+-    try:
+-        pg = json.loads(NEXT.search(html)[1])['props']['pageProps']
+-        a = _score_record(api, mid, norm)
+-        b = _score_record(pg['liveScore'], mid, norm)
+-        if a != b or identifier(pg['matchId']) != mid:
+-            raise Review('source_disagreement')
+-        fixtures = pg['initialFixtures']['fixtures']
+-        events = fixtures['mainDetails']
+-        if not isinstance(events, list) or not events:
+-            raise Review('missing_event_timeline')
+-        halves, finals, late = [], [], False
+-        for event in events:
+-            minute = str(event.get('time') or '').strip()
+-            kinds = ' '.join(str(event.get(k) or '') for k in ('homeEventType', 'awayEventType'))
+-            if ABNORMAL.search(minute + ' ' + kinds):
+-                raise Review('abnormal_event_timeline')
+-            if minute in ('中', '完'):
+-                shown = [pair(event[k]) for k in ('awayEventDetails', 'homeEventDetails') if event.get(k)]
+-                if len(shown) != 1:
+-                    raise Review('ambiguous_event_marker')
+-                (halves if minute == '中' else finals).append(shown[0])
+-            else:
+-                m = re.fullmatch(r'(\d{1,3})(?:\+\d{1,2})?', minute)
+-                if not m or int(m[1]) > 90:
+-                    raise Review('non_regulation_event_minute')
+-                late |= int(m[1]) == 90
+-        tech = [pair(f"{r.get('home')}-{r.get('away')}") for r in fixtures['techDetails']
+-                if r.get('time') in ('角球', 'Corners')]
+-        if (halves, finals, tech) != ([a.half], [a.goals], [a.corners]) or not late or events[-1].get('time') != '完':
+-            raise Review('incomplete_or_conflicting_timeline')
+-        return a
+-    except (KeyError, AttributeError, TypeError, IndexError, json.JSONDecodeError) as exc:
+-        raise Review('provider_payload') from exc
+-
+-
+-class Tipsme:
+-    def __init__(self, norm):
+-        self.norm = norm
+-
+-    @staticmethod
+-    def _get(url):
+-        headers = {'Accept-Language': 'zh-HK', 'Cache-Control': 'no-cache', 'Pragma': 'no-cache'}
+-        if url.startswith('https://tipsme.hk/'):
+-            try:
+-                from curl_cffi import requests as page_client
+-                from curl_cffi.requests.exceptions import RequestException as PageError
+-            except ImportError as exc:
+-                raise Review('event_page_client_unavailable') from exc
+-            try:
+-                response = page_client.get(url, headers=headers, timeout=(3, 5), allow_redirects=False,
+-                                           impersonate='chrome')
+-            except PageError as exc:
+-                raise Review('event_page_unavailable') from exc
+-        else:
+-            response = requests.get(url, headers=headers, timeout=(3, 5), allow_redirects=False)
+-        if response.status_code != 200:
+-            raise Review('provider_unavailable')
+-        try:
+-            age = float(response.headers.get('Age', 0))
+-        except ValueError as exc:
+-            raise Review('provider_cache_age') from exc
+-        if not 0 <= age <= 60:
+-            raise Review('provider_cached')
+-        return response
+-
+-    def final(self, mid):
+-        try:
+-            api = self._get(f'{API}/match/{mid}').json()
+-            # Do not spend a page call on clearly non-final fixtures.
+-            _score_record(api, mid, self.norm)
+-            return parse_final(mid, api, self._get(PAGE.format(mid)).text, self.norm)
+-        except (requests.RequestException, AttributeError) as exc:
+-            raise Review('provider_unavailable') from exc
+-
+-    def odds(self, mid):
+-        try:
+-            return self._get(f'{API}/odds/hkjc/{mid}').json()
+-        except requests.RequestException as exc:
+-            raise Review('odds_unavailable') from exc
+-
+-
+-def relevant(rows, mid, day, home, away, norm):
+-    for row in rows:
+-        rid, dt = identifier(row['Tipsme_Match_ID']), explicit_date(row['Match_Date'])
+-        teams = (norm(row['Home_Team']), norm(row['Away_Team']))
+-        label = re.split(r'\s+vs\s+', str(row['Match'] or '').strip(), flags=re.I)
+-        named = tuple(map(norm, label)) == (home, away)
+-        same_pair = teams == (home, away) or named
+-        swapped = teams == (away, home) or tuple(map(norm, label)) == (away, home)
+-        if rid == mid or (dt == day and (same_pair or swapped)) or (dt is None and (same_pair or swapped) and rid is None):
+-            yield row, (rid == mid and dt == day and teams == (home, away)
+-                        and (len(label) == 1 or named))
+-
+-
+-def exact_open_group(rows, ev, norm):
+-    matches = list(relevant(rows, ev.mid, ev.kickoff.date(), ev.home, ev.away, norm))
+-    if not matches or any(not exact or r['Status'] != 'Open' for r, exact in matches):
+-        raise Review('non_open_or_ambiguous_group')
+-    group = sorted((r for r, _ in matches), key=lambda r: str(r['ID']))
+-    ids = [str(r['ID'] or '') for r in group]
+-    if any(not rid or rid.startswith('TOTAL') for rid in ids) or len(set(ids)) != len(ids):
+-        raise Review('duplicate_or_invalid_slip_id')
+-    return group
+-
+-
+-def number(value):
+-    try:
+-        n = float(value)
+-        if not math.isfinite(n):
+-            raise ValueError
+-        return n
+-    except (TypeError, ValueError, OverflowError) as exc:
+-        raise Review('invalid_slip_numbers') from exc
+-
+-
+-def _history_stamp(value, cutoff):
+-    v = str(value or '')
+-    if re.fullmatch(r'\d{4}-\d\d-\d\d \d\d:\d\d', v):
+-        try:
+-            t = datetime.strptime(v, '%Y-%m-%d %H:%M').replace(tzinfo=HKT)
+-        except ValueError as exc:
+-            raise Review('unverified_existing_clv_timestamp') from exc
+-        if cutoff - LOOKBACK <= t < cutoff:
+-            return t
+-    if re.fullmatch(r'\d\d-\d\d \d\d:\d\d', v):
+-        for year in (cutoff.year, cutoff.year - 1):
+-            try:
+-                t = datetime.strptime(f'{year}-{v}', '%Y-%m-%d %H:%M').replace(tzinfo=HKT)
+-            except ValueError:
+-                continue
+-            if cutoff - LOOKBACK <= t < cutoff:
+-                return t
+-    raise Review('unverified_existing_clv_timestamp')
+-
+-
+-def _closing(raw, ev, market, line, norm, parse_line, odds_entry):
+-    if not isinstance(raw, dict) or (norm(raw.get('hkjcHomeTeamName')), norm(raw.get('hkjcAwayTeamName'))) != (ev.home, ev.away):
+-        raise Review('odds_identity')
+-    key, line_key, upp, low, _ = MARKETS[market]
+-    recs = raw.get(key)
+-    if not isinstance(recs, list):
+-        raise Review('missing_closing_market')
+-    cutoff = ev.kickoff.replace(second=0, microsecond=0)
+-    quotes = {}
+-    for r in recs:
+-        if not isinstance(r, dict) or r.get(line_key) is None:
+-            raise Review('invalid_closing_market')
+-        if parse_line(r[line_key]) != line:
+-            continue
+-        t = provider_time(r.get('create_time'))
+-        if not cutoff - LOOKBACK <= t < cutoff:
+-            continue
+-        up, lo = number(r.get(upp)), number(r.get(low))
+-        if min(up, lo) <= 1:
+-            raise Review('invalid_closing_quote')
+-        minute = t.replace(second=0, microsecond=0)
+-        if minute in quotes and quotes[minute] != (up, lo):
+-            raise Review('ambiguous_closing_minute')
+-        quotes[minute] = (up, lo)
+-    if not quotes:
+-        raise Review('missing_pre_kickoff_price')
+-    return cutoff, quotes, [odds_entry(i, market, t.strftime('%Y-%m-%d %H:%M'), line, *v)
+-                            for i, (t, v) in enumerate(sorted(quotes.items()))]
+-
+-
+-def build_plan(group, ev, raw_odds, *, norm, calculate, parse_line, odds_entry, merge_history):
+-    """Calculate with existing payout math; refuse ambiguous CLV rather than rewrite history."""
+-    updates = {}
+-    for r in group:
+-        bt = str(r['Bet_Type'] or '').strip()
+-        live = bt.endswith(' (即場)')
+-        market = bt.removesuffix(' (即場)')
+-        if market not in MARKETS or r['Selection'] not in MARKETS[market][-1]:
+-            raise Review('unsupported_slip')
+-        line, price, system, user = (number(r[k]) for k in INPUTS[2:])
+-        if not -50 <= line <= 50 or line * 4 != round(line * 4) or price <= 1 or min(system, user) < 0:
+-            raise Review('invalid_slip_numbers')
+-        sp, up, sa, ua, unit, label, _ = calculate(bt, r['Selection'], line, price, system, user,
+-                                                   *ev.goals, *ev.corners)
+-        if not all(math.isfinite(v) for v in (sp, up, sa, ua, unit)):
+-            raise Review('invalid_calculated_amount')
+-        values = ('Settled', *ev.goals, *ev.corners, *ev.cards, f'{ev.half[0]}-{ev.half[1]}',
+-                  sp, up, sa, ua, unit, label)
+-        changes = dict(zip(('Status',) + RESULT, values))
+-        if not live:
+-            cutoff, quotes, snapshots = _closing(raw_odds, ev, market, line, norm, parse_line, odds_entry)
+-            try:
+-                history = json.loads(r['Odds_History'] or '[]')
+-            except (ValueError, TypeError) as exc:
+-                raise Review('invalid_odds_history') from exc
+-            if not isinstance(history, list) or any(not isinstance(s, dict) for s in history):
+-                raise Review('invalid_odds_history')
+-            known = {}
+-            for snap in history:
+-                if str(snap.get('type') or '').strip() != market:
+-                    continue
+-                if number(snap.get('line')) != line:
+-                    continue
+-                t = _history_stamp(snap.get('record_time'), cutoff)
+-                existing = number(snap.get('upper')), number(snap.get('lower'))
+-                if t > max(quotes) or min(existing) <= 1 or (t in quotes and existing != quotes[t]):
+-                    raise Review('conflicting_existing_clv_price')
+-                if t in known and existing != known[t]:
+-                    raise Review('conflicting_existing_clv_price')
+-                known[t] = existing
+-            snapshots = [s for s in snapshots if _history_stamp(s['record_time'], cutoff) not in known]
+-            merged, added = merge_history(r['Odds_History'], snapshots)
+-            if added:
+-                changes['Odds_History'] = merged
+-        updates[str(r['ID'])] = changes
+-    return updates
+-
+-
+-def _in(values, sql, conn):
+-    return conn.execute(text(sql).bindparams(bindparam('ids', expanding=True)), {'ids': sorted(values)})
+-
+-
+-def _fields(cols):
+-    return ', '.join(f'"{c}"' for c in cols)
+-
+-
+-def _short(conn):
+-    conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+-    conn.execute(text("SET LOCAL statement_timeout = '8s'"))
+-
+-
+-def _now(conn):
+-    return conn.scalar(text('SELECT clock_timestamp()'))
+-
+-
+-def _rows(conn, ev):
+-    pattern = rf'^[+]?0*{ev.mid}([.]0+)?$'
+-    # Alias checks need only identity columns; don't load large odds histories for unrelated legacy rows.
+-    core = ', '.join(f'CASE WHEN match_id_ok THEN "{c}" END AS "{c}"' for c in COLUMNS[len(IDENTITY):])
+-    return list(conn.execute(text(f'''
+-        SELECT {_fields(IDENTITY)}, {core} FROM (
+-            SELECT *, btrim(CAST("Tipsme_Match_ID" AS text)) ~ :pattern AS match_id_ok FROM {BETS}
+-        ) AS slips
+-        WHERE match_id_ok
+-           OR CAST("Match_Date" AS text) = :day
+-           OR ("Match_Date" IS NULL OR CAST("Match_Date" AS text) !~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$')
+-        '''), {'pattern': pattern, 'day': ev.kickoff.date().isoformat()}).mappings())
+-
+-
+-def _locked_state(conn, mid):
+-    return conn.execute(text(f'SELECT * FROM {STATE} WHERE match_id = :mid FOR UPDATE'),
+-                        {'mid': mid}).mappings().one_or_none()
+-
+-
+-def _fence(conn, lease):
+-    latest = conn.scalar(text(f'SELECT last_scan FROM {LEASE} WHERE singleton FOR SHARE'))
+-    if latest != lease:
+-        raise Review('scan_superseded')
+-
+-
+-class Postgres:
+-    def __init__(self, engine, norm):
+-        self.engine = engine
+-        self.norm = norm
+-
+-    def claim(self, run_mode):
+-        """One shared start per ten minutes across all Streamlit processes."""
+-        with self.engine.begin() as conn:
+-            _short(conn)
+-            # Even empty scans must not look healthy with an unapplied/partial migration.
+-            conn.execute(text(f'SELECT slip_id FROM {RECEIPT} LIMIT 0'))
+-            if run_mode == 'write':
+-                conn.execute(text(f'SELECT id FROM {TOMBS} LIMIT 0'))
+-            now = _now(conn)
+-            last = conn.execute(text(f'''SELECT last_scan FROM {LEASE} WHERE singleton FOR UPDATE'''
+-                                     )).scalar_one()
+-            if last is not None and now - last < POLL:
+-                return None, []
+-            today = now.astimezone(HKT).date()
+-            hits = conn.execute(text(f'''
+-                WITH candidates AS (
+-                    SELECT DISTINCT ltrim(regexp_replace(split_part(btrim(CAST("Tipsme_Match_ID" AS text)),
+-                        '.', 1), '^[+]', ''), '0') AS mid
+-                    FROM {BETS} WHERE "Status" = 'Open'
+-                    AND CAST("Match_Date" AS text) BETWEEN :lo AND :hi
+-                    AND btrim(CAST("Tipsme_Match_ID" AS text)) ~ :pattern
+-                ), ranked AS (
+-                    SELECT c.mid, s.last_attempt,
+-                        CASE WHEN s.reason = 'normal_final'
+-                              AND s.last_good BETWEEN :gap_floor AND :now
+-                              AND s.last_good - s.first_good < :hold
+-                             THEN s.first_good END AS observation_started
+-                    FROM candidates c LEFT JOIN {STATE} s ON s.match_id = c.mid
+-                    WHERE c.mid <> '' AND NOT coalesce(s.manual, false)
+-                ), followups AS (
+-                    -- Protect the oldest still-continuous, unfinished windows instead
+-                    -- of letting a long round-robin queue repeatedly reset them.
+-                    SELECT mid, last_attempt, observation_started FROM ranked
+-                    WHERE observation_started IS NOT NULL
+-                    ORDER BY observation_started, last_attempt, mid LIMIT :follow_limit
+-                ), probes AS (
+-                    SELECT r.mid, r.last_attempt FROM ranked r
+-                    WHERE NOT EXISTS (SELECT 1 FROM followups f WHERE f.mid = r.mid)
+-                    ORDER BY r.last_attempt NULLS FIRST, r.mid
+-                    LIMIT (:limit - (SELECT count(*) FROM followups))
+-                )
+-                SELECT mid FROM (
+-                    SELECT mid, last_attempt, observation_started, 0 AS lane FROM followups
+-                    UNION ALL
+-                    SELECT mid, last_attempt, NULL, 1 FROM probes
+-                ) q ORDER BY lane, observation_started, last_attempt NULLS FIRST, mid
+-                '''), {'lo': (today - LOOKBACK).isoformat(), 'hi': today.isoformat(),
+-                       'pattern': STRICT_ID, 'limit': MAX_MATCHES, 'now': now, 'gap_floor': now - GAP,
+-                       'hold': HOLD, 'follow_limit': MAX_MATCHES - MIN_PROBE_SLOTS}).scalars().all()
+-            conn.execute(text(f'UPDATE {LEASE} SET last_scan = :now WHERE singleton'), {'now': now})
+-            return now, hits
+-
+-    def observe(self, lease, began, mid, ev, code, manual=False):
+-        with self.engine.begin() as conn:
+-            _short(conn)
+-            _fence(conn, lease)
+-            conn.execute(text(f'''INSERT INTO {STATE} (match_id, reason) VALUES (:mid, 'new')
+-                                  ON CONFLICT (match_id) DO NOTHING'''), {'mid': mid})
+-            old = _locked_state(conn, mid)
+-            now = _now(conn)
+-            if old['manual']:
+-                return False
+-            if not timedelta(0) <= now - began <= FRESH:
+-                ev, code, manual = None, 'stale_observation', False
+-            if ev is not None and not timedelta(minutes=90) <= now - ev.kickoff <= LOOKBACK + timedelta(days=1):
+-                ev, code = None, 'kickoff_out_of_range'
+-            first = None
+-            if ev is not None:
+-                continuous = old['fingerprint'] == ev.key and old['last_good'] is not None and (
+-                    timedelta(0) <= now - old['last_good'] <= GAP)
+-                first = old['first_good'] if continuous else now
+-            if manual:
+-                ev, first = None, None
+-            conn.execute(text(f'''UPDATE {STATE} SET first_good=:first, last_good=:last,
+-                          last_attempt=:now, fingerprint=:fp, reason=:code, manual=:manual WHERE match_id=:mid
+-                          '''), dict(mid=mid, first=first, last=now if ev else None, now=now,
+-                                     fp=ev.key if ev else None, code=code, manual=manual))
+-            return first is not None and now - first >= HOLD
+-
+-    def group(self, ev):
+-        with self.engine.begin() as conn:
+-            _short(conn)
+-            return exact_open_group(_rows(conn, ev), ev, self.norm)
+-
+-    def record_reason(self, lease, mid, code):
+-        with self.engine.begin() as conn:
+-            _short(conn)
+-            _fence(conn, lease)
+-            conn.execute(text(f'UPDATE {STATE} SET reason=:code WHERE match_id=:mid AND NOT manual'),
+-                         {'mid': mid, 'code': code})
+-
+-    def write(self, lease, ev, group, plan, began):
+-        with self.engine.begin() as conn:
+-            _short(conn)
+-            _fence(conn, lease)
+-            conn.execute(text(f'LOCK TABLE {BETS} IN SHARE ROW EXCLUSIVE MODE'))
+-            state = _locked_state(conn, ev.mid)
+-            now = _now(conn)
+-            if (not state or state['manual'] or state['fingerprint'] != ev.key or
+-                    not timedelta(0) <= now - state['last_good'] <= GAP or
+-                    now - state['first_good'] < HOLD or not timedelta(0) <= now - began <= FRESH):
+-                raise Review('expired_write_evidence')
+-            current = exact_open_group(_rows(conn, ev), ev, self.norm)
+-            if digest([dict(r) for r in current]) != digest([dict(r) for r in group]):
+-                raise Review('group_changed_since_read')
+-            ids = set(plan)
+-            if ids != {str(r['ID']) for r in current}:
+-                raise Review('invalid_write_plan')
+-            if _in(ids, f'SELECT id FROM {TOMBS} WHERE id IN :ids', conn).first():
+-                raise Review('tombstoned_slip')
+-            if _in(ids, f'SELECT 1 FROM {BETS} WHERE "ID" IN :ids GROUP BY "ID" HAVING count(*) <> 1', conn).first():
+-                raise Review('duplicate_or_invalid_slip_id')
+-            if conn.scalar(text(f'SELECT EXISTS (SELECT 1 FROM {RECEIPT} WHERE match_id=:mid)'),
+-                           {'mid': ev.mid}):
+-                raise Review('match_already_receipted')
+-            expected = {}
+-            original = {str(r['ID']): r for r in current}
+-            for rid, changes in plan.items():
+-                if (not {'Status', *RESULT} <= changes.keys() <= {'Status', *RESULT, 'Odds_History'}
+-                        or changes['Status'] != 'Settled'):
+-                    raise Review('invalid_write_columns')
+-                before = original[rid]
+-                expected[rid] = {
+-                    'Match_Date': ev.kickoff.date().isoformat(),
+-                    'Tipsme_Match_ID': ev.mid,
+-                    **{k: before[k] for k in ('Home_Team', 'Away_Team', 'Bet_Type', 'Selection', 'Odds_History')},
+-                    **{k: number(before[k]) for k in INPUTS[2:]},
+-                    **changes,
+-                }
+-                assignments = ', '.join(f'"{k}"=:{k}' for k in changes)
+-                res = conn.execute(text(f'''UPDATE {BETS} SET {assignments}
+-                                             WHERE "ID"=:rid AND "Status"='Open' '''),
+-                                   {'rid': rid, **{k: str(v) for k, v in changes.items()}})
+-                if res.rowcount != 1:
+-                    raise Review('update_count')
+-            saved = list(_in(ids, f'SELECT {_fields(COLUMNS)} FROM {BETS} WHERE "ID" IN :ids', conn).mappings())
+-            if (len(saved) != len(ids) or {str(r['ID']) for r in saved} != ids or
+-                    any(not equal_changes(r, expected[str(r['ID'])]) for r in saved)):
+-                raise Review('transaction_readback')
+-            for rid, fields in expected.items():
+-                conn.execute(text(f'''INSERT INTO {RECEIPT} (slip_id, match_id, match_day, fingerprint,
+-                                    committed_at, expected) VALUES (:rid,:mid,:day,:fp,:now,CAST(:expected AS jsonb))'''),
+-                             dict(rid=rid, mid=ev.mid, day=ev.kickoff.date(), fp=ev.key, now=now,
+-                                  expected=json.dumps(fields, ensure_ascii=False)))
+-            conn.execute(text(f"UPDATE {STATE} SET reason='committed' WHERE match_id=:mid"), {'mid': ev.mid})
+-        # A different transaction confirms the commit. If uncertain, never replay a receipted match.
+-        with self.engine.begin() as conn:
+-            _short(conn)
+-            ledger = list(_in(ids, f'SELECT slip_id, fingerprint, expected FROM {RECEIPT} WHERE slip_id IN :ids',
+-                              conn).mappings())
+-            got = list(_in(ids, f'SELECT {_fields(COLUMNS)} FROM {BETS} WHERE "ID" IN :ids', conn).mappings())
+-            if (len(ledger) != len(ids) or len(got) != len(ids) or {str(r['ID']) for r in got} != ids
+-                    or any(r['fingerprint'] != ev.key or r['expected'] != expected[r['slip_id']] for r in ledger)
+-                    or any(not equal_changes(r, expected[str(r['ID'])]) for r in got)):
+-                raise Review('commit_readback_unconfirmed')
+-            return ids
+-
+-    def observed_until(self):
+-        with self.engine.begin() as conn:
+-            _short(conn)
+-            return _now(conn)
+-
+-    def review_day(self, day, fixtures):
+-        with self.engine.connect().execution_options(isolation_level='REPEATABLE READ') as conn, conn.begin():
+-            _short(conn)
+-            conn.execute(text('SET TRANSACTION READ ONLY'))
+-            rows = conn.execute(text(f'''SELECT {_fields(IDENTITY + RESULT[:4])}
+-                     FROM {BETS} b WHERE NOT EXISTS (SELECT 1 FROM {TOMBS} t WHERE t.id=b."ID")'''
+-                                    )).mappings().all()
+-            pending = reconciliation_pending(rows, fixtures, day, self.norm)
+-            audits = conn.execute(text(f'''SELECT a.slip_id, a.expected, to_jsonb(b) AS actual,
+-                       EXISTS (SELECT 1 FROM {TOMBS} t WHERE t.id=a.slip_id) AS deleted
+-                       FROM {RECEIPT} a LEFT JOIN {BETS} b ON b."ID"=a.slip_id
+-                       WHERE a.match_day=:day'''), {'day': day}).mappings().all()
+-        return pending, (len({r['slip_id'] for r in audits}) == len(audits) and
+-                         all(r['actual'] and not r['deleted'] and equal_changes(r['actual'], r['expected'])
+-                             for r in audits))
+-
+-
+-def equal_changes(row, changes):
+-    for k, exp in changes.items():
+-        val = row.get(k)
+-        if k == 'Match_Date':
+-            if str(val) != exp:
+-                return False
+-        elif k == 'Tipsme_Match_ID':
+-            if identifier(val) != exp:
+-                return False
+-        elif isinstance(exp, (int, float)):
+-            try:
+-                if number(val) != exp:
+-                    return False
+-            except Review:
+-                return False
+-        elif val != exp:
+-            return False
+-    return True
+-
+-
+-def protected_current(conn, ids):
+-    """Generic writer's freshness check; stays on after mode is switched back to off."""
+-    if not ids or not conn.scalar(text('SELECT to_regclass(:name)'), {'name': RECEIPT}):
+-        return []
+-    return list(_in(ids, f'''SELECT b.* FROM {BETS} b JOIN {RECEIPT} r ON r.slip_id=b."ID"
+-                             WHERE b."ID" IN :ids''', conn).mappings())
+-
+-
+-def early_scan(store, provider, run_mode, planner):
+-    if run_mode not in ('observe', 'write'):
+-        return {}
+-
+-    def one(mid):
+-        began = store.observed_until()
+-        try:
+-            ev = provider.final(mid)
+-        except Review as exc:
+-            store.observe(lease, began, mid, None, exc.code, exc.manual)
+-            return (exc.code, set())
+-        if not store.observe(lease, began, mid, ev, 'normal_final'):
+-            return ('observing', set())
+-        try:
+-            group = store.group(ev)
+-            pre = any(not str(r['Bet_Type']).strip().endswith(' (即場)') for r in group)
+-            plan = planner(group, ev, provider.odds(mid) if pre else None)
+-            if run_mode == 'observe':
+-                store.record_reason(lease, mid, 'would_settle')
+-                return ('would_settle', set())
+-            began = store.observed_until()
+-            try:
+-                fresh = provider.final(mid)
+-            except Review as exc:
+-                store.observe(lease, began, mid, None, exc.code, exc.manual)
+-                return (exc.code, set())
+-            if fresh != ev:
+-                store.observe(lease, began, mid, fresh, 'final_corrected')
+-                return ('final_corrected', set())
+-            return ('committed', store.write(lease, ev, group, plan, began))
+-        except Review as exc:
+-            store.record_reason(lease, mid, exc.code)
+-            return (exc.code, set())
+-
+-    def guarded(mid):
+-        try:
+-            return one(mid)
+-        except Exception:
+-            # No fallback write. A failed/unknown commit is resolved by official rows + receipts.
+-            return ('sql_or_runtime_unconfirmed', set())
+-
+-    lease, matches = store.claim(run_mode)
+-    if not matches:
+-        return {}
+-    with ThreadPoolExecutor(max_workers=4) as workers:
+-        return dict(zip(matches, workers.map(guarded, matches)))
+-
+-
+-def reconciliation_pending(rows, fixtures, day, norm):
+-    """05:00 write mode: compare official rows to feed; never insert or settle here."""
+-    pending = set()
+-    day_rows = [r for r in rows if explicit_date(r['Match_Date']) == day]
+-    for r in day_rows:
+-        if r['Status'] != 'Settled':
+-            pending.add(identifier(r['Tipsme_Match_ID']) or 'legacy-open')
+-    for f in fixtures:
+-        mid = identifier(f.get('hkjc_match_id'))
+-        home, away = norm(f.get('home')), norm(f.get('away'))
+-        group = list(relevant(rows, mid, day, home, away, norm))
+-        values = tuple(f.get(k) for k in ('home_goal', 'away_goal', 'home_corner', 'away_corner'))
+-        if not mid or not home or not away or not f.get('finished') or any(
+-                type(v) is not int or not 0 <= v <= 99 for v in values):
+-            pending.add(mid or 'unknown-fixture')
+-            continue
+-        counts = dict(zip(RESULT[:4], values))
+-        if (not group or any(not exact or r['Status'] != 'Settled' or not equal_changes(r, counts)
+-                             for r, exact in group) or
+-                len({r['ID'] for r, _ in group}) != len(group)):
+-            pending.add(mid or 'unknown-fixture')
+-    return pending
+diff --git a/migrations/16413_early_settlement.sql b/migrations/16413_early_settlement.sql
+deleted file mode 100644
+index 1f085aa..0000000
+--- a/migrations/16413_early_settlement.sql
++++ /dev/null
+@@ -1,47 +0,0 @@
+--- V17 (schema identifier 16413). Run only on the intended PostgreSQL project after approval.
+--- Apply as the existing app DB owner, or explicitly provision a narrowly scoped service role.
+--- No ledger changes, extensions, grants, backfill, or automated DROP/rollback.
+-BEGIN;
+-SET LOCAL lock_timeout = '5s';
+-CREATE TABLE IF NOT EXISTS public.fb_early_state_16413 (
+-    match_id TEXT PRIMARY KEY CHECK (match_id ~ '^[1-9][0-9]{0,11}$'),
+-    fingerprint TEXT CHECK (fingerprint ~ '^[0-9a-f]{64}$'),
+-    first_good TIMESTAMPTZ,
+-    last_good TIMESTAMPTZ,
+-    last_attempt TIMESTAMPTZ,
+-    reason TEXT NOT NULL,
+-    manual BOOLEAN NOT NULL DEFAULT false,
+-    CHECK ((fingerprint IS NULL AND first_good IS NULL AND last_good IS NULL)
+-        OR (fingerprint IS NOT NULL AND first_good IS NOT NULL AND last_good IS NOT NULL AND last_attempt IS NOT NULL
+-            AND first_good <= last_good AND last_good <= last_attempt))
+-);
+-CREATE TABLE IF NOT EXISTS public.fb_early_lease_16413 (
+-    singleton BOOLEAN PRIMARY KEY CHECK (singleton),
+-    last_scan TIMESTAMPTZ
+-);
+-INSERT INTO public.fb_early_lease_16413 (singleton) VALUES (true) ON CONFLICT DO NOTHING;
+-CREATE TABLE IF NOT EXISTS public.fb_early_receipt_16413 (
+-    slip_id TEXT PRIMARY KEY,
+-    match_id TEXT NOT NULL CHECK (match_id ~ '^[1-9][0-9]{0,11}$'),
+-    match_day DATE NOT NULL,
+-    fingerprint TEXT NOT NULL CHECK (fingerprint ~ '^[0-9a-f]{64}$'),
+-    committed_at TIMESTAMPTZ NOT NULL,
+-    expected JSONB NOT NULL CHECK (jsonb_typeof(expected) = 'object')
+-);
+-CREATE INDEX IF NOT EXISTS fb_early_receipt_16413_match ON public.fb_early_receipt_16413 (match_id);
+-CREATE INDEX IF NOT EXISTS fb_early_receipt_16413_day ON public.fb_early_receipt_16413 (match_day);
+-ALTER TABLE public.fb_early_state_16413 ENABLE ROW LEVEL SECURITY;
+-ALTER TABLE public.fb_early_lease_16413 ENABLE ROW LEVEL SECURITY;
+-ALTER TABLE public.fb_early_receipt_16413 ENABLE ROW LEVEL SECURITY;
+-REVOKE ALL ON public.fb_early_state_16413, public.fb_early_lease_16413, public.fb_early_receipt_16413 FROM PUBLIC;
+--- Supabase default grants can be explicit even when PUBLIC has been revoked.
+-DO $$
+-DECLARE role_name TEXT;
+-BEGIN
+-    FOR role_name IN SELECT rolname FROM pg_roles WHERE rolname IN ('anon', 'authenticated')
+-    LOOP
+-        EXECUTE format('REVOKE ALL ON public.fb_early_state_16413, public.fb_early_lease_16413, '
+-                       'public.fb_early_receipt_16413 FROM %I', role_name);
+-    END LOOP;
+-END $$;
+-COMMIT;
+diff --git a/tests/run_early_postgres.sh b/tests/run_early_postgres.sh
+deleted file mode 100644
+index 41874c4..0000000
+--- a/tests/run_early_postgres.sh
++++ /dev/null
+@@ -1,21 +0,0 @@
+-#!/usr/bin/env bash
+-set -euo pipefail
+-if [[ $# -ne 1 || $1 != /* || ! -x "$1/initdb" || ! -x "$1/pg_ctl" ]]; then
+-  printf 'Usage: bash tests/run_early_postgres.sh /absolute/path/to/postgres/bin\n' >&2
+-  exit 2
+-fi
+-bin=$1
+-repo=$(cd "$(dirname "$0")/.." && pwd)
+-temp=$(mktemp -d /tmp/fbapp-16413-test.XXXXXX)
+-trap '"$bin/pg_ctl" -D "$temp/db" -m immediate -w stop >/dev/null 2>&1 || :; rm -rf -- "$temp"' EXIT
+-mkdir -m 700 "$temp/socket" "$temp/home"
+-export HOME="$temp/home"
+-unset DATABASE_URL DB_URL EARLY_SETTLE_MODE PGSERVICE PGHOST PGPORT PGDATABASE PGUSER PGOPTIONS
+-libargs=()
+-if [[ -f "$bin/../share/postgresql/postgres.bki" ]]; then
+-  libargs=(-L "$bin/../share/postgresql")
+-fi
+-"$bin/initdb" -D "$temp/db" "${libargs[@]}" -U fbapp_early_test -A trust --encoding=UTF8 --no-locale >/dev/null
+-"$bin/pg_ctl" -D "$temp/db" -l "$temp/postgres.log" -o "-c listen_addresses='' -k $temp/socket -p 55413" -w start
+-cd "$repo"
+-FBAPP_TEST_SOCKET="$temp/socket" PYTHONPATH="$repo" "${PYTHON:-python}" -m unittest discover -s tests -p 'test_early_postgres.py' -v
+diff --git a/tests/run_slot_postgres.sh b/tests/run_slot_postgres.sh
+new file mode 100644
+index 0000000..870dc01
+--- /dev/null
++++ b/tests/run_slot_postgres.sh
+@@ -0,0 +1,13 @@
++#!/usr/bin/env bash
++# Start only a throwaway PostgreSQL with no TCP listener.
++set -euo pipefail
++pgbin=${1:?Usage: bash tests/run_slot_postgres.sh /absolute/path/to/postgresql/bin}
++python_bin=${PYTHON:-python}
++export PYTHONPATH="$PWD"
++tmp=$(mktemp -d)
++trap '"$pgbin/pg_ctl" -D "$tmp/db" -m immediate stop >/dev/null 2>&1 || true; rm -rf -- "$tmp"' EXIT
++mkdir -m 700 "$tmp/socket"
++"$pgbin/initdb" --auth=trust --username=fbapp_slot_test --encoding=UTF8 --no-locale -D "$tmp/db" >/dev/null
++"$pgbin/pg_ctl" -D "$tmp/db" -l "$tmp/postgres.log" -o "-k '$tmp/socket' -c listen_addresses=''" -w start >/dev/null
++"$pgbin/createdb" -h "$tmp/socket" -U fbapp_slot_test fbapp_slot_test
++FB_APP_SLOT_TEST_SOCKET="$tmp/socket" "$python_bin" -m unittest discover -s tests -p test_slot_postgres.py -v
+diff --git a/tests/test_daily_schedule.py b/tests/test_daily_schedule.py
+index 8f78dd2..dd27880 100644
+--- a/tests/test_daily_schedule.py
++++ b/tests/test_daily_schedule.py
+@@ -145,6 +145,41 @@ _tipsme_fetch_page_html = fixture_get
+ st.session_state.result = tipsme_fetch_day_results('2026-11-20', require_complete=True)
+ '''
+ 
++SLOT_WIRING = WIRING + r'''
++from types import SimpleNamespace
++_has_secret = lambda key: key == 'DB_URL'
++_v163_sql_engine = lambda: SimpleNamespace(dialect=SimpleNamespace(name='postgresql'))
++get_hkt_now = lambda: datetime(2026, 11, 21, 0, 0, tzinfo=HKT) + timedelta(
++    seconds=st.session_state.get('test_delta', 0))
++def slot_cfg():
++    base = cfg_frame()
++    return pd.concat([base, pd.DataFrame([['settlement_slots', '00:00'],
++                      ['settlement_slot_claim', st.session_state.get('claim', '')]],
++                      columns=SCHED_COLUMNS)], ignore_index=True)
++_v16412_schedule_frame = slot_cfg
++def slot_claim(engine, key):
++    st.session_state.claim = key
++    st.session_state['_v1511_sched_cache'] = None
++    return True
++_v18_claim_slot = slot_claim
++_v18_open_match_ids = lambda engine, day: {'999001'}
++_v16412_settlement_recorded = lambda expected: set(expected.ID) == set(
++    st.session_state.test_db.loc[st.session_state.test_db.Status.eq('Settled'), 'ID'])
++if MODE == 'bad_slot_detail':
++    tipsme_fetch_match_info = lambda _mid: {**MATCH, 'corner': '7-1'}
++if MODE == 'no_slot_detail':
++    tipsme_fetch_match_info = lambda _mid: None
++if MODE == 'no_slot_close':
++    tipsme_fetch_hkjc_odds = lambda _mid: None
++if MODE in ('bad_slot_detail', 'no_slot_detail', 'no_slot_close'):
++    if not len(st.session_state.test_db):
++        st.session_state.test_db = pd.DataFrame([fixture_row(status='Open')]).reindex(columns=DB_COLUMNS)
++if MODE == 'mixed_slot_ids' and not len(st.session_state.test_db):
++    st.session_state.test_db = pd.DataFrame([
++        fixture_row(status='Open'), fixture_row(mid='', status='Open'),
++    ]).reindex(columns=DB_COLUMNS)
++'''
++
+ 
+ class DailyTests(unittest.TestCase):
+     def setUp(self):
+@@ -160,6 +195,8 @@ class DailyTests(unittest.TestCase):
+         filename.write_text(src + f'\nMODE={mode!r}\nMARKER={marker!r}\nWIN={win!r}\n' + code + '\n' + body,
+                             encoding='utf-8')
+         at = AppTest.from_file(str(filename), default_timeout=45)
++        if code == SLOT_WIRING:
++            at.secrets['DB_URL'] = ''  # Route calls through the explicit fake engine only.
+         at.query_params['runner'] = '1'
+         at.session_state['test_delta'] = delta
+         return self.rerun(at)
+@@ -357,3 +394,91 @@ st.session_state.result = (success, saved, failure, _v1511_sched_load(fresh=True
+                 rows, message = at.session_state.result
+                 self.assertIsNone(rows)
+                 self.assertIn('賽果未讀齊', message)
++
++    def test_slot_midnight_settles_only_existing_and_does_not_mark_0500(self):
++        at = self.play('open', code=SLOT_WIRING, delta=-1)
++        # The previous day's 05:00 can still be catching up at 23:59; only a slot is premature.
++        self.assertEqual(at.session_state.test_fetched, [('2026-11-19', {'require_complete': True})])
++        at.session_state['test_delta'] = 0
++        self.rerun(at)
++        self.assertEqual(at.session_state.test_fetched[-1],
++                         ('2026-11-20', {'require_complete': True, 'kickoff_window': ('21:00', '23:59')}))
++        self.assertEqual(at.session_state.test_writes, ['SETTLE_CONFIRM'])
++        self.assertEqual(tuple(at.session_state.test_db.iloc[0][
++            ['Status', 'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner', 'Half_Score']]),
++            ('Settled', 2, 1, 5, 2, '1-0'))
++        self.assertEqual(at.session_state.claim, '2026-11-21 00:00')
++        self.assertTrue(at.session_state.v15_auto['slot_verified'])
++        self.assertNotIn('test_marker', at.session_state)
++        self.assertFalse(Path('.fbapp_daily_status.csv').exists())
++        at.session_state['test_delta'] = 5 * 3600
++        self.rerun(at)
++        self.assertEqual(at.session_state.test_marker['last_run_win'], '00:00-23:59')
++        self.assertEqual(at.session_state.test_writes, ['SETTLE_CONFIRM'])
++
++    def test_slot_leaves_missing_open_details_or_clv_for_daily(self):
++        for mode in ('fresh', 'bad_slot_detail', 'no_slot_detail', 'no_slot_close', 'mixed_slot_ids'):
++            with self.subTest(mode=mode):
++                Path('auto_status.csv').unlink(missing_ok=True)
++                at = self.play(mode, code=SLOT_WIRING)
++                self.assertNotIn('test_writes', at.session_state)
++                self.assertNotIn('test_marker', at.session_state)
++                if mode != 'fresh':
++                    self.assertEqual(at.session_state.test_db.iloc[0]['Status'], 'Open')
++                    self.assertEqual(len(at.session_state.v15_auto['failed']), 1)
++                    at.session_state['test_delta'] = 901
++                    self.rerun(at)
++                    self.assertEqual(len(at.session_state.test_fetched), 1)
++
++    def test_all_slot_boundaries_and_claim_expiry(self):
++        at = self.play(code='', body=r'''
++cfg = {'settlement_slots': ','.join(_V18_SLOTS)}
++day = datetime(2026, 12, 31, tzinfo=HKT)
++ts = [day + timedelta(hours=h) for h in range(3, 25, 3)]
++st.session_state.result = [
++    ((key, d.isoformat(), lo, hi),
++     _v18_slot_due(t + timedelta(hours=2, minutes=59), {**cfg, 'settlement_slot_claim': key}),
++     _v18_slot_due(t, {'settlement_slots': '01:00'}))
++    for t in ts for key, d, lo, hi in [_v18_slot_due(t, cfg)]
++]
++''')
++        expected = [
++            ('03:00', '00:00', '02:59'), ('06:00', '03:00', '05:59'),
++            ('09:00', '06:00', '08:59'), ('12:00', '09:00', '11:59'),
++            ('15:00', '12:00', '14:59'), ('18:00', '15:00', '17:59'),
++            ('21:00', '18:00', '20:59'), ('00:00', '21:00', '23:59'),
++        ]
++        self.assertEqual(at.session_state.result, [
++            (('2027-01-01 ' + t if t == '00:00' else '2026-12-31 ' + t, '2026-12-31', lo, hi),
++             None, None)
++            for t, lo, hi in expected])
++
++    def test_slot_closing_odds_exclude_kickoff_minute_or_wrong_line(self):
++        body = r'''
++rows = pd.DataFrame([fixture_row(status='Open')])
++bet = {'type': '入球大小', 'line': 2.5, 'upper': 1.95, 'lower': 1.9}
++cases = [dict(bet, record_time='11-20 23:58'), dict(bet, record_time='11-20 23:59'),
++         dict(bet, record_time='11-21 00:01'), dict(bet, record_time='11-20 23:58', line=3.0)]
++st.session_state.result = [_v18_slot_close(rows, [hist], MATCH) is not None for hist in cases]
++'''
++        at = self.play(code=WIRING, body=body)
++        self.assertEqual(at.session_state.result, [True, False, False, False])
++
++    def test_slot_results_query_requires_only_its_relevant_rolling_pages(self):
++        body = FEED_WIRING + r'''
++del pages['2026-11-21', 1]
++am, _ = tipsme_fetch_day_results('2026-11-20', require_complete=True, kickoff_window=('12:00', '14:59'))
++pm, _ = tipsme_fetch_day_results('2026-11-20', require_complete=True, kickoff_window=('21:00', '23:59'))
++st.session_state.slot_results = (am is not None, pm is None)
++'''
++        at = self.play(code=body, body='')
++        self.assertEqual(at.session_state.slot_results, (True, True))
++
++    def test_daily_still_accepts_exact_team_pair_when_legacy_id_is_missing(self):
++        wiring = WIRING + r'''
++st.session_state.test_db.loc[:, 'Tipsme_Match_ID'] = ''
++'''
++        at = self.play('open', code=wiring)
++        self.assertEqual(at.session_state.test_writes, ['SETTLE_CONFIRM'])
++        self.assertEqual(at.session_state.test_db.iloc[0]['Status'], 'Settled')
++        self.assertEqual(at.session_state.test_marker['last_run'], '2026-11-20')
+diff --git a/tests/test_early_postgres.py b/tests/test_early_postgres.py
+deleted file mode 100644
+index ac2ce18..0000000
+--- a/tests/test_early_postgres.py
++++ /dev/null
+@@ -1,354 +0,0 @@
+-"""Native PostgreSQL tests; use run_early_postgres.sh, never an existing server."""
+-import os
+-import re
+-import unittest
+-from concurrent.futures import ThreadPoolExecutor
+-from dataclasses import replace
+-from datetime import timedelta
+-from pathlib import Path
+-from threading import Barrier, Event
+-from types import SimpleNamespace
+-from unittest.mock import Mock, patch
+-
+-from sqlalchemy import create_engine, text
+-from sqlalchemy.engine import URL
+-from sqlalchemy.exc import DBAPIError
+-
+-import fb_app_early_settlement as es
+-from test_early_settlement import APP, EV, app_defs, fixture, norm, odds, plan, slip
+-
+-
+-SOCKET = os.getenv('FBAPP_TEST_SOCKET', '')
+-APP_DATA = app_defs('DB_COLUMNS')
+-DB_COLUMNS = APP_DATA['DB_COLUMNS']
+-
+-
+-@unittest.skipUnless(SOCKET, 'run tests/run_early_postgres.sh to start an isolated native PostgreSQL')
+-class NativePostgres(unittest.TestCase):
+-    @classmethod
+-    def setUpClass(cls):
+-        # Hardcoded database/user and private temporary Unix socket; no configurable DSN or TCP.
+-        path = Path(SOCKET)
+-        if (not re.fullmatch(r'/tmp/fbapp-16413-test\.[A-Za-z0-9]+/socket', SOCKET)
+-                or path.resolve() != path or path.stat().st_uid != os.getuid()
+-                or path.stat().st_mode & 0o077):
+-            raise RuntimeError('refusing to test outside the dedicated temporary PostgreSQL socket')
+-        cls.engine = create_engine(URL.create('postgresql+psycopg2', username='fbapp_early_test',
+-                                             database='postgres', query={'host': SOCKET, 'port': '55413'}))
+-        cls.addClassCleanup(cls.engine.dispose)
+-        with cls.engine.begin() as c:
+-            who = c.execute(text('SELECT current_user, inet_server_addr(), current_database()')).one()
+-            if who != ('fbapp_early_test', None, 'postgres') or c.scalar(text("SELECT to_regclass(:name)"), {'name': es.BETS}):
+-                raise RuntimeError('test server is not an empty, dedicated local cluster')
+-            cols = ', '.join(f'"{k}" ' + ('DATE' if k == 'Match_Date' else
+-                             'NUMERIC' if k in es.INPUTS[2:] else 'TEXT') for k in DB_COLUMNS)
+-            c.execute(text(f'CREATE TABLE {es.BETS} ({cols})'))
+-            c.execute(text(f'CREATE TABLE {es.TOMBS} (id TEXT PRIMARY KEY, deleted_at TEXT)'))
+-            c.execute(text('CREATE ROLE anon; CREATE ROLE authenticated'))
+-            c.execute(text('ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated'))
+-        migration = (APP.parent / 'migrations/16413_early_settlement.sql').read_text()
+-        with cls.engine.connect().execution_options(isolation_level='AUTOCOMMIT') as c:
+-            with c.connection.driver_connection.cursor() as cursor:
+-                cursor.execute(migration)
+-                cursor.execute(migration)
+-
+-    def setUp(self):
+-        self.store = es.Postgres(self.engine, norm)
+-        self.now = es.datetime.now(es.UTC).replace(microsecond=0)
+-        self.ev = replace(EV, kickoff=(self.now - timedelta(hours=6)).astimezone(es.HKT))
+-        p = patch.object(es, '_now', lambda _: self.now)
+-        p.start()
+-        self.addCleanup(p.stop)
+-        with self.engine.begin() as c:
+-            c.execute(text(f'TRUNCATE {es.BETS}, {es.TOMBS}, {es.STATE}, {es.RECEIPT}'))
+-            c.execute(text(f'UPDATE {es.LEASE} SET last_scan=NULL'))
+-
+-    def insert(self, *rows):
+-        for row in rows:
+-            columns = ','.join(f'"{k}"' for k in row)
+-            args = ','.join(':' + k for k in row)
+-            with self.engine.begin() as c:
+-                c.execute(text(f'INSERT INTO {es.BETS} ({columns}) VALUES ({args})'), row)
+-
+-    def sql(self, query, **params):
+-        with self.engine.begin() as c:
+-            result = c.execute(text(query), params)
+-            return result.fetchall() if result.returns_rows else None
+-
+-    def tick(self, *, minutes=0, ev=None, missing=False, code='normal', manual=False):
+-        self.now += timedelta(minutes=minutes)
+-        lease, queue = self.store.claim('write')
+-        self.assertIn(self.ev.mid, queue)
+-        return lease, self.store.observe(lease, self.now, self.ev.mid, None if missing else ev or self.ev,
+-                                         code, manual)
+-
+-    def prime(self, *, rows=None):
+-        self.insert(*(rows if rows is not None else [slip(ev=self.ev), slip('B', ev=self.ev, pre=True)]))
+-        self.assertFalse(self.tick()[1])
+-        for t in range(1, 12):
+-            self.assertFalse(self.tick(minutes=10)[1], f'early at minute {t*10}')
+-        lease, mature = self.tick(minutes=10)
+-        self.assertTrue(mature)
+-        group = self.store.group(self.ev)
+-        return lease, group, plan(group, self.ev, odds(self.ev))
+-
+-    def current_status(self):
+-        return [r[0] for r in self.sql(f'SELECT "Status" FROM {es.BETS} ORDER BY "ID"')]
+-
+-    def test_migration_is_idempotent_and_anon_and_authenticated_are_revoked(self):
+-        rows = self.sql("""SELECT c.relrowsecurity, has_table_privilege('anon',c.oid,'SELECT'),
+-            has_table_privilege('authenticated',c.oid,'UPDATE') FROM pg_class c
+-            WHERE c.relname IN ('fb_early_state_16413','fb_early_lease_16413','fb_early_receipt_16413')""")
+-        self.assertEqual(rows, [(True, False, False)] * 3)
+-        self.assertEqual(self.sql(f'SELECT count(*) FROM {es.LEASE}'), [(1,)])
+-
+-    def test_database_clock_starts_at_first_observed_ft_and_writes_at_two_hours_only(self):
+-        lease, group, changes = self.prime()
+-        self.assertEqual(self.current_status(), ['Open', 'Open'])
+-        self.assertEqual(self.store.write(lease, self.ev, group, changes, self.now), {'A', 'B'})
+-        self.assertEqual(self.current_status(), ['Settled', 'Settled'])
+-        self.assertEqual(self.sql(f'''SELECT "Initial_Odds", "User_Stake", "Half_Score", "Away_Red"
+-                                     FROM {es.BETS} ORDER BY "ID"'''),
+-                         [(group[0]['Initial_Odds'], 20, '1-0', '1')] * 2)
+-        self.assertEqual(self.store.review_day(self.ev.kickoff.date(), [fixture(self.ev)]), (set(), True))
+-
+-    def test_82_candidates_preserve_first_stability_window_and_room_for_new_probes(self):
+-        """The observed production queue size, with synthetic finals and no ledger writes."""
+-        mids = [str(int(self.ev.mid) + i) for i in range(82)]
+-        self.sql(f'''INSERT INTO {es.BETS} ("ID", "Tipsme_Match_ID", "Status", "Match_Date")
+-            SELECT 'queue-' || n, n, 'Open', :day FROM unnest(CAST(:mids AS text[])) AS n''',
+-                 mids=mids, day=self.ev.kickoff.date())
+-        seen, ready, new_per_scan = set(), {}, []
+-        for scan in range(13):
+-            if scan:
+-                self.now += timedelta(minutes=11)  # scheduler jitter; do not assume exact cadence
+-            lease, queue = self.store.claim('observe')
+-            self.assertEqual(len(set(queue)), es.MAX_MATCHES)
+-            new_per_scan.append(len(set(queue) - seen))
+-            seen.update(queue)
+-            for mid in queue:
+-                if self.store.observe(lease, self.now, mid, replace(self.ev, mid=mid), 'normal_final'):
+-                    ready.setdefault(mid, scan * 11)
+-                    self.store.record_reason(lease, mid, 'would_settle')
+-        self.assertEqual(ready.get(mids[0]), 121)
+-        self.assertGreaterEqual(min(new_per_scan), 2)
+-        self.assertEqual(self.sql(f"SELECT count(*) FROM {es.BETS} WHERE \"Status\"='Open'"), [(82,)])
+-        self.assertEqual(self.sql(f'SELECT count(*) FROM {es.RECEIPT}'), [(0,)])
+-
+-    def test_follow_up_slots_exclude_expired_and_already_mature_observations(self):
+-        # The two old observations should wait behind unseen probe candidates.
+-        # Only the fresh, unfinished timer should be promoted.
+-        special = [str(int(self.ev.mid) + i) for i in range(12)]
+-        self.sql(f'''INSERT INTO {es.BETS} ("ID", "Tipsme_Match_ID", "Status", "Match_Date")
+-            SELECT 'case-' || n, n, 'Open', :day FROM unnest(CAST(:mids AS text[])) AS n''',
+-                 mids=special, day=self.ev.kickoff.date())
+-        for mid, first_age, last_age in [(special[-3], 41, 31), (special[-2], 130, 10), (special[-1], 15, 5)]:
+-            self.sql(f'''INSERT INTO {es.STATE}
+-              (match_id, fingerprint, first_good, last_good, last_attempt, reason)
+-              VALUES (:mid, repeat('a',64), :first, :last, :last, 'normal_final')''',
+-              mid=mid, first=self.now - timedelta(minutes=first_age),
+-              last=self.now - timedelta(minutes=last_age))
+-        _, queue = self.store.claim('observe')
+-        self.assertIn(special[-1], queue)
+-        self.assertNotIn(special[-2], queue)
+-        self.assertNotIn(special[-3], queue)
+-        self.assertEqual(len(queue), es.MAX_MATCHES)
+-
+-    def test_write_gate_itself_rejects_119_minutes_and_stale_recheck(self):
+-        self.insert(slip(ev=self.ev))
+-        self.tick()
+-        self.tick(minutes=30)
+-        self.tick(minutes=30)
+-        self.tick(minutes=30)
+-        lease, mature = self.tick(minutes=29)
+-        self.assertFalse(mature)
+-        group = self.store.group(self.ev)
+-        with self.assertRaisesRegex(es.Review, 'expired_write_evidence'):
+-            self.store.write(lease, self.ev, group, plan(group, self.ev), self.now)
+-        self.now += timedelta(minutes=1)
+-        with self.assertRaisesRegex(es.Review, 'expired_write_evidence'):
+-            self.store.write(lease, self.ev, group, plan(group, self.ev), self.now - timedelta(seconds=61))
+-        self.assertEqual(self.current_status(), ['Open'])
+-
+-    def test_global_scan_limit_and_old_open_are_not_selected(self):
+-        for i in range(9):
+-            self.insert(slip(str(i), ev=replace(self.ev, mid=str(999010+i))))
+-        self.insert(slip('old', ev=self.ev, Match_Date=(self.ev.kickoff.date()-timedelta(days=30)).isoformat()))
+-        _, matches = self.store.claim('write')
+-        self.assertEqual(len(matches), es.MAX_MATCHES)
+-        self.assertNotIn(self.ev.mid, matches)
+-
+-    def test_outage_and_greater_than_30_minute_gap_reset_stability(self):
+-        self.insert(slip(ev=self.ev))
+-        self.tick()
+-        self.tick(minutes=30)
+-        first, = self.sql(f'SELECT first_good FROM {es.STATE}')[0]
+-        self.assertEqual(first, self.now - timedelta(minutes=30))
+-        self.tick(minutes=31)
+-        self.assertEqual(self.sql(f'SELECT first_good FROM {es.STATE}'), [(self.now,)])
+-        self.tick(minutes=10, missing=True, code='provider_unavailable')
+-        self.assertEqual(self.sql(f'SELECT first_good,last_good FROM {es.STATE}'), [(None, None)])
+-        self.tick(minutes=10)
+-        self.assertEqual(self.sql(f'SELECT first_good FROM {es.STATE}'), [(self.now,)])
+-
+-    def test_delay_resume_correction_and_manual_latch(self):
+-        self.insert(slip(ev=self.ev))
+-        self.tick(missing=True, code='postponed')
+-        self.tick(minutes=10)
+-        self.tick(minutes=10, ev=replace(self.ev, goals=(3, 1)))
+-        self.assertEqual(self.sql(f'SELECT first_good FROM {es.STATE}'), [(self.now,)])
+-        self.tick(minutes=10, missing=True, code='abandoned', manual=True)
+-        self.now += timedelta(minutes=10)
+-        _, queue = self.store.claim('write')
+-        self.assertNotIn(self.ev.mid, queue)
+-        self.assertEqual(self.current_status(), ['Open'])
+-
+-    def test_single_global_lease_and_superseded_worker_fencing(self):
+-        self.insert(slip(ev=self.ev))
+-        gate = Barrier(2)
+-        def claim():
+-            gate.wait()
+-            return self.store.claim('write')
+-        with ThreadPoolExecutor(max_workers=2) as pool:
+-            outcomes = list(pool.map(lambda _: claim(), range(2)))
+-        (old,) = [lease for lease, hits in outcomes if hits]
+-        self.now += es.POLL
+-        new, hits = self.store.claim('write')
+-        self.assertIn(self.ev.mid, hits)
+-        self.assertNotEqual(old, new)
+-        with self.assertRaisesRegex(es.Review, 'scan_superseded'):
+-            self.store.observe(old, self.now, self.ev.mid, self.ev, 'late')
+-
+-    def test_two_writers_same_match_only_one_commit(self):
+-        lease, group, changes = self.prime()
+-        barrier = Barrier(2)
+-        def writer():
+-            barrier.wait()
+-            try:
+-                return self.store.write(lease, self.ev, group, changes, self.now)
+-            except es.Review as exc:
+-                return exc.code
+-        with ThreadPoolExecutor(max_workers=2) as pool:
+-            result = list(pool.map(lambda _: writer(), range(2)))
+-        self.assertCountEqual(result, [{'A', 'B'}, 'non_open_or_ambiguous_group'])
+-        self.assertEqual(self.sql(f'SELECT count(*) FROM {es.RECEIPT}'), [(2,)])
+-
+-    def test_manual_settlement_wins_table_lock_runner_does_not_overwrite(self):
+-        lease, group, changes = self.prime()
+-        started = Event()
+-        def writer():
+-            started.set()
+-            return self.store.write(lease, self.ev, group, changes, self.now)
+-        with ThreadPoolExecutor(max_workers=1) as pool:
+-            with self.engine.begin() as c:
+-                c.execute(text(f'LOCK TABLE {es.BETS} IN SHARE ROW EXCLUSIVE MODE'))
+-                job = pool.submit(writer)
+-                self.assertTrue(started.wait(2))
+-                c.execute(text(f'''UPDATE {es.BETS} SET "Status"='Settled', "Home_Goal"='22' '''))
+-            with self.assertRaisesRegex(es.Review, 'non_open_or_ambiguous_group'):
+-                job.result(5)
+-        self.assertEqual(self.sql(f'SELECT DISTINCT "Home_Goal" FROM {es.BETS}'), [('22',)])
+-        self.assertEqual(self.sql(f'SELECT count(*) FROM {es.RECEIPT}'), [(0,)])
+-
+-    def test_database_lock_timeout_leaves_no_partial_change_or_receipt(self):
+-        lease, group, changes = self.prime()
+-        with self.engine.begin() as c:
+-            c.execute(text(f'LOCK TABLE {es.BETS} IN SHARE ROW EXCLUSIVE MODE'))
+-            with self.assertRaises(DBAPIError) as caught:
+-                self.store.write(lease, self.ev, group, changes, self.now)
+-            self.assertEqual(caught.exception.orig.pgcode, '55P03')
+-        self.assertEqual(self.current_status(), ['Open', 'Open'])
+-        self.assertEqual(self.sql(f'SELECT count(*) FROM {es.RECEIPT}'), [(0,)])
+-
+-    def test_tombstones_duplicate_elsewhere_and_new_slip_invalidate_write(self):
+-        lease, group, changes = self.prime()
+-        self.sql(f"INSERT INTO {es.TOMBS} (id) VALUES ('B')")
+-        with self.assertRaisesRegex(es.Review, 'tombstoned_slip'):
+-            self.store.write(lease, self.ev, group, changes, self.now)
+-        self.sql(f'DELETE FROM {es.TOMBS}')
+-        self.insert(slip('B', ev=replace(self.ev, mid='777000'), Home_Team='OTHER', Match='OTHER vs XX',
+-                         Match_Date='2026-01-01'))
+-        with self.assertRaisesRegex(es.Review, 'duplicate_or_invalid_slip_id'):
+-            self.store.write(lease, self.ev, group, changes, self.now)
+-        self.sql(f"""DELETE FROM {es.BETS} WHERE "Tipsme_Match_ID"='777000'""")
+-        self.insert(slip('C', ev=self.ev))
+-        with self.assertRaisesRegex(es.Review, 'group_changed_since_read'):
+-            self.store.write(lease, self.ev, group, changes, self.now)
+-        self.assertEqual(self.current_status(), ['Open', 'Open', 'Open'])
+-
+-    def test_transaction_readback_mismatch_rolls_back_entire_group(self):
+-        lease, group, changes = self.prime()
+-        self.sql(f'''CREATE FUNCTION public.fb_16413_test_trigger() RETURNS trigger LANGUAGE plpgsql AS $$
+-                    BEGIN IF NEW."ID" = 'B' THEN NEW."System_Stake" := 177; END IF; RETURN NEW; END $$''')
+-        self.sql(f'''CREATE TRIGGER alter_after BEFORE UPDATE ON {es.BETS}
+-                    FOR EACH ROW EXECUTE FUNCTION public.fb_16413_test_trigger()''')
+-        try:
+-            with self.assertRaisesRegex(es.Review, 'transaction_readback'):
+-                self.store.write(lease, self.ev, group, changes, self.now)
+-            self.assertEqual(self.current_status(), ['Open', 'Open'])
+-            self.assertEqual(self.sql(f'SELECT count(*) FROM {es.RECEIPT}'), [(0,)])
+-        finally:
+-            self.sql(f'DROP TRIGGER alter_after ON {es.BETS}')
+-            self.sql('DROP FUNCTION public.fb_16413_test_trigger()')
+-
+-    def test_post_commit_disconnect_resolves_via_receipts_and_never_replays(self):
+-        lease, group, changes = self.prime()
+-        original = es._in
+-        def disconnect(ids, sql, conn):
+-            if sql.startswith('SELECT slip_id, fingerprint, expected'):
+-                raise TimeoutError('simulated disconnect after COMMIT')
+-            return original(ids, sql, conn)
+-        with patch.object(es, '_in', disconnect), self.assertRaises(TimeoutError):
+-            self.store.write(lease, self.ev, group, changes, self.now)
+-        self.assertEqual(self.store.review_day(self.ev.kickoff.date(), [fixture(self.ev)]), (set(), True))
+-        self.sql(f"""UPDATE {es.BETS} SET "Status"='Open'""")
+-        group = self.store.group(self.ev)
+-        changes = plan(group, self.ev, odds(self.ev))
+-        with self.assertRaisesRegex(es.Review, 'match_already_receipted'):
+-            self.store.write(lease, self.ev, group, changes, self.now)
+-        self.assertEqual(self.sql(f'SELECT count(*) FROM {es.RECEIPT}'), [(2,)])
+-
+-    def test_audit_reports_cash_or_odds_history_drift_even_when_scores_match(self):
+-        lease, group, changes = self.prime()
+-        self.store.write(lease, self.ev, group, changes, self.now)
+-        self.sql(f"""UPDATE {es.BETS} SET "User_Profit"='17' WHERE "ID"='A' """)
+-        self.assertEqual(self.store.review_day(self.ev.kickoff.date(), [fixture(self.ev)]), (set(), False))
+-
+-    def test_end_to_end_store_observe_then_write_with_fake_provider(self):
+-        self.insert(slip(ev=self.ev, pre=True))
+-        upstream = Mock()
+-        upstream.final.return_value = self.ev
+-        upstream.odds.return_value = odds(self.ev)
+-        for index in range(13):
+-            result = es.early_scan(self.store, upstream, 'observe', plan)
+-            self.assertEqual(result[self.ev.mid][0], 'observing' if index < 12 else 'would_settle')
+-            self.now += es.POLL
+-        self.assertEqual(self.current_status(), ['Open'])
+-        self.assertEqual(self.sql(f'SELECT count(*) FROM {es.RECEIPT}'), [(0,)])
+-        self.assertEqual(es.early_scan(self.store, upstream, 'write', plan)[self.ev.mid], ('committed', {'A'}))
+-        self.assertEqual(self.store.review_day(self.ev.kickoff.date(), [fixture(self.ev)]), (set(), True))
+-
+-    def test_stale_generic_settled_overwrite_is_blocked_but_fresh_manual_edit_works(self):
+-        lease, group, changes = self.prime()
+-        with self.engine.connect() as c:
+-            import pandas as pd
+-            stale = pd.read_sql_table('football_bets', c, schema='public')
+-        state = {'_v1641_fallback_base': False}
+-        st = SimpleNamespace(session_state=state, error=Mock())
+-        ns = app_defs('_v1512_fp', 'V1512_FP_COLS', '_V16413_RESULT_FP', 'DB_COLUMNS',
+-                      '_v1512_save_sql_main', 'process_legacy_columns', 'enforce_columns',
+-                      V164_TOMB_TABLE='football_bets_deleted', _V10_SQL_TABLE='public.football_settings',
+-                      get_hkt_now=lambda: self.now, _v163_sql_engine=lambda: self.engine,
+-                      is_missing_match_date=lambda x: x is None, st=st)
+-        fp, save = ns['_v1512_fp'], ns['_v1512_save_sql_main']
+-        state['_v1641_sql_base'] = fp(stale)
+-        stale['Status'], stale['Home_Goal'] = 'Settled', '99'
+-        self.store.write(lease, self.ev, group, changes, self.now)
+-        self.assertFalse(save(stale, 'football_bets'))
+-        self.assertEqual(self.sql(f'SELECT DISTINCT "Home_Goal" FROM {es.BETS}'), [('2',)])
+-        with self.engine.connect() as c:
+-            fresh = pd.read_sql_table('football_bets', c, schema='public')
+-        state['_v1641_sql_base'] = fp(fresh)
+-        fresh.loc[fresh['ID'].eq('A'), 'Note'] = 'deliberate correction'
+-        self.assertTrue(save(fresh, 'football_bets'), st.error.call_args_list)
+-        self.assertEqual(self.sql(f'''SELECT "Note" FROM {es.BETS} WHERE "ID"='A' '''), [('deliberate correction',)])
+diff --git a/tests/test_early_settlement.py b/tests/test_early_settlement.py
+deleted file mode 100644
+index 3caef5b..0000000
+--- a/tests/test_early_settlement.py
++++ /dev/null
+@@ -1,311 +0,0 @@
+-"""Deterministic provider, payout, runner and schedule tests; no real endpoints."""
+-import ast
+-import json
+-import os
+-import re
+-import unittest
+-from dataclasses import replace
+-from datetime import datetime, timedelta
+-from pathlib import Path
+-from types import SimpleNamespace
+-from unittest.mock import Mock, patch
+-
+-import pandas as pd
+-import fb_app_early_settlement as es
+-
+-
+-APP = Path(__file__).resolve().parents[1] / 'FB-app.py'
+-
+-
+-def app_defs(*names, **context):
+-    tree = ast.parse(APP.read_text())
+-    def selected(n):
+-        return ((isinstance(n, ast.FunctionDef) and n.name in names) or
+-                (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in names for t in n.targets)))
+-    ns = dict(pd=pd, re=re, os=os, datetime=datetime, timedelta=timedelta, HKT=es.HKT,
+-              _early16413=es, **context)
+-    exec(compile(ast.Module(body=[n for n in tree.body if selected(n)], type_ignores=[]), str(APP), 'exec'), ns)
+-    return ns
+-
+-
+-def norm(x):
+-    return str(x or '').replace(' ', '')
+-
+-
+-KO = datetime(2026, 11, 20, 23, 59, 37, tzinfo=es.HKT)
+-EV = es.Evidence('999001', '主隊', '客隊', KO, (2, 1), (1, 0), (5, 2), (0, 1, 1, 3))
+-PAYOUT_NAMES = ('calculate_settlement', '_tipsme_cap_value', '_tipsme_oh_entry',
+-                '_oh_sort_ts', 'merge_odds_history_snapshots', 'parse_dt_for_comparison', 'v10_parse_time')
+-PAYOUT = app_defs(*PAYOUT_NAMES, json=json, get_hkt_now=lambda: KO + timedelta(hours=3))
+-
+-
+-def payload(ev=EV):
+-    rec = dict(home=ev.home, away=ev.away, matchId=int(ev.mid),
+-               fullMatchTimeUtc=ev.kickoff.astimezone(es.UTC).replace(tzinfo=None).isoformat(),
+-               fullMatchTime=ev.kickoff.strftime('%m/%d/%Y %H:%M:%S'), extraScore='', matchStatus='8',
+-               liveTime='完', additionalTime='', score='2-1', halfScore='1-0', corner='5-2',
+-               homeRedCard='0', awayRedCard='1', homeYellowCard='1', awayYellowCard='3')
+-    page = dict(matchId=ev.mid, liveScore=rec.copy(), initialFixtures={'fixtures': {
+-        'mainDetails': [{'time': '中', 'awayEventDetails': '1-0'}, {'time': '90+8', 'homeEventType': '換人'},
+-                        {'time': '完', 'awayEventDetails': '2-1'}],
+-        'techDetails': [{'time': '角球', 'home': '5', 'away': '2'}],
+-    }})
+-    return rec, page
+-
+-
+-def parse(rec, page):
+-    html = '<html><script type="application/json" id="__NEXT_DATA__">' + json.dumps(
+-        {'props': {'pageProps': page}}, ensure_ascii=False) + '</script></html>'
+-    return es.parse_final(EV.mid, rec, html, norm)
+-
+-
+-def slip(rid='A', ev=EV, pre=False, **kw):
+-    return {**dict.fromkeys(es.COLUMNS), 'ID': rid, 'Status': 'Open', 'Tipsme_Match_ID': ev.mid,
+-            'Match_Date': ev.kickoff.date().isoformat(), 'Home_Team': ev.home, 'Away_Team': ev.away,
+-            'Match': f'{ev.home} vs {ev.away}', 'Bet_Type': '入球大小' if pre else '入球大小 (即場)',
+-            'Selection': 'Over', 'Initial_Line': '2.75', 'Initial_Odds': '1.9',
+-            'System_Stake': '100', 'User_Stake': '20', 'Odds_History': '[]', **kw}
+-
+-
+-def odds(ev=EV):
+-    cutoff = ev.kickoff.replace(second=0, microsecond=0)
+-    quotes = []
+-    for delta, up in ((timedelta(minutes=-10), '1.80'), (timedelta(minutes=-1), '1.85'),
+-                      (timedelta(seconds=10), '2.00'), (timedelta(minutes=1), '2.50')):
+-        t = (cutoff + delta).astimezone(es.UTC).replace(tzinfo=None)
+-        quotes.append(dict(number_of_goals='[2.5/3]', big_odds=up, small_odds='1.95', create_time=t.isoformat()))
+-    return dict(hkjcHomeTeamName=ev.home, hkjcAwayTeamName=ev.away, hiloOdds=quotes)
+-
+-
+-def plan(rows, ev, raw=None):
+-    return es.build_plan(rows, ev, raw, norm=norm, calculate=PAYOUT['calculate_settlement'],
+-                         parse_line=PAYOUT['_tipsme_cap_value'], odds_entry=PAYOUT['_tipsme_oh_entry'],
+-                         merge_history=PAYOUT['merge_odds_history_snapshots'])
+-
+-
+-def fixture(ev=EV, **kw):
+-    return dict(hkjc_match_id=int(ev.mid), home=ev.home, away=ev.away, match_time=ev.kickoff.timestamp(),
+-                finished=True, home_goal=ev.goals[0], away_goal=ev.goals[1],
+-                home_corner=ev.corners[0], away_corner=ev.corners[1]) | kw
+-
+-
+-class EvidenceTests(unittest.TestCase):
+-    def test_normal_regulation_and_hong_kong_midnight(self):
+-        self.assertEqual(EV, parse(*payload()))
+-        self.assertEqual(EV.kickoff.astimezone(es.UTC).hour, 15)
+-
+-    def test_zero_result_is_not_missing(self):
+-        rec, page = payload()
+-        rec.update(score='0-0', halfScore='0-0', corner='0-0')
+-        page['liveScore'] = rec.copy()
+-        for e in page['initialFixtures']['fixtures']['mainDetails']:
+-            if 'awayEventDetails' in e:
+-                e['awayEventDetails'] = '0-0'
+-        page['initialFixtures']['fixtures']['techDetails'][0].update(home='0', away='0')
+-        self.assertEqual(parse(rec, page).goals, (0, 0))
+-
+-    def test_one_source_unavailable_or_conflicting(self):
+-        for key, value in dict(score='3-1', halfScore='2-1', corner='3-2', home='另隊',
+-                               matchId=999002, fullMatchTime='11/21/2026 23:59:37',
+-                               homeYellowCard='2').items():
+-            with self.subTest(key=key):
+-                rec, page = payload()
+-                page['liveScore'][key] = value
+-                with self.assertRaises(es.Review):
+-                    parse(rec, page)
+-        with self.assertRaises(es.Review):
+-            es.parse_final(EV.mid, payload()[0], 'temporarily unavailable', norm)
+-
+-    def test_delayed_interrupted_cancelled_abandoned_and_extra_time(self):
+-        for status, label, extra in [('1', '推遲', ''), ('4', '暫停', ''), ('9', '取消', ''),
+-                                     ('8', '腰斬', ''), ('8', '完', '3-2'), ('8', '中', '')]:
+-            with self.subTest(label=label, extra=extra):
+-                rec, page = payload()
+-                rec.update(matchStatus=status, liveTime=label, extraScore=extra)
+-                with self.assertRaises(es.Review):
+-                    parse(rec, page)
+-
+-    def test_incomplete_and_non_regulation_event_page(self):
+-        for adjustment in ('missing', 'minutes', 'penalties', 'early', 'no_corners', 'mismatched_score'):
+-            with self.subTest(adjustment=adjustment):
+-                rec, page = payload()
+-                f = page['initialFixtures']['fixtures']
+-                if adjustment == 'missing':
+-                    page['initialFixtures'] = None
+-                if adjustment in ('minutes', 'penalties', 'early'):
+-                    f['mainDetails'][1]['time'] = {'minutes': '105', 'penalties': '十二碼', 'early': '80'}[adjustment]
+-                if adjustment == 'no_corners':
+-                    f['techDetails'].clear()
+-                if adjustment == 'mismatched_score':
+-                    f['mainDetails'][2]['awayEventDetails'] = '1-1'
+-                with self.assertRaises(es.Review):
+-                    parse(rec, page)
+-
+-    def test_network_accepts_no_redirect_or_old_cache(self):
+-        for code, headers in [(302, {}), (500, {}), (200, {'Age': '61'}), (200, {'Age': 'unknown'})]:
+-            with self.subTest(code=code, headers=headers), patch.object(es.requests, 'get') as get:
+-                get.return_value = SimpleNamespace(status_code=code, headers=headers)
+-                with self.assertRaises(es.Review):
+-                    es.Tipsme(norm).final(EV.mid)
+-                self.assertFalse(get.call_args.kwargs['allow_redirects'])
+-                self.assertEqual(get.call_args.kwargs['timeout'], (3, 5))
+-
+-
+-class GroupAndPlanTests(unittest.TestCase):
+-    def test_requires_same_id_date_and_both_teams_for_whole_group(self):
+-        self.assertEqual(len(es.exact_open_group([slip(Tipsme_Match_ID=' +0999001.0 '), slip('B')], EV, norm)), 2)
+-        for row in (slip('B', Match_Date=None), slip('B', Match_Date='2026-11-21'),
+-                    slip('B', Home_Team='另隊'), slip('B', Tipsme_Match_ID=None),
+-                    slip('B', Status='Settled'), slip('B', Tipsme_Match_ID='222222'),
+-                    slip('B', Home_Team='客隊', Away_Team='主隊'), slip()):
+-            with self.subTest(row=row), self.assertRaises(es.Review):
+-                es.exact_open_group([slip(), row], EV, norm)
+-
+-    def test_reuses_production_payout_for_quarter_lines_and_zero_stakes(self):
+-        changes = plan([slip(), slip('Z', System_Stake='0', User_Stake='0')], EV)
+-        self.assertEqual((changes['A']['System_Profit'], changes['A']['User_Profit'],
+-                          changes['A']['System_Payout'], changes['A']['Half_Score']), (45.0, 9.0, 145.0, '1-0'))
+-        self.assertEqual(changes['Z']['User_Payout'], 0.0)
+-        self.assertEqual(changes['A']['Away_Yellow'], 3)
+-        self.assertFalse(set(es.INPUTS) & changes['A'].keys())
+-        self.assertNotIn('Odds_History', changes['A'])
+-
+-    def test_clv_same_market_line_excludes_kickoff_minute_and_later(self):
+-        changes = plan([slip(pre=True)], EV, odds())
+-        saved = json.loads(changes['A']['Odds_History'])
+-        self.assertEqual([x['upper'] for x in saved], [1.80, 1.85])
+-        self.assertEqual(saved[-1]['record_time'], '2026-11-20 23:58')
+-        originals = json.dumps(saved, ensure_ascii=False)
+-        self.assertNotIn('Odds_History', plan([slip(pre=True, Odds_History=originals)], EV, odds())['A'])
+-
+-    def test_no_odds_wrong_line_swapped_or_contaminated_history_blocks_the_group(self):
+-        for adjustments in ({'hiloOdds': None}, {'hkjcHomeTeamName': '客隊'},
+-                            {'hiloOdds': odds()['hiloOdds'][2:]},
+-                            {'hiloOdds': [{**o, 'number_of_goals': '2.5'} for o in odds()['hiloOdds']]}):
+-            with self.subTest(adjustments=adjustments), self.assertRaises(es.Review):
+-                plan([slip(), slip('B', pre=True)], EV, odds() | adjustments)
+-        for stamp in ('11-20 23:59', '11-21 00:00', '23:00', 'bad'):
+-            history = json.dumps([{'type': '入球大小', 'line': 2.75, 'record_time': stamp,
+-                                   'upper': 1.85, 'lower': 1.95}])
+-            with self.subTest(stamp=stamp), self.assertRaises(es.Review):
+-                plan([slip(pre=True, Odds_History=history)], EV, odds())
+-
+-    def test_unsupported_or_invalid_financial_arguments_do_not_default_to_push(self):
+-        for bad in (dict(Bet_Type='半場大小'), dict(Initial_Odds='nan'), dict(Initial_Line='2.12'),
+-                    dict(User_Stake='-1'), dict(Selection='Away')):
+-            with self.subTest(bad=bad), self.assertRaises(es.Review):
+-                plan([slip(**bad)], EV)
+-
+-    def test_read_only_reconciliation_flags_missing_wrong_day_open_and_wrong_result(self):
+-        ready = slip() | plan([slip()], EV)['A']
+-        for rows, expected in (([ready], set()), ([], {EV.mid}), ([slip()], {EV.mid}),
+-                               ([ready | {'Home_Goal': '7'}], {EV.mid}),
+-                               ([ready | {'Match_Date': '2026-11-19'}], {EV.mid}),
+-                               ([ready, slip('P', Tipsme_Match_ID=None, Home_Team='他隊', Match='他隊 VS 客隊')],
+-                                {'legacy-open'})):
+-            self.assertEqual(es.reconciliation_pending(rows, [fixture()], KO.date(), norm), expected)
+-        self.assertEqual(es.reconciliation_pending([ready], [fixture(home_corner=None)], KO.date(), norm), {EV.mid})
+-
+-
+-class RunnerTests(unittest.TestCase):
+-    def setUp(self):
+-        self.store = Mock()
+-        self.store.claim.return_value = (KO, [EV.mid])
+-        self.store.observe.return_value = True
+-        self.store.group.return_value = [slip()]
+-        self.store.observed_until.return_value = KO
+-        self.store.write.return_value = {'A'}
+-        self.provider = Mock()
+-        self.provider.final.return_value = EV
+-
+-    def test_off_and_invalid_never_touch_store_or_provider(self):
+-        self.assertEqual(es.mode(None), 'off')
+-        self.assertEqual(es.mode('on'), 'invalid')
+-        for m in ('off', 'invalid'):
+-            self.assertEqual(es.early_scan(self.store, self.provider, m, plan), {})
+-        self.assertEqual(self.store.mock_calls, [])
+-        self.assertEqual(self.provider.mock_calls, [])
+-
+-    def test_observe_records_would_settle_without_ledger_writes(self):
+-        self.assertEqual(es.early_scan(self.store, self.provider, 'observe', plan)[EV.mid][0], 'would_settle')
+-        self.store.write.assert_not_called()
+-        self.provider.odds.assert_not_called()
+-
+-    def test_hold_defers_plan_and_provider_recheck(self):
+-        self.store.observe.return_value = False
+-        self.assertEqual(es.early_scan(self.store, self.provider, 'write', plan)[EV.mid][0], 'observing')
+-        self.store.group.assert_not_called()
+-        self.provider.final.assert_called_once_with(EV.mid)
+-
+-    def test_fresh_write_rechecks_then_calls_one_transaction(self):
+-        self.assertEqual(es.early_scan(self.store, self.provider, 'write', plan), {EV.mid: ('committed', {'A'})})
+-        self.assertEqual(self.provider.final.call_count, 2)
+-        self.store.write.assert_called_once()
+-
+-    def test_correction_and_second_source_failure_reset_instead_of_writing(self):
+-        for outcome, reason in ((replace(EV, goals=(3, 1)), 'final_corrected'),
+-                                (es.Review('provider_unavailable'), 'provider_unavailable')):
+-            self.provider.final.side_effect = [EV, outcome]
+-            self.assertEqual(es.early_scan(self.store, self.provider, 'write', plan)[EV.mid][0], reason)
+-            self.store.write.assert_not_called()
+-            self.assertEqual(self.store.observe.call_args.args[4], reason)
+-
+-    def test_commit_exception_never_falls_back_to_a_second_write(self):
+-        self.store.write.side_effect = TimeoutError
+-        self.assertEqual(es.early_scan(self.store, self.provider, 'write', plan)[EV.mid][0],
+-                         'sql_or_runtime_unconfirmed')
+-        self.store.write.assert_called_once()
+-
+-
+-class ScheduleIntegration(unittest.TestCase):
+-    def test_write_mode_never_enters_legacy_scheduler_even_if_open_or_no_db(self):
+-        cfg = dict(enabled='1', time='05:00', t0='00:00', t1='23:59')
+-        old_path = Mock(side_effect=AssertionError('legacy ledger path'))
+-        review = Mock()
+-        st = SimpleNamespace(session_state={})
+-        ns = app_defs('_v1511_sched_try_start', _v16413_mode=lambda: 'write',
+-                      _v162_can_automate=lambda: True, _v10_settings_allow_automation=lambda: True,
+-                      get_hkt_now=lambda: (KO + timedelta(days=1)).replace(hour=5),
+-                      _v1511_sched_load=lambda **_: cfg, _v16412_schedule_done=lambda *_: False,
+-                      _v15_load_remote=lambda: None, _v15_status_phase=lambda _: 'missing',
+-                      _v16412_window=lambda _: '00:00-23:59', st=st,
+-                      tipsme_fetch_day_results=lambda *a, **kw: ([fixture()], 'ok'),
+-                      _v15_build_queue_date=lambda q, *a: q,
+-                      _v16412_authoritative_bets=old_path, _v16413_review_schedule=review)
+-        self.assertFalse(ns['_v1511_sched_try_start'](pd.DataFrame([slip()])))
+-        review.assert_called_once()
+-        old_path.assert_not_called()
+-        self.assertNotIn('v15_auto', st.session_state)
+-
+-    def test_a_previously_queued_daily_batch_is_stopped_before_any_step(self):
+-        st = SimpleNamespace(session_state={'v15_auto': {'active': True, 'sched': True, 'step': 'BET'}},
+-                             rerun=Mock())
+-        taken = Mock(side_effect=AssertionError('old batch'))
+-        ns = app_defs('v15_auto_executor', _v16413_mode=lambda: 'write', _v15_log=Mock(),
+-                      _v15_taken_over=taken, st=st)
+-        ns['v15_auto_executor'](None, None, None)
+-        taken.assert_not_called()
+-        self.assertFalse(st.session_state['v15_auto']['active'])
+-
+-    def test_marker_only_on_readback_success(self):
+-        for response in ((set(), True), ({EV.mid}, True), (set(), False), RuntimeError('db offline')):
+-            with self.subTest(response=response), patch.object(es, 'Postgres') as postgres:
+-                check = postgres.return_value.review_day
+-                if isinstance(response, Exception):
+-                    check.side_effect = response
+-                else:
+-                    check.return_value = response
+-                mark, notice = Mock(return_value=True), Mock()
+-                ns = app_defs('_v16413_review_schedule', _v163_sql_engine=lambda: object(), _v14_norm_team=norm,
+-                              _v1511_mark_done=mark, _v16412_schedule_notice=notice)
+-                ns['_v16413_review_schedule'](KO.date(), 'all', [fixture()])
+-                self.assertEqual(mark.call_count, int(response == (set(), True)))
+-                notice.assert_called_once()
+-
+-    def test_early_fragment_off_or_viewer_does_not_connect(self):
+-        for m, can in (('off', True), ('observe', False), ('write', False), ('invalid', True)):
+-            engine = Mock()
+-            ns = app_defs('_v16413_early_body', _v16413_mode=lambda: m, _v162_can_automate=lambda: can,
+-                          _v163_sql_engine=engine)
+-            ns['_v16413_early_body']()
+-            engine.assert_not_called()
+diff --git a/tests/test_slot_postgres.py b/tests/test_slot_postgres.py
+new file mode 100644
+index 0000000..f58e972
+--- /dev/null
++++ b/tests/test_slot_postgres.py
+@@ -0,0 +1,164 @@
++"""PostgreSQL roundtrips confined to the isolated Unix socket from run_slot_postgres.sh."""
++import importlib.util
++import os
++import stat
++from concurrent.futures import ThreadPoolExecutor
++from datetime import datetime
++from pathlib import Path
++from threading import Barrier
++from types import SimpleNamespace
++import unittest
++
++import pandas as pd
++from sqlalchemy import Text, URL, create_engine, text
++
++
++SOCKET = os.environ.get('FB_APP_SLOT_TEST_SOCKET')
++ROOT = Path(__file__).resolve().parents[1]
++
++
++@unittest.skipUnless(SOCKET, 'Run tests/run_slot_postgres.sh for isolated PostgreSQL')
++class SlotPostgres(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        sock = Path(SOCKET)
++        if (not sock.is_absolute() or sock.name != 'socket' or not sock.parent.name.startswith('tmp.')
++                or sock.is_symlink() or sock.stat().st_uid != os.getuid() or stat.S_IMODE(sock.stat().st_mode) != 0o700):
++            raise RuntimeError('Expected disposable private Unix socket only')
++        cls.engine = create_engine(URL.create('postgresql+psycopg2', username='fbapp_slot_test',
++                                             database='fbapp_slot_test', query={'host': str(sock)}))
++        with cls.engine.connect() as conn:
++            assert conn.execute(text("SELECT current_database(), current_user, inet_server_addr(), "
++                                     "current_setting('listen_addresses')")).one() == (
++                'fbapp_slot_test', 'fbapp_slot_test', None, '')
++        spec = importlib.util.spec_from_file_location('fbapp_slot_candidate', ROOT / 'FB-app.py')
++        cls.app = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(cls.app)
++        cls.app.get_hkt_now = lambda: datetime(2026, 11, 21, 0, 25, tzinfo=cls.app.HKT)
++        cls.app._v163_sql_engine = lambda: cls.engine
++        cls.app._has_secret = lambda key: key == 'DB_URL'
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.engine.dispose()
++
++    def setUp(self):
++        self.errors = []
++        self.app.st = SimpleNamespace(session_state={}, error=self.errors.append)
++        with self.engine.begin() as conn:
++            conn.execute(text('DROP TABLE IF EXISTS public.football_bets, public.football_bets_deleted, public.football_schedule'))
++            conn.execute(text('CREATE TABLE public.football_schedule ("Key" text, "Value" text)'))
++            conn.execute(text('ALTER TABLE public.football_schedule ENABLE ROW LEVEL SECURITY'))
++            conn.execute(text('CREATE TABLE public.football_bets_deleted (id text PRIMARY KEY, deleted_at text)'))
++            conn.execute(text('INSERT INTO public.football_schedule VALUES '
++                              """('enabled','1'), ('time','05:00'), ('t0','00:00'), ('t1','23:59'),
++                                 ('last_run','nan'), ('settlement_slots','00:00'), ('extension','keep')"""))
++        self.key = '2026-11-21 00:00'
++
++    def schedule_identity(self):
++        with self.engine.connect() as conn:
++            return tuple(conn.execute(text("""
++                SELECT oid, relrowsecurity FROM pg_class WHERE oid = 'public.football_schedule'::regclass
++            """)).one())
++
++    def test_two_sessions_claim_same_slot_only_once(self):
++        identity = self.schedule_identity()
++        barrier = Barrier(2)
++        def attempt(_):
++            barrier.wait(timeout=5)
++            return self.app._v18_claim_slot(self.engine, self.key)
++        with ThreadPoolExecutor(max_workers=2) as pool:
++            self.assertEqual(sorted(pool.map(attempt, (1, 2))), [False, True])
++        self.assertEqual(self.app._v1511_sched_load(fresh=True)['settlement_slot_claim'], self.key)
++        self.assertEqual(identity, self.schedule_identity())
++
++    def test_setting_and_legacy_marker_updates_keep_table_and_claim(self):
++        identity = self.schedule_identity()
++        self.assertTrue(self.app._v18_claim_slot(self.engine, self.key))
++        cfg = self.app._v1511_sched_load(fresh=True)
++        self.assertTrue(self.app._v1511_sched_save(dict(cfg, settlement_slots='03:00'), settings_only=True))
++        self.assertTrue(self.app._v1511_sched_save(dict(cfg, last_run='2026-11-20', last_run_win='00:00-23:59')))
++        saved = self.app._v1511_sched_load(fresh=True)
++        self.assertEqual((saved['settlement_slots'], saved['settlement_slot_claim'], saved['last_run']),
++                         ('03:00', self.key, '2026-11-20'))
++        with self.engine.connect() as conn:
++            self.assertEqual(conn.execute(text("""SELECT "Value" FROM public.football_schedule
++                                                   WHERE "Key" = 'extension'""")).scalar_one(), 'keep')
++        self.assertEqual(identity, self.schedule_identity())
++
++    def test_stale_slot_or_deselection_cannot_claim(self):
++        self.assertFalse(self.app._v18_claim_slot(self.engine, '2026-11-20 21:00'))
++        cfg = self.app._v1511_sched_load(fresh=True)
++        self.assertTrue(self.app._v1511_sched_save(dict(cfg, settlement_slots=''), settings_only=True))
++        self.assertFalse(self.app._v18_claim_slot(self.engine, self.key))
++        self.assertNotIn('settlement_slot_claim', self.app._v1511_sched_load(fresh=True))
++
++    def fixture(self):
++        rows = [{'ID': rid, 'Status': status, 'Match_Date': datetime.fromisoformat(day).date(),
++                 'Date': f'{day} 20:00', 'Match': 'H vs A', 'Tipsme_Match_ID': mid,
++                 'Initial_Line': 2.5, 'Initial_Odds': 1.9, 'System_Stake': 0, 'User_Stake': 0,
++                 'Home_Team': 'H', 'Away_Team': 'A', 'Odds_History': '[]'}
++                for (rid, status, day, mid) in [('A', 'Open', '2026-11-20', '1001'),
++                    ('B', 'Settled', '2026-11-20', '1002'), ('C', 'Open', '2026-11-21', '1003'),
++                    ('D', 'Open', '2026-11-20', '1004.0'), ('E', 'Open', '2026-11-20', '1005')]]
++        pd.DataFrame(rows).reindex(columns=self.app.DB_COLUMNS).to_sql(
++            'football_bets', self.engine, schema='public', index=False,
++            dtype={'Result_Label': Text(), 'Half_Score': Text()})
++        with self.engine.begin() as conn:
++            conn.execute(text("INSERT INTO public.football_bets_deleted VALUES ('E', 'test')"))
++        return pd.read_sql_table('football_bets', self.engine, schema='public')
++
++    def test_narrow_read_only_open_same_date_and_not_tombstoned(self):
++        self.fixture()
++        self.assertEqual(self.app._v18_open_match_ids(self.engine, datetime(2026, 11, 20).date()),
++                         {'1001', '1004'})
++
++    def prepare_write(self):
++        df = self.fixture()
++        df['Result_Label'] = df['Result_Label'].astype('object')
++        self.app.st.session_state['_v1641_sql_base'] = self.app._v1512_fp(df)
++        self.app.st.session_state['_v18_slot_expected'] = self.app._v1512_fp(df.loc[df.ID.eq('A')])
++        df.loc[df.ID.eq('A'), ['Status', 'Result_Label', 'Half_Score',
++                              'Home_Goal', 'Away_Goal', 'Home_Corner', 'Away_Corner']] = [
++                                  'Settled', 'Win', '1-0', 2, 1, 5, 2]
++        return df
++
++    def test_save_and_existing_confirmation_only_touch_target(self):
++        df = self.prepare_write()
++        with self.engine.begin() as conn:
++            conn.execute(text('UPDATE public.football_bets SET "Home_DA"=123 WHERE "ID"=\'A\''))
++        self.assertTrue(self.app._v1512_save_sql_main(df, 'football_bets'), self.errors)
++        self.assertTrue(self.app._v16412_settlement_recorded(df.loc[df.ID.eq('A')]))
++        actual = pd.read_sql_table('football_bets', self.engine, schema='public').set_index('ID')
++        self.assertEqual(actual.at['A', 'Status'], 'Settled')
++        self.assertEqual(actual.at['A', 'Result_Label'], 'Win')
++        self.assertEqual(tuple(actual.loc['A', ['Half_Score', 'Home_Goal', 'Away_Goal',
++                                               'Home_Corner', 'Away_Corner', 'Initial_Odds', 'Home_DA']]),
++                         ('1-0', 2, 1, 5, 2, 1.9, 123))
++        self.assertEqual(actual.at['D', 'Status'], 'Open')
++        self.assertEqual(len(actual), 5)
++
++    def test_concurrent_settlement_or_edit_cannot_be_overwritten(self):
++        for state, change in [('Settled', 1.9), ('Open', 2.1)]:
++            with self.subTest(status=state):
++                with self.engine.begin() as conn:
++                    conn.execute(text('DROP TABLE IF EXISTS public.football_bets'))
++                    conn.execute(text('DELETE FROM public.football_bets_deleted'))
++                df = self.prepare_write()
++                with self.engine.begin() as conn:
++                    conn.execute(text('UPDATE public.football_bets SET "Status"=:s, "Initial_Odds"=:o WHERE "ID"=\'A\''),
++                                 {'s': state, 'o': change})
++                self.assertFalse(self.app._v1512_save_sql_main(df, 'football_bets'))
++                with self.engine.connect() as conn:
++                    actual = conn.execute(text('SELECT "Status", "Initial_Odds" FROM public.football_bets '
++                                               'WHERE "ID"=\'A\'')).one()
++                self.assertEqual(tuple(actual), (state, change))
++
++    def test_tombstone_after_snapshot_aborts_without_changing_slot_rows(self):
++        df = self.prepare_write()
++        with self.engine.begin() as conn:
++            conn.execute(text("INSERT INTO public.football_bets_deleted VALUES ('A', 'test')"))
++        self.assertFalse(self.app._v1512_save_sql_main(df, 'football_bets'))
++        with self.engine.connect() as conn:
++            self.assertEqual(conn.execute(text('SELECT "Status" FROM public.football_bets WHERE "ID"=\'A\'')).scalar_one(),
++                             'Open')
