@@ -290,10 +290,12 @@ class StreamlitPanel(unittest.TestCase):
         at = self.boot(rows, full=True)
         headings = [m.value for m in at.markdown]
         order = ["#### CLV (收盤線價值) 追蹤", "##### 分盤口類型 CLV 統計",
-                 "##### CLV 與賽果的關係", "##### 平均 CLV 按月趨勢",
+                 "##### 平均 CLV 按月趨勢",
                  "##### 最近 15 注 CLV 明細", "#### 🎲 蒙地卡羅本金模擬", "#### 賽前快照證據分組（V18.1）"]
         self.assertEqual(sorted(headings.index(heading) for heading in order),
                          [headings.index(heading) for heading in order])
+        self.assertEqual(headings.count("##### 分盤口類型 CLV 統計"), 1)
+        self.assertFalse(any("與賽果的關係" in heading for heading in headings))
         self.assertEqual(headings.count("##### 最近 15 注 CLV 明細"), 1)
         self.assertEqual(len(at.tabs), 0)
         self.assertEqual([m.value for m in at.metric if m.label == "可計算 CLV 的注單"], ["1 注"])
@@ -302,6 +304,12 @@ class StreamlitPanel(unittest.TestCase):
         price_details = [d.value for d in at.dataframe if "價格差%" in d.value.columns]
         self.assertEqual(price_details[0]["Match"].tolist(), ["較新紀錄", "較早紀錄"])
         self.assertEqual(price_details[0]["價格差%"].tolist(), [8.33, 0.0])
+        official = next(d.value for d in at.dataframe if "CLV 分組" in d.value.columns)
+        legacy = next(d.value for d in at.dataframe if "價格差 分組" in d.value.columns)
+        self.assertEqual(official.iloc[-1]["注數"], 1)
+        self.assertEqual(legacy.iloc[-1]["注數"], 2)
+        self.assertAlmostEqual(legacy.iloc[-1]["單位盈虧"], -.05)
+        self.assertFalse(any("實注單位盈虧" in d.value.columns for d in at.dataframe))
         evidence = next(d.value for d in at.dataframe if "全部注數" in d.value.columns)
         self.assertEqual(evidence["全部注數"].sum(), 7)
         self.assertEqual(evidence["已結算"].sum(), 6)
@@ -309,6 +317,54 @@ class StreamlitPanel(unittest.TestCase):
         self.assertFalse(at.exception)
         self.assertFalse(at.error)
         self.assertTrue(any("User 帳戶" in m.value for m in at.info))
+
+    def test_combined_market_table_splits_raw_sign_and_reconciles_unit_results(self):
+        # Tiny positive and negative values both round to 0.00% in the UI.
+        rows = [
+            dict(CLV=1e-7, Bet_Type="入球大小", Unit_Profit="0.45", System_Stake=0),
+            dict(CLV=0.02, Bet_Type="入球大小", Unit_Profit=-1, System_Stake=100),
+            dict(CLV=0.0, Bet_Type="入球大小", Unit_Profit=0, System_Stake=100),
+            dict(CLV=-1e-7, Bet_Type="讓球", Unit_Profit=0.9, System_Stake=0),
+            dict(CLV=-0.01, Bet_Type="讓球", Unit_Profit=-0.5, System_Stake=100),
+        ]
+        scope = "\n".join(ast.unparse(n) for n in nodes({"render_clv_period_stats", "v9_clean_bt"}))
+        at = AppTest.from_string(
+            f"import numpy as np\nimport pandas as pd\nimport streamlit as st\n{scope}\n"
+            f"frame = pd.DataFrame({rows!r})\n"
+            "frame['Match_Date'] = '2026-11-23'\n"
+            "frame['_entry_order'] = range(len(frame))\n"
+            "render_clv_period_stats(frame)\n"
+        ).run()
+        self.assertFalse(at.exception)
+        df = at.dataframe[0].value
+        self.assertEqual(df.columns.tolist(),
+                         ["盤口類型", "CLV 分組", "注數", "命中率", "單位盈虧", "平均CLV", "跑贏收盤率"])
+        self.assertEqual(df[["盤口類型", "CLV 分組"]].values.tolist(),
+                         [[market, name] for market in ("入球大小", "讓球")
+                          for name in ("小計", "正", "零", "負")] +
+                         [["全盤口", name] for name in ("正", "零", "負", "合計")])
+        df = df.set_index(["盤口類型", "CLV 分組"])
+        expected = {
+            ("入球大小", "小計"): (3, 100/3, -.55),
+            ("入球大小", "正"): (2, 50, -.55),
+            ("入球大小", "零"): (1, 0, 0),
+            ("讓球", "小計"): (2, 50, .40),
+            ("讓球", "負"): (2, 50, .40),
+            ("全盤口", "正"): (2, 50, -.55),
+            ("全盤口", "零"): (1, 0, 0),
+            ("全盤口", "負"): (2, 50, .40),
+            ("全盤口", "合計"): (5, 40, -.15),
+        }
+        for idx, (count, hit, units) in expected.items():
+            with self.subTest(row=idx):
+                self.assertEqual(df.loc[idx, "注數"], count)
+                self.assertAlmostEqual(df.loc[idx, "命中率"], hit)
+                self.assertAlmostEqual(df.loc[idx, "單位盈虧"], units)
+        for idx in (("入球大小", "負"), ("讓球", "正"), ("讓球", "零")):
+            self.assertEqual(df.loc[idx, "注數"], 0)
+            self.assertTrue(df.loc[idx, ["平均CLV", "跑贏收盤率", "命中率", "單位盈虧"]].isna().all())
+        self.assertAlmostEqual(df.loc[("全盤口", "合計"), "平均CLV"], .2)
+        self.assertEqual(df.loc[("全盤口", "合計"), "跑贏收盤率"], 40)
 
     def test_empty_ledger_shows_only_one_set_of_headings(self):
         at = self.boot([], full=True)

@@ -35,7 +35,7 @@ from fb_app_historical_clv import overlay as overlay_historical_clv, sql_rows as
 # V16.4.11：自動分析及入庫只讀本批次已核對的快照，不讀手動表單的 widget。
 # V16.4.12：排程以有效日期及正式庫核對確認完成，不把缺值或掃描結束當成功。
 # V18：香港固定時段可各自啟用，沿用既有結算；原每日排程及歷史補建保留。
-FB_APP_RELEASE = 'V18.2.4'
+FB_APP_RELEASE = 'V18.2.5'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -2313,7 +2313,7 @@ def render_clv_closing_updater(db_file, db_table):
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 def render_clv_period_stats(valid, *, archive=False):
-    """Present the five sections once, including when no sample qualifies."""
+    """Present the overview, grouped stats, trend and details for one CLV source scope."""
     valid = valid.copy()
     title = "舊版價格差（歷史參考）" if archive else "CLV (收盤線價值) 追蹤"
     label = "價格差" if archive else "CLV"
@@ -2331,35 +2331,48 @@ def render_clv_period_stats(valid, *, archive=False):
               f"{values.gt(0).mean() * 100:.1f}%" if len(values) else "無估計")
 
     valid['_bt'] = valid['Bet_Type'].astype(str).apply(v9_clean_bt)
+    valid['_unit'] = pd.to_numeric(valid['Unit_Profit'], errors='coerce')
     st.markdown(f"##### 分盤口類型 {label} 統計")
+    st.caption("命中率以贏半或以上計；單位盈虧包含模擬注、不按注碼加權。"
+               "這些是歷史結果，不代表樣本外精準度或長期盈利。")
+    group_col = f'{label} 分組'
+    avg_col = f'平均{label}'
+    beat_col = '正價格差比率' if archive else '跑贏收盤率'
     market_rows = []
-    for bt, g in valid.groupby('_bt'):
-        staked = pd.to_numeric(g['System_Stake'], errors='coerce').gt(0)
-        unit_sum = pd.to_numeric(g.loc[staked, 'Unit_Profit'], errors='coerce').sum()
-        market_rows.append({'盤口類型': bt, '注數': len(g),
-                            f'平均{label}': f"{g['CLV'].mean() * 100:+.2f}%",
-                            '跑贏收盤率': f"{g['CLV'].gt(0).mean() * 100:.0f}%",
-                            '實注單位盈虧': f"{unit_sum:+.2f}U"})
+
+    def append_stats(market, group, part):
+        clv, unit = part['CLV'], part['_unit']
+        market_rows.append({'盤口類型': market, group_col: group, '注數': len(part),
+                            '命中率': unit.gt(0).mean() * 100,
+                            '單位盈虧': unit.sum(min_count=1),
+                            avg_col: clv.mean() * 100,
+                            beat_col: clv.gt(0).mean() * 100})
+
+    def append_signs(market, part):
+        clv = part['CLV']  # Partition by the raw sign, not the display precision.
+        for name, mask in (('正', clv.gt(0)), ('零', clv.eq(0)), ('負', clv.lt(0))):
+            append_stats(market, name, part.loc[mask])
+
+    for market, part in valid.groupby('_bt'):
+        append_stats(market, '小計', part)
+        append_signs(market, part)
+    if not valid.empty:
+        append_signs('全盤口', valid)
+        append_stats('全盤口', '合計', valid)
     if market_rows:
-        st.dataframe(pd.DataFrame(market_rows), width="stretch", hide_index=True)
+        table = pd.DataFrame(market_rows)
+        subtotal = table[group_col].isin(['小計', '合計'])
+        styled = table.style.apply(lambda col: np.where(subtotal, 'font-weight: bold', ''), axis=0)
+        st.dataframe(styled, width="stretch", height="content", hide_index=True, placeholder="-",
+                     column_config={
+                         '盤口類型': st.column_config.TextColumn(pinned=True),
+                         avg_col: st.column_config.NumberColumn(format='%+.2f%%'),
+                         beat_col: st.column_config.NumberColumn(format='%.1f%%'),
+                         '命中率': st.column_config.NumberColumn(format='%.1f%%'),
+                         '單位盈虧': st.column_config.NumberColumn(format='%+.2fU'),
+                     })
     else:
         st.info("尚無合資格的已結算注單。" if not archive else "尚無可比較的舊版價格差紀錄。")
-
-    st.markdown(f"##### {label} 與賽果的關係")
-    st.caption("下面是這批已結算注單（含模擬注）的歷史結果，不是模型的樣本外精準度或長期盈利證明。")
-    ev1, ev2 = st.columns(2)
-    for col, side_title, part in ((ev1, f"{label} 為正", valid[values.gt(0)]),
-                                  (ev2, f"{label} 為零或負", valid[values.le(0)])):
-        with col:
-            st.markdown(f"**{side_title}**")
-            if part.empty:
-                st.write("無樣本")
-                continue
-            unit = pd.to_numeric(part['Unit_Profit'], errors='coerce')
-            m1, m2, m3 = st.columns(3)
-            m1.metric("注數", f"{len(part)}")
-            m2.metric("命中率 (贏半或以上)", f"{unit.gt(0).mean() * 100:.1f}%")
-            m3.metric("單位盈虧", f"{unit.sum():+.2f}U")
 
     valid['_month'] = valid['Match_Date'].fillna('').astype(str).str[:7]
     monthly = valid[valid['_month'].str.fullmatch(r'\d{4}-(?:0[1-9]|1[012])')].groupby('_month')['CLV'].mean().sort_index()
@@ -2383,7 +2396,7 @@ def render_clv_period_stats(valid, *, archive=False):
 
 def render_clv_summary(settled, classified):
     columns = ['Date', 'Match_Date', 'Match', 'Bet_Type', 'Selection', 'Initial_Line',
-               'Initial_Odds', 'System_Stake', 'Unit_Profit', 'Result_Label', 'Odds_History']
+               'Initial_Odds', 'Unit_Profit', 'Result_Label', 'Odds_History']
     data = settled.reindex(columns=list(dict.fromkeys([*settled.columns, *columns]))).copy()
     data['_entry_order'] = data['Date'].map(lambda x: clv_local(x.strip() if isinstance(x, str) else x))
     data['CLV'] = classified['clv'].where(classified['group'].isin(['snapshot', 'historical_verified'])).to_numpy()
