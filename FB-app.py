@@ -35,7 +35,7 @@ from fb_app_historical_clv import overlay as overlay_historical_clv, sql_rows as
 # V16.4.11：自動分析及入庫只讀本批次已核對的快照，不讀手動表單的 widget。
 # V16.4.12：排程以有效日期及正式庫核對確認完成，不把缺值或掃描結束當成功。
 # V18：香港固定時段可各自啟用，沿用既有結算；原每日排程及歷史補建保留。
-FB_APP_RELEASE = 'V18.2.3'
+FB_APP_RELEASE = 'V18.2.4'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -1557,6 +1557,64 @@ def _v161_sql_read_bets(*, allow_empty=False):
     except Exception:
         return None
 
+def _v1824_read_clv_ledger_snapshot():
+    """Skip retransmitting the entire ledger only on the same PostgreSQL snapshot.
+
+    Keep the probe and the original full read in one read-only transaction.
+    No elapsed-time cache, partial ledger, schema changes or stale fallback.
+    """
+    key = '_v1824_clv_ledger_snapshot'
+    cache = st.session_state.get(key)
+    try:
+        from sqlalchemy import text
+        engine = _v163_sql_engine()
+        if engine is not None and engine.dialect.name == 'postgresql':
+            with engine.connect().execution_options(isolation_level='REPEATABLE READ') as conn:
+                with conn.begin():
+                    conn.execute(text('SET TRANSACTION READ ONLY'))
+                    conn.execute(text('LOCK TABLE public."football_bets" IN ACCESS SHARE MODE NOWAIT'))
+                    token = conn.execute(text('''
+                        SELECT pg_catalog.pg_current_snapshot()::text, c.oid,
+                               pg_catalog.pg_relation_filenode(c.oid),
+                               pg_catalog.pg_postmaster_start_time(),
+                               pg_catalog.inet_server_addr()::text,
+                               pg_catalog.inet_server_port(),
+                               current_database(), current_user, session_user,
+                               current_setting('search_path'), current_setting('TimeZone'),
+                               current_setting('DateStyle'), current_setting('extra_float_digits')
+                        FROM pg_catalog.pg_class c
+                        WHERE c.oid = pg_catalog.to_regclass('public.football_bets')
+                          AND c.oid = pg_catalog.to_regclass('football_bets')
+                          AND c.relkind = 'r' AND c.relpersistence = 'p' AND NOT c.relhassubclass
+                          AND NOT pg_catalog.pg_is_in_recovery()
+                          AND NOT pg_catalog.row_security_active(c.oid)
+                          AND NOT EXISTS (
+                              SELECT 1 FROM pg_catalog.pg_attribute a
+                              WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                                AND a.atttypid NOT IN (
+                                    'text'::regtype, 'varchar'::regtype, 'bpchar'::regtype,
+                                    'int2'::regtype, 'int4'::regtype, 'int8'::regtype,
+                                    'float4'::regtype, 'float8'::regtype, 'numeric'::regtype,
+                                    'bool'::regtype, 'date'::regtype, 'timestamp'::regtype,
+                                    'timestamptz'::regtype)
+                          )
+                    ''')).one_or_none()
+                    if token is not None:
+                        token = tuple(token)
+                        if cache is not None and cache[0] == id(engine) and cache[1] == token:
+                            return cache[2].copy(deep=True)
+                        df = pd.read_sql_table('football_bets', conn)
+                        if df is not None and not df.empty:
+                            df = process_legacy_columns(df)
+                            st.session_state[key] = (id(engine), token, df.copy(deep=True))
+                            return df
+    except Exception:
+        pass
+    # Incompatibility, SQL errors and empty snapshots retain the old authoritative
+    # fall-through; an old cached frame is never used as the fallback.
+    st.session_state.pop(key, None)
+    return _v161_sql_read_bets()
+
 def _v1645_sql_read_bet_duplicates(match_id):
     """自動 BET 的唯讀防重預查；精確比對仍使用原有 Python 規則。"""
     if not match_id:
@@ -1593,14 +1651,14 @@ def _v1645_sql_read_bet_duplicates(match_id):
     except Exception:
         return None
 
-def _v161_refresh_db_from_sql():
+def _v161_refresh_db_from_sql(*, reuse_clv_snapshot=False):
     """V16.1：批次開始前從 SQL 強制刷新 session df_db。
     背景 (2026-11-17 首晚事故)：接手裝置的 session 快照過舊，看不到其他裝置剛
     寫入的注單 → 「已記錄跳過」失效 → 7 對重複下注。刷新後快照與 SQL 一致
     (合併策略沿用 V15.9.2 _v159_merge_db：ID 聯集、已結算優先、本機獨有列全
     保留 — 絕不因刷新而丟失本 session 數據)。回傳 True 表示已刷新。"""
     try:
-        cloud = _v161_sql_read_bets()
+        cloud = _v1824_read_clv_ledger_snapshot() if reuse_clv_snapshot else _v161_sql_read_bets()
         if cloud is None:
             return False
         # V16.4：刷新亦過濾刪除墓碑 — 主裝置長開 session 記憶體中的已刪
@@ -9250,7 +9308,7 @@ def v15_auto_executor(df_db, opts_tournaments, opts_teams):
         # 裝置剛寫入的注單，令「已記錄跳過」失效。刷新後此檢查用 SQL 即時
         # 數據。非 clv 模式 (每日結算/輪次) 零改動。
         if str(a.get('mode')) == 'clv':
-            if _v161_refresh_db_from_sql():
+            if _v161_refresh_db_from_sql(reuse_clv_snapshot=True):
                 refreshed = st.session_state.get('df_db')
                 if refreshed is not None:
                     df_db = refreshed
@@ -9776,7 +9834,7 @@ def _v18_daily_bet_precheck(day, *, engine=None):
             # 只在日期型別可安全等價時下推日期；舊文字／帶時區格式必須保留
             # 整個日期序列給原 pandas 解析，不將字串前綴當作權威賽日。
             native = {'date', 'timestamp without time zone'}
-            if date_cols and all(types[col] in native for col in date_cols):
+            if day is not None and date_cols and all(types[col] in native for col in date_cols):
                 args = ', '.join(f'b."{col}"::date' for col in date_cols)
                 date_expr = f'COALESCE({args})' if len(date_cols) == 2 else args
                 query += f' WHERE {date_expr} = :day'
@@ -9852,7 +9910,11 @@ def _v16412_schedule_notice(day, window, msg):
 def _v16412_finish_schedule(a):
     day = _v16412_date(a['rdate'])
     window = _v16412_window(a)
-    db = _v16412_authoritative_bets()
+    # Completion only checks fixture identity and status. Keep all date values
+    # for pandas legacy parsing and never replace the session or write baseline.
+    db = _v18_daily_bet_precheck(None) if _has_secret('DB_URL') else None
+    if db is None:
+        db = _v16412_authoritative_bets()
     pending = (sum(not _v16412_settled(_v16412_match_rows(db, m)) for m in a['queue'])
                if db is not None else None)
     if a.get('failed') or pending:
@@ -10359,7 +10421,7 @@ def v16_try_start_auto_bet(df_db, cfg):
         return False
     if phase == 'stale':
         # 接手前保留正式庫防重；不能核對時不接手。FILL 仍有獨立刷新。
-        if _v161_refresh_db_from_sql():
+        if _v161_refresh_db_from_sql(reuse_clv_snapshot=True):
             refreshed = st.session_state.get('df_db')
             if refreshed is not None:
                 df_db = refreshed
