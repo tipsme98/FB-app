@@ -86,6 +86,20 @@ class Evidence(unittest.TestCase):
             with self.subTest(q=q):
                 self.assertEqual(classify(marked(q)).group, "pending")
 
+    def test_diagnostic_reasons_do_not_relax_eligibility(self):
+        for q, reason in (
+            (quote(ENTRY_AT), "not_after_entry"),
+            (quote(KICK - timedelta(minutes=16)), "too_early"),
+            (quote(KICK - timedelta(minutes=2), line=2.5), "line_changed"),
+            (quote(KICK - timedelta(minutes=2), close=False), "no_archive"),
+            (quote(KICK - timedelta(minutes=2), mid=2), "no_archive"),
+        ):
+            with self.subTest(reason=reason):
+                result = classify(marked(q))
+                self.assertEqual((result.group, result.clv, result.reason), ("pending", None, reason))
+        boundary = classify(marked(quote(KICK - timedelta(minutes=15))))
+        self.assertEqual((boundary.group, boundary.clv), ("snapshot", 0.0))
+
     def test_same_final_source_quote_and_counterexamples(self):
         result = classify(marked(quote(QUOTED)))
         self.assertEqual((result.group, result.clv), ("snapshot", 0.0))
@@ -201,7 +215,7 @@ class StreamlitPanel(unittest.TestCase):
     def boot(self, rows, *, full=False):
         names = self.shared | {"render_clv_section"}
         if full:
-            names |= {"render_clv_tab", "render_clv_date_tabs", "render_clv_period_stats",
+            names |= {"render_clv_tab", "render_clv_summary", "render_clv_period_stats", "render_clv_recent_diagnostics",
                       "render_handicap_audit", "compute_legacy_bet_clv",
                       "v9_clean_bt", "_oh_sort_ts", "parse_dt_for_comparison", "v10_parse_time",
                       "get_hkt_now", "HKT", "render_monte_carlo_section", "build_mc_records",
@@ -232,7 +246,7 @@ class StreamlitPanel(unittest.TestCase):
         self.assertEqual([m.value for m in at.metric], ["1 注", "+0.00%", "1 注"])
         self.assertEqual(at.session_state["groups"], ["historical_late", "snapshot"])
 
-    def test_two_periods_keep_archive_outside_official_counts_and_preserve_order(self):
+    def test_single_view_keeps_archive_outside_official_counts_and_preserves_order(self):
         def history(close):
             # Reverse storage order to check date ordering; wrong lines must not be used.
             return json.dumps([quote(KICK-timedelta(minutes=1), price=close),
@@ -257,28 +271,49 @@ class StreamlitPanel(unittest.TestCase):
                  "##### 最近 15 注 CLV 明細", "#### 🎲 蒙地卡羅本金模擬", "#### 賽前快照證據分組（V18.1）"]
         self.assertEqual(sorted(headings.index(heading) for heading in order),
                          [headings.index(heading) for heading in order])
-        self.assertEqual(headings.count("##### 最近 15 注 CLV 明細"), 2)
-        self.assertEqual([t.label for t in at.tabs], ["11 月 22 日前", "11 月 22 日 00:00 起"])
-        self.assertEqual([m.value for m in at.metric if m.label == "可計算 CLV 的注單"], ["0 注", "1 注"])
-        self.assertEqual([m.value for m in at.metric if m.label == "舊版可比對紀錄"], ["1 注", "1 注"])
-        self.assertEqual([m.value for m in at.metric if m.label == "平均 CLV"], ["無估計", "+0.00%"])
+        self.assertEqual(headings.count("##### 最近 15 注 CLV 明細"), 1)
+        self.assertEqual(len(at.tabs), 0)
+        self.assertEqual([m.value for m in at.metric if m.label == "可計算 CLV 的注單"], ["1 注"])
+        self.assertEqual([m.value for m in at.metric if m.label == "舊版可比對紀錄"], ["2 注"])
+        self.assertEqual([m.value for m in at.metric if m.label == "平均 CLV"], ["+0.00%"])
         price_details = [d.value for d in at.dataframe if "價格差%" in d.value.columns]
-        self.assertEqual(price_details[0]["Match"].tolist(), ["較早紀錄"])
-        self.assertEqual(price_details[1]["價格差%"].tolist(), [8.33])
+        self.assertEqual(price_details[0]["Match"].tolist(), ["較新紀錄", "較早紀錄"])
+        self.assertEqual(price_details[0]["價格差%"].tolist(), [8.33, 0.0])
         evidence = next(d.value for d in at.dataframe if "全部注數" in d.value.columns)
         self.assertEqual(evidence["全部注數"].sum(), 7)
         self.assertEqual(evidence["已結算"].sum(), 6)
-        self.assertTrue(any("缺有效時間" in m.value for m in at.caption))
         at.selectbox(key="mc_account").select("User").run()
         self.assertFalse(at.exception)
         self.assertFalse(at.error)
         self.assertTrue(any("User 帳戶" in m.value for m in at.info))
 
-    def test_empty_ledger_shows_both_tabs_and_all_five_headings(self):
+    def test_empty_ledger_shows_only_one_set_of_headings(self):
         at = self.boot([], full=True)
-        self.assertEqual(len(at.tabs), 2)
-        self.assertEqual(sum(m.value == "##### 平均 CLV 按月趨勢" for m in at.markdown), 2)
-        self.assertEqual([m.value for m in at.metric if m.label == "可計算 CLV 的注單"], ["0 注", "0 注"])
+        self.assertEqual(len(at.tabs), 0)
+        self.assertEqual(sum(m.value == "##### 平均 CLV 按月趨勢" for m in at.markdown), 1)
+        self.assertEqual([m.value for m in at.metric if m.label == "可計算 CLV 的注單"], ["0 注"])
+        self.assertTrue(any("無有效登記時間的紀錄" in m.value for m in at.info))
+
+    def test_recent_diagnostics_read_only_status_and_evidence_counts(self):
+        final = quote(KICK-timedelta(minutes=2))
+        rows = [
+            base(Note="", Match="未有標記"),
+            marked(Match="缺收盤"),
+            marked(quote(KICK-timedelta(minutes=2), line=2.5), Match="轉線"),
+            marked(final, Status="Open", Match="未結算"),
+            marked(final, Match="已結算"),
+            marked(final, Status="Unknown", Match="其他"),
+            base(Date="2026-11-21 14:00"),
+            base(Date="2026-11-22"),
+        ]
+        at = self.boot(rows, full=True)
+        self.assertIn("近期帳本 6 筆｜已結算 4 筆｜待結算 1 筆｜其他狀態 1 筆",
+                      [m.value for m in at.markdown])
+        t = next(el.value for el in at.table if "核對結果" in el.value.columns)
+        self.assertEqual(t[["全部", "已結算", "待結算", "其他"]].sum().tolist(), [6, 4, 1, 1])
+        good = t[t["核對結果"].str.startswith("入注及收盤證據齊全")].iloc[0]
+        self.assertEqual(good[["全部", "已結算", "待結算", "其他"]].tolist(), [3, 1, 1, 1])
+        self.assertEqual([m.value for m in at.metric if m.label == "可計算 CLV 的注單"], ["1 注"])
 
     def test_preview_excel_and_csv_keep_missing_distinct_from_zero(self):
         preview, = nodes({"preview_db_dialog"})

@@ -18,6 +18,7 @@ class Cohort(NamedTuple):
     clv: float | None = None
     closing: float | None = None
     close_time: str = ""
+    reason: str = ""  # optional read-only detail; does not change eligibility
 
 
 def fixture_id(value):
@@ -211,22 +212,25 @@ def classify(row):
             if actual_kickoff == kickoff and stamp < kickoff:
                 closes.append((stamp, round(float(raw["line"]), 6), price_pair))
     if not closes:
-        return Cohort("pending")
+        return Cohort("pending", reason="no_archive")
     last = max(t for t, _, _ in closes)
     finals = {(line, p) for t, line, p in closes if t == last}
     if len(finals) != 1:
         return Cohort("close_conflict")
     line, final_pair = next(iter(finals))
     if line != key[4]:
-        return Cohort("pending")
+        return Cohort("pending", reason="line_changed")
     # If the pre-kickoff entry actually used the final quote, the independent
     # completed-fixture archive must confirm the very same two-sided quote.
     # A different or older pre-entry quote, or a duplicate live snapshot, is not proof.
     same_final_quote = last == q and all(
         math.isclose(x, float(y), abs_tol=1e-6, rel_tol=0) for x, y in zip(final_pair, pair)
     )
-    if not same_final_quote and not (entered < last and kickoff - last <= timedelta(minutes=15)):
-        return Cohort("pending")
+    if not same_final_quote:
+        if last <= entered:
+            return Cohort("pending", reason="not_after_entry")
+        if kickoff - last > timedelta(minutes=15):
+            return Cohort("pending", reason="too_early")
     closing = final_pair[side]
     if same_final_quote:
         return Cohort("snapshot", 0.0, closing, last.isoformat())

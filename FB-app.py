@@ -34,7 +34,7 @@ from fb_app_handicap_audit import handicap_audit
 # V16.4.11：自動分析及入庫只讀本批次已核對的快照，不讀手動表單的 widget。
 # V16.4.12：排程以有效日期及正式庫核對確認完成，不把缺值或掃描結束當成功。
 # V18：香港固定時段可各自啟用，沿用既有結算；原每日排程及歷史補建保留。
-FB_APP_RELEASE = 'V18.2'
+FB_APP_RELEASE = 'V18.2.1'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -2254,7 +2254,7 @@ def render_clv_closing_updater(db_file, db_table):
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 def render_clv_period_stats(valid, *, archive=False):
-    """Both date tabs have the same five sections, including for an empty period."""
+    """Present the five sections once, including when no sample qualifies."""
     valid = valid.copy()
     title = "舊版價格差（歷史參考）" if archive else "CLV (收盤線價值) 追蹤"
     label = "價格差" if archive else "CLV"
@@ -2284,7 +2284,7 @@ def render_clv_period_stats(valid, *, archive=False):
     if market_rows:
         st.dataframe(pd.DataFrame(market_rows), width="stretch", hide_index=True)
     else:
-        st.info("本時段尚無合資格的已結算注單。")
+        st.info("尚無合資格的已結算注單。" if not archive else "尚無可比較的舊版價格差紀錄。")
 
     st.markdown(f"##### {label} 與賽果的關係")
     st.caption("下面是這批已結算注單（含模擬注）的歷史結果，不是模型的樣本外精準度或長期盈利證明。")
@@ -2320,28 +2320,18 @@ def render_clv_period_stats(valid, *, archive=False):
         st.write("無明細")
 
 
-def render_clv_date_tabs(settled):
+def render_clv_summary(settled, classified):
     columns = ['Date', 'Match_Date', 'Match', 'Bet_Type', 'Selection', 'Initial_Line',
                'Initial_Odds', 'System_Stake', 'Unit_Profit', 'Result_Label', 'Odds_History']
-    data = settled.reindex(columns=list(dict.fromkeys([*settled.columns, *columns])))
-    periods = data['Date'].map(clv_report_period)
-    excluded = int(periods.isna().sum())
-    st.caption("以帳本入注／登記時間按香港時間分組，分界為 2026-11-22 00:00。"
-               + (f"有 {excluded:,} 筆已結算紀錄缺有效時間，未放入兩區。" if excluded else ""))
-    verified = _v16_clv_rows(data)
-    frames = st.tabs(["11 月 22 日前", "11 月 22 日 00:00 起"])
-    for period, container in enumerate(frames):
-        with container:
-            section = data.loc[periods.eq(period)].copy()
-            section['_entry_order'] = section['Date'].map(lambda x: clv_local(x.strip() if isinstance(x, str) else x))
-            cohort = verified.loc[periods.eq(period)]
-            section['CLV'] = cohort['clv'].where(cohort['group'].eq('snapshot')).to_numpy()
-            render_clv_period_stats(section[section['CLV'].notna()])
-            with st.expander("舊版價格差紀錄（不計入可計算 CLV 注單）"):
-                archive = section.copy()
-                archive['CLV'] = (pd.to_numeric(archive.apply(compute_legacy_bet_clv, axis=1), errors='coerce')
-                                  if not archive.empty else pd.Series(dtype=float))
-                render_clv_period_stats(archive[archive['CLV'].notna()], archive=True)
+    data = settled.reindex(columns=list(dict.fromkeys([*settled.columns, *columns]))).copy()
+    data['_entry_order'] = data['Date'].map(lambda x: clv_local(x.strip() if isinstance(x, str) else x))
+    data['CLV'] = classified['clv'].where(classified['group'].eq('snapshot')).to_numpy()
+    render_clv_period_stats(data[data['CLV'].notna()])
+    with st.expander("舊版價格差紀錄（不計入可計算 CLV 注單）"):
+        archive = data.loc[data['Date'].map(clv_report_period).notna()].copy()
+        archive['CLV'] = (pd.to_numeric(archive.apply(compute_legacy_bet_clv, axis=1), errors='coerce')
+                          if not archive.empty else pd.Series(dtype=float))
+        render_clv_period_stats(archive[archive['CLV'].notna()], archive=True)
 
 
 CLV_GROUPS = {
@@ -2357,7 +2347,47 @@ CLV_GROUPS = {
 }
 
 
-def render_clv_section(df):
+def render_clv_recent_diagnostics(df, classified):
+    """Explain eligibility for recent ledger entries without reading a second ledger."""
+    with st.expander("11 月 22 日起：為何有入注紀錄，仍未必有 CLV？"):
+        st.caption("只核對目前載入的帳本，按 2026-11-22 00:00 香港時間起的登記時間篩選。"
+                   "每筆只歸入一個原因；登記時間不是賽前入注證明。")
+        recent = df.get('Date', pd.Series(index=df.index, dtype=object)).map(clv_report_period).eq(1)
+        if not recent.any():
+            st.info("目前帳本在這段期間無有效登記時間的紀錄可供診斷。")
+            return
+        recent_groups = classified.loc[recent].copy()
+        reason = recent_groups['reason'].where(recent_groups['group'].eq('pending'), recent_groups['group'])
+        status = df.get('Status', pd.Series(index=df.index, dtype=object)).loc[recent]
+        settled = status.eq('Settled')
+        open_rows = status.fillna('').astype(str).str.strip().eq('Open')
+        other = ~(settled | open_rows)
+        counts = reason.value_counts()
+        st.write(f"近期帳本 {int(recent.sum()):,} 筆｜已結算 {int(settled.sum()):,} 筆｜"
+                 f"待結算 {int(open_rows.sum()):,} 筆｜其他狀態 {int(other.sum()):,} 筆")
+        definitions = {
+            'snapshot': '入注及收盤證據齊全（已結算才計入 CLV）',
+            'historical_unknown': '缺可核對的賽前入注標記',
+            'historical_late': '賽日後登記，缺賽前入注標記',
+            'entry_invalid': '有入注標記，但與時間或注單不符',
+            'no_archive': '已核實入注，缺可核對的完場收盤報價',
+            'line_changed': '已核實入注，但收盤轉線',
+            'not_after_entry': '收盤報價未晚於入注，亦未證實是同一筆',
+            'too_early': '最後報價距開賽超過 15 分鐘',
+            'kickoff_conflict': '入注與收盤證據的開賽時間不符',
+            'close_conflict': '同時收盤報價有衝突',
+            'follow': '用家跟投副本',
+            'out_of_scope': '即場、非適用盤口或入注欄位不完整',
+        }
+        settled_counts, open_counts = reason[settled].value_counts(), reason[open_rows].value_counts()
+        st.table(pd.DataFrame([
+            {'核對結果': label, '全部': int(counts[code]), '已結算': int(settled_counts.get(code, 0)),
+             '待結算': int(open_counts.get(code, 0)), '其他': int(reason[other].eq(code).sum())}
+            for code, label in definitions.items() if code in counts
+        ]))
+
+
+def render_clv_section(df, classified=None):
     st.markdown("#### 賽前快照證據分組（V18.1）")
     st.caption("本區顯示報價證據覆蓋，並非預測命中率。"
                "原始價格 CLV = 記錄入注賠率 ÷ 同場、同方向、同線的近收盤賠率 − 1。"
@@ -2367,7 +2397,8 @@ def render_clv_section(df):
     if df is None or df.empty:
         st.info("尚無注單可檢視。")
         return
-    classified = _v16_clv_rows(df)
+    if classified is None:
+        classified = _v16_clv_rows(df)
     buckets = classified.group.value_counts()
     settled_buckets = classified.loc[df.Status.eq('Settled'), 'group'].value_counts()
     matched = classified.group.eq('snapshot') & df.Status.eq('Settled')
@@ -2403,11 +2434,15 @@ def render_clv_tab(df, db_file, db_table, sys_bankroll):
     st.subheader("CLV (收盤線價值) 追蹤與蒙地卡羅本金模擬")
     render_clv_closing_updater(db_file, db_table)
     st.divider()
-    settled = df[df['Status'].eq('Settled')] if not df.empty else df.copy()
+    settled_mask = df.get('Status', pd.Series(index=df.index, dtype=object)).eq('Settled')
+    settled = df.loc[settled_mask].copy()
     try:
-        render_clv_date_tabs(settled)
+        classified = _v16_clv_rows(df)
+        render_clv_summary(settled, classified.loc[settled_mask])
+        render_clv_recent_diagnostics(df, classified)
     except Exception as e:
-        st.error(f"分期 CLV 追蹤發生錯誤：{e}")
+        classified = None
+        st.error(f"CLV 追蹤發生錯誤：{e}")
     st.divider()
     try:
         render_monte_carlo_section(settled, sys_bankroll)
@@ -2415,7 +2450,7 @@ def render_clv_tab(df, db_file, db_table, sys_bankroll):
         st.error(f"蒙地卡羅模擬發生錯誤：{e}")
     st.divider()
     try:
-        render_clv_section(df)
+        render_clv_section(df, classified)
     except Exception as e:
         st.error(f"賽前快照證據分組發生錯誤：{e}")
     with st.expander("讓球前向驗證：模型與同期去水市場對照"):
@@ -7165,7 +7200,7 @@ def _v16_clv_rows(df_db):
             'Initial_Line', 'Initial_Odds', 'Odds_History']
     vals = pd.DataFrame(
         map(classify_clv, df_db.reindex(columns=keys).to_dict('records')), index=df_db.index,
-        columns=['group', 'clv', 'closing', 'close_time'],
+        columns=['group', 'clv', 'closing', 'close_time', 'reason'],
     )
     vals['clv'] = pd.to_numeric(vals['clv'], errors='coerce')
     if sig is not None:
