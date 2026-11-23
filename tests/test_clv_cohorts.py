@@ -212,11 +212,11 @@ class Archive(unittest.TestCase):
 class StreamlitPanel(unittest.TestCase):
     shared = {"CLV_GROUPS", "_V16_CLV_HOLDER", "_v16_db_content_sig", "_v16_clv_rows"}
 
-    def boot(self, rows, *, full=False):
+    def boot(self, rows, *, full=False, historical=None):
         names = self.shared | {"render_clv_section"}
         if full:
             names |= {"render_clv_tab", "render_clv_summary", "render_clv_period_stats", "render_clv_recent_diagnostics",
-                      "render_handicap_audit", "compute_legacy_bet_clv",
+                      "render_handicap_audit", "compute_legacy_bet_clv", "render_historical_clv_batch",
                       "v9_clean_bt", "_oh_sort_ts", "parse_dt_for_comparison", "v10_parse_time",
                       "get_hkt_now", "HKT", "render_monte_carlo_section", "build_mc_records",
                       "run_bankroll_simulation"}
@@ -224,10 +224,12 @@ class StreamlitPanel(unittest.TestCase):
                    "from datetime import datetime, timedelta, timezone\n"
                    "from fb_app_clv_cohorts import classify as classify_clv, ENTRY as CLV_ENTRY, local as clv_local, report_period as clv_report_period\n"
                    "from fb_app_handicap_audit import handicap_audit\n"
+                   "from fb_app_historical_clv import overlay as overlay_historical_clv\n"
                    + "\n".join(ast.unparse(n) for n in nodes(names))
                    + f"\nframe = pd.DataFrame({rows!r}, index=list(range(719, 719+{len(rows)})))\n"
                    + ("def render_clv_closing_updater(*_): st.button('收盤更新測試替身')\n"
-                      "render_clv_tab(frame, None, None, 10000)\n" if full else "render_clv_section(frame)\n")
+                      f"render_clv_tab(frame, None, None, 10000, historical={historical!r})\n"
+                      if full else "render_clv_section(frame)\n")
                    + "st.session_state['groups'] = _v16_clv_rows(frame).group.tolist()\n"
                    + "assert _v16_clv_rows(frame) is _v16_clv_rows(frame)\n"
                    + "if len(frame):\n"
@@ -237,6 +239,27 @@ class StreamlitPanel(unittest.TestCase):
         self.assertFalse(at.exception)
         self.assertFalse(at.error)
         return at
+
+    def test_history_filter_uses_live_status_and_has_no_duplicate_summary(self):
+        from test_historical_clv import sample
+        b, h = sample()
+        pending = base(**b)
+        old = base(ID="prior", Date="2026-11-20 15:01", Match_Date="2026-11-20")
+        at = self.boot([pending, old], full=True, historical=("ok", [h]))
+        self.assertTrue(any("待結算 1 筆" in x.value for x in at.markdown))
+        self.assertEqual(next(x for x in at.metric if x.label == "可計算 CLV 的注單").value, "0 注")
+        at.radio(key="historical_clv_batch_filter").set_value("已結算").run()
+        self.assertTrue(any("這個狀態目前沒有核證紀錄" in x.value for x in at.info))
+        at = self.boot([pending, old], full=True, historical=("ok", [dict(h, Status="Settled")]))
+        self.assertEqual(next(x for x in at.metric if x.label == "可計算 CLV 的注單").value, "1 注")
+        self.assertEqual(next(x for x in at.metric if x.label == "平均 CLV").value, "+13.85%")
+        self.assertEqual(sum("#### CLV (收盤線價值) 追蹤" == x.value for x in at.markdown), 1)
+
+    def test_history_unavailable_preserves_native_snapshot(self):
+        live = marked(quote(KICK - timedelta(minutes=2), price=1.80))
+        at = self.boot([live], full=True, historical=("unavailable", None))
+        self.assertTrue(any("不是零筆" in x.value for x in at.warning))
+        self.assertEqual(next(x for x in at.metric if x.label == "可計算 CLV 的注單").value, "1 注")
 
     def test_reports_empty_as_missing_and_legitimate_zero_as_zero(self):
         legacy = base(ID="legacy", Date="2026-11-24 11:00")

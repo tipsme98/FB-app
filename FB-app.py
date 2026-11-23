@@ -18,6 +18,7 @@ from fb_app_clv_cohorts import (
     record_handicap_forecast as clv_record_handicap_forecast,
 )
 from fb_app_handicap_audit import handicap_audit
+from fb_app_historical_clv import overlay as overlay_historical_clv, sql_rows as historical_clv_sql_rows
 # ==============================================================================
 # V16.4.1 (2026-11-18)：主表增量寫入和墓碑/Undo 同一事務；只按明示 ID 刪除。
 # 保留差量備份，不再把「本次某些列成功」當作全份備份可清空的證據。
@@ -34,7 +35,7 @@ from fb_app_handicap_audit import handicap_audit
 # V16.4.11：自動分析及入庫只讀本批次已核對的快照，不讀手動表單的 widget。
 # V16.4.12：排程以有效日期及正式庫核對確認完成，不把缺值或掃描結束當成功。
 # V18：香港固定時段可各自啟用，沿用既有結算；原每日排程及歷史補建保留。
-FB_APP_RELEASE = 'V18.2.1'
+FB_APP_RELEASE = 'V18.2.3'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -2262,7 +2263,7 @@ def render_clv_period_stats(valid, *, archive=False):
     if archive:
         st.caption("舊版公式僅作歷史對照，可能含收盤回填或無法核實的入注。以下不計入正式 CLV。")
     else:
-        st.caption("只計已結算而且可核對為開賽前入注的同線報價。模擬注及實注均可；可獨立核對同價才記 0%。")
+        st.caption("只計已結算且同線兩端已核證的注單。歷史馬會收盤及賽前快照分列來源；同一注只計一次。")
     values = valid['CLV']
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("舊版可比對紀錄" if archive else "可計算 CLV 的注單", f"{len(valid):,} 注")
@@ -2312,6 +2313,8 @@ def render_clv_period_stats(valid, *, archive=False):
 
     st.markdown(f"##### 最近 15 注 {label} 明細")
     cols = ['Date', 'Match', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 'CLV', 'Result_Label']
+    if not archive:
+        cols.append('核證來源')
     recent = valid.sort_values('_entry_order', ascending=False, kind='stable').head(15).reindex(columns=cols)
     recent['CLV'] = (recent['CLV'] * 100).round(2)
     if not recent.empty:
@@ -2325,7 +2328,8 @@ def render_clv_summary(settled, classified):
                'Initial_Odds', 'System_Stake', 'Unit_Profit', 'Result_Label', 'Odds_History']
     data = settled.reindex(columns=list(dict.fromkeys([*settled.columns, *columns]))).copy()
     data['_entry_order'] = data['Date'].map(lambda x: clv_local(x.strip() if isinstance(x, str) else x))
-    data['CLV'] = classified['clv'].where(classified['group'].eq('snapshot')).to_numpy()
+    data['CLV'] = classified['clv'].where(classified['group'].isin(['snapshot', 'historical_verified'])).to_numpy()
+    data['核證來源'] = classified['group'].map({'snapshot': '賽前快照', 'historical_verified': '歷史馬會核證'}).to_numpy()
     render_clv_period_stats(data[data['CLV'].notna()])
     with st.expander("舊版價格差紀錄（不計入可計算 CLV 注單）"):
         archive = data.loc[data['Date'].map(clv_report_period).notna()].copy()
@@ -2367,6 +2371,7 @@ def render_clv_recent_diagnostics(df, classified):
                  f"待結算 {int(open_rows.sum()):,} 筆｜其他狀態 {int(other.sum()):,} 筆")
         definitions = {
             'snapshot': '入注及收盤證據齊全（已結算才計入 CLV）',
+            'historical_verified': '歷史入注及馬會同線收盤已核證（已結算才計入 CLV）',
             'historical_unknown': '缺可核對的賽前入注標記',
             'historical_late': '賽日後登記，缺賽前入注標記',
             'entry_invalid': '有入注標記，但與時間或注單不符',
@@ -2430,7 +2435,52 @@ def render_clv_section(df, classified=None):
                  width="stretch", hide_index=True)
 
 
-def render_clv_tab(df, db_file, db_table, sys_bankroll):
+def render_historical_clv_batch(evidence_status, rows, evidence):
+    with st.expander("歷史 CLV 核證｜馬會賽前最後賠率"):
+        if evidence_status == 'unavailable':
+            st.warning("暫時無法讀取正式核證旁表；不是零筆。現有賽前快照仍可查看。")
+            return
+        if evidence is None:
+            st.info("目前未讀到正式核證旁表；本機匯出不會當作正式結果。")
+            return
+        settled = [r for r in rows if r["狀態"] == "已結算"]
+        added = sum(r["主統計核證來源"] == "歷史馬會核證" for r in settled)
+        stored = len({r["bet_id"] for r in evidence})
+        avg = f"{sum(r['CLV%'] for r in settled) / len(settled):+.2f}%" if settled else "無估計"
+        st.write(f"旁表 {stored:,} 筆｜配對 {len(rows):,} 筆｜已結算 {len(settled):,} 筆｜"
+                 f"待結算 {len(rows)-len(settled):,} 筆｜未能配對 {stored-len(rows):,} 筆")
+        st.caption(f"這批已結算平均 {avg}；主統計新增 {added:,} 筆，其餘重疊樣本由原賽前快照計一次。"
+                   "待結算可看價格，不計入平均；對照價不是報價時間或實際成交證明。")
+        if rows:
+            choice = st.radio("歷史批次狀態", ["全部", "已結算", "待結算"], horizontal=True,
+                              key='historical_clv_batch_filter')
+            details = pd.DataFrame(r for r in rows if choice == "全部" or r["狀態"] == choice)
+            if details.empty:
+                st.info("這個狀態目前沒有核證紀錄。")
+            else:
+                st.dataframe(details.sort_values("登記時間", ascending=False), width="stretch",
+                             hide_index=True, column_config={"CLV%": st.column_config.NumberColumn(format="%.2f")})
+
+
+@st.cache_data(ttl=120, max_entries=1, show_spinner=False)
+def _historical_clv_cached():
+    engine = _v163_sql_engine()
+    if engine is None:
+        raise RuntimeError("SQL unavailable")
+    with engine.connect() as conn:
+        return historical_clv_sql_rows(conn)
+
+
+def _historical_clv_load(db_table):
+    if db_table != 'football_bets' or not _has_secret('DB_URL'):
+        return 'not_configured', None
+    try:
+        return 'ok', _historical_clv_cached()
+    except Exception:
+        return 'unavailable', None
+
+
+def render_clv_tab(df, db_file, db_table, sys_bankroll, *, historical=None):
     st.subheader("CLV (收盤線價值) 追蹤與蒙地卡羅本金模擬")
     render_clv_closing_updater(db_file, db_table)
     st.divider()
@@ -2438,8 +2488,16 @@ def render_clv_tab(df, db_file, db_table, sys_bankroll):
     settled = df.loc[settled_mask].copy()
     try:
         classified = _v16_clv_rows(df)
-        render_clv_summary(settled, classified.loc[settled_mask])
-        render_clv_recent_diagnostics(df, classified)
+        if historical is None:
+            render_clv_summary(settled, classified.loc[settled_mask])
+            render_clv_recent_diagnostics(df, classified)
+        else:
+            hist_status, evidence = historical
+            display, formal, batch_rows = overlay_historical_clv(df, classified, evidence)
+            closed = display.get('Status', pd.Series(index=display.index, dtype=object)).eq('Settled')
+            render_clv_summary(display.loc[closed], formal.loc[closed])
+            render_historical_clv_batch(hist_status, batch_rows, evidence)
+            render_clv_recent_diagnostics(display, formal)
     except Exception as e:
         classified = None
         st.error(f"CLV 追蹤發生錯誤：{e}")
@@ -12075,9 +12133,9 @@ def _v1649_render_parameter_lab(df_settled):
         pct = lambda v: f"{v:+.2%}" if v is not None else "不適用"
         if lab.FROZEN:
             st.markdown("##### 凍結的歷史候選")
-            st.caption(f"以截至 {lab.FROZEN_AS_OF} 的固定研究配置分析；只作模擬。重新搜尋不會改下表，也不會開啟下注。")
+            st.caption(f"截至 {lab.FROZEN_AS_OF} 的舊回測對照。重新搜尋不會改下表或正式下注設定。")
             st.dataframe(pd.DataFrame([
-                {"盤口": m, "用途": c["use"], "模型": c["model"], "參數": c["parameter"],
+                {"盤口": m, "模型": c["model"], "參數": c["parameter"],
                  "開啟特徵": "、".join(c["groups"]) or "只用基礎盤口",
                  "最低 EV": pct(c["threshold"]), "歷史末段 ROI": pct(c.get("holdout_roi")),
                  "末段注數": c.get("holdout_n", 0)}
@@ -12105,9 +12163,11 @@ def _v1649_render_parameter_lab(df_settled):
             if chosen:
                 st.dataframe(pd.DataFrame([
                     {"階段": name, "注數": s["n"], "淨利潤（U）": round(s["net"], 3),
-                     "ROI": pct(s["roi"]), "同線隨機 ROI": pct(s["pair_roi"])}
+                     "ROI": pct(s["roi"]), "同線隨機 ROI": pct(s["pair_roi"]),
+                     "模型 Log-loss": s["logloss"], "去水市場 Log-loss": s["raw_logloss"]}
                     for name,s in (("開發冠軍",chosen), ("末段驗證",test)) if s
                 ]), hide_index=True, width="stretch")
+                st.caption("Log-loss 越低越好，按全批可比盤口評估；ROI 只計模型篩選的模擬注，不代表預測較準。")
                 st.caption(f"{chosen['model']}／{chosen['parameter']}；最低 EV {pct(chosen['threshold'])}；"
                            f"開啟：{'、'.join(chosen['groups']) or '無額外特徵'}。")
                 with st.expander("一次切換一項特徵"):
@@ -12142,28 +12202,6 @@ def _v1649_render_parameter_lab(df_settled):
                                             "threshold":st.column_config.NumberColumn("最低 EV",format="percent")})
                 st.download_button("下載全部模型組合 CSV", df_rank.to_csv(index=False).encode("utf-8-sig"),
                                    "fb-app-parameter-lab.csv", "text/csv", key="v1649_lab_download", on_click="ignore")
-        st.markdown("##### 新賽事 T−30 影子分析")
-        st.caption("使用凍結配置重訓。貼上 JSON，須有 fixture_id、kickoff（含 +08:00 或 UTC 時區）、"
-                   "home、away、league、odds；odds 使用 type、line、upper、lower、record_time、unlock（true）。"
-                   "只接受 T−30 前 15 分鐘內的雙邊報價，不寫入注單。")
-        st.caption("大／小或主／客必須是同時、同線的十進制賠率。賠率走勢宜提供多個已記錄時點，"
-                   "只有一筆報價時，走勢特徵為零。")
-        with st.form("v1649_lab_form"):
-            value = st.text_area("賽前資料 JSON", max_chars=80000, key="v1649_lab_input")
-            submitted = st.form_submit_button("執行影子分析")
-        if submitted:
-            st.session_state.pop("_v1649_lab_forecast", None)
-            try:
-                with st.spinner("用較早的賽果與報價重新訓練凍結配置…"):
-                    st.session_state["_v1649_lab_forecast"] = lab.score_fixture(live_dataset, json.loads(value))
-            except (ValueError, RuntimeError) as exc:
-                st.warning("沒有產生影子分析：" + str(exc))
-        if st.session_state.get("_v1649_lab_forecast"):
-            pred = pd.DataFrame(st.session_state["_v1649_lab_forecast"])
-            st.dataframe(pred, hide_index=True, width="stretch",
-                         column_config={"估計EV":st.column_config.NumberColumn("估計 EV",format="percent")})
-            st.download_button("下載這次影子分析 CSV", pred.to_csv(index=False).encode("utf-8-sig"),
-                               "fb-app-shadow.csv", "text/csv", key="v1649_lab_forecast_download", on_click="ignore")
 
 
 def render_dl_ml_analysis_section(df_settled):
@@ -14542,7 +14580,8 @@ def main():
         render_time_dimension_pnl_tab(df_settled_tdp, sys_bankroll, sys_max_stake)
 
     with t_clv:
-        render_clv_tab(st.session_state.df_db, db_file, db_table, sys_bankroll)
+        render_clv_tab(st.session_state.df_db, db_file, db_table, sys_bankroll,
+                       historical=_historical_clv_load(db_table))
 
     with t_ai:
         st.subheader("🤖 全局模型與績效分析")
