@@ -10,7 +10,7 @@ import unittest
 import pandas as pd
 from streamlit.testing.v1 import AppTest
 
-from fb_app_clv_cohorts import ENTRY, HKT, QUOTE, classify, entry_note, fixture_id, local, quote_tag
+from fb_app_clv_cohorts import ENTRY, HKT, QUOTE, classify, entry_note, fixture_id, local, quote_tag, report_period
 
 APP = Path(__file__).resolve().parents[1] / "FB-app.py"
 KICK = datetime(2026, 11, 23, 0, 10, tzinfo=HKT)
@@ -59,6 +59,13 @@ def nodes(names):
 
 
 class Evidence(unittest.TestCase):
+    def test_hong_kong_cutoff_and_unknown_dates(self):
+        cases = {"2026-11-21 23:59:59": 0, "2026-11-22T00:00:00+08:00": 1,
+                 "2026-11-21T16:00:00Z": 1, "2026-11-22T00:00:00+09:00": 0,
+                 "2026-11-22": None, "broken": None, None: None, pd.NaT: None}
+        for value, expected in cases.items():
+            self.assertEqual(report_period(value), expected)
+
     def test_legacy_never_inherits_price_proof(self):
         self.assertEqual(classify(base(Date="2026-11-24 02:00")).group, "historical_late")
         self.assertEqual(classify(base(Date="2026-11-23 00:08")).group, "historical_unknown")
@@ -78,6 +85,29 @@ class Evidence(unittest.TestCase):
                   quote(KICK-timedelta(minutes=2), line=2.5), quote(KICK-timedelta(minutes=2), close=False)):
             with self.subTest(q=q):
                 self.assertEqual(classify(marked(q)).group, "pending")
+
+    def test_same_final_source_quote_and_counterexamples(self):
+        result = classify(marked(quote(QUOTED)))
+        self.assertEqual((result.group, result.clv), ("snapshot", 0.0))
+        self.assertEqual(classify(marked(quote(QUOTED, close=False))).group, "pending")
+        self.assertEqual(classify(marked({**quote(QUOTED), "upper": 1.91})).group, "pending")
+        self.assertEqual(classify(marked(quote(QUOTED - timedelta(seconds=1)))).group, "pending")
+        self.assertEqual(classify(marked(quote(QUOTED), quote(QUOTED, line=2.5))).group, "close_conflict")
+
+    def test_manual_entry_only_unchanged_fresh_actual_latest_provider_snapshot(self):
+        scope = dict(clv_fixture_id=fixture_id, clv_entry_note=entry_note)
+        exec(compile(ast.Module(body=nodes({"_clv_manual_entry_note"}), type_ignores=[]), str(APP), "exec"), scope)
+        fn = scope["_clv_manual_entry_note"]
+        fill = {**locked()["fill"], "clv_manual_prices": locked()["odds"], "clv_manual_kickoff": KICK.timestamp()}
+        self.assertTrue(fn(base(), CANDIDATE, fill, locked()["odds"], ENTRY_AT))
+        reconstructed = {k: v for k, v in locked()["odds"][0].items() if k != QUOTE}
+        self.assertTrue(fn(base(), CANDIDATE, fill, [reconstructed], ENTRY_AT))
+        self.assertIsNone(fn(base(), CANDIDATE, fill, locked()["odds"], ENTRY_AT+timedelta(minutes=6)))
+        self.assertIsNone(fn(base(), CANDIDATE, fill, [{**reconstructed, "upper": 1.90}], ENTRY_AT))
+        self.assertIsNone(fn(base(), CANDIDATE, fill, [*locked()["odds"], quote(ENTRY_AT)], ENTRY_AT))
+        self.assertIsNone(fn(base(Tipsme_Match_ID=2), CANDIDATE, fill, locked()["odds"], ENTRY_AT))
+        self.assertIsNone(fn(base(), CANDIDATE, {**fill, "clv_manual_kickoff": KICK.timestamp()+60},
+                             locked()["odds"], ENTRY_AT))
 
     def test_latest_line_and_ambiguities(self):
         first = quote(KICK-timedelta(minutes=5))
@@ -142,6 +172,15 @@ class Archive(unittest.TestCase):
         raw = self.raw((t1, 2.75, 1.95), (t2[:19], 2.75, 1.88))
         self.assertFalse(any(QUOTE in q for q in self.archive(raw)))
 
+    def test_same_price_after_kickoff_does_not_erase_certified_final_quote(self):
+        raw = self.raw((QUOTED.isoformat(), 2.75, 1.95),
+                       ((KICK+timedelta(minutes=2)).isoformat(), 2.75, 1.95))
+        history = self.archive(raw)
+        self.assertEqual([q[QUOTE][1] for q in history if QUOTE in q], [QUOTED.isoformat()])
+        self.assertEqual(classify(marked(*history)).clv, 0.0)
+        ambiguous = self.raw((QUOTED.isoformat(), 2.75, 1.95), (QUOTED.isoformat(), 2.5, 1.90))
+        self.assertFalse(any(QUOTE in q for q in self.archive(ambiguous)))
+
     def test_merge_does_not_change_price_and_only_marks_identified_new_entries(self):
         new = quote(KICK-timedelta(minutes=2))
         previous = {k: v for k, v in new.items() if k != QUOTE}
@@ -162,13 +201,15 @@ class StreamlitPanel(unittest.TestCase):
     def boot(self, rows, *, full=False):
         names = self.shared | {"render_clv_section"}
         if full:
-            names |= {"render_clv_tab", "render_legacy_clv_section", "compute_legacy_bet_clv",
+            names |= {"render_clv_tab", "render_clv_date_tabs", "render_clv_period_stats",
+                      "render_handicap_audit", "compute_legacy_bet_clv",
                       "v9_clean_bt", "_oh_sort_ts", "parse_dt_for_comparison", "v10_parse_time",
                       "get_hkt_now", "HKT", "render_monte_carlo_section", "build_mc_records",
                       "run_bankroll_simulation"}
         wrapper = ("import pandas as pd\nimport numpy as np\nimport streamlit as st\nimport json, re\n"
                    "from datetime import datetime, timedelta, timezone\n"
-                   "from fb_app_clv_cohorts import classify as classify_clv, ENTRY as CLV_ENTRY\n"
+                   "from fb_app_clv_cohorts import classify as classify_clv, ENTRY as CLV_ENTRY, local as clv_local, report_period as clv_report_period\n"
+                   "from fb_app_handicap_audit import handicap_audit\n"
                    + "\n".join(ast.unparse(n) for n in nodes(names))
                    + f"\nframe = pd.DataFrame({rows!r}, index=list(range(719, 719+{len(rows)})))\n"
                    + ("def render_clv_closing_updater(*_): st.button('收盤更新測試替身')\n"
@@ -191,7 +232,7 @@ class StreamlitPanel(unittest.TestCase):
         self.assertEqual([m.value for m in at.metric], ["1 注", "+0.00%", "1 注"])
         self.assertEqual(at.session_state["groups"], ["historical_late", "snapshot"])
 
-    def test_restores_history_above_evidence_with_no_verified_samples(self):
+    def test_two_periods_keep_archive_outside_official_counts_and_preserve_order(self):
         def history(close):
             # Reverse storage order to check date ordering; wrong lines must not be used.
             return json.dumps([quote(KICK-timedelta(minutes=1), price=close),
@@ -206,6 +247,8 @@ class StreamlitPanel(unittest.TestCase):
             base(ID="pending", Status="Pending", Odds_History=history(1.80)),
             base(ID="single", Odds_History=json.dumps([quote(QUOTED)])),
             base(ID="live", Bet_Type="入球大小 (即場)", Odds_History=history(1.80)),
+            base(ID="bad-date", Date="2026-11-22", Odds_History=history(1.80)),
+            marked(quote(QUOTED), Match="可證明同價"),
         ]
         at = self.boot(rows, full=True)
         headings = [m.value for m in at.markdown]
@@ -214,21 +257,28 @@ class StreamlitPanel(unittest.TestCase):
                  "##### 最近 15 注 CLV 明細", "#### 🎲 蒙地卡羅本金模擬", "#### 賽前快照證據分組（V18.1）"]
         self.assertEqual(sorted(headings.index(heading) for heading in order),
                          [headings.index(heading) for heading in order])
-        self.assertEqual(len(at.get("vega_lite_chart")), 1)
-        self.assertEqual([m.value for m in at.metric],
-                         ["2 注", "+4.17%", "+4.17%", "50.0%",
-                          "1", "100.0%", "+0.95U", "1", "0.0%", "-1.00U",
-                          "0 注", "無估計", "無樣本"])
-        self.assertEqual(at.dataframe[0].value.loc[0, "實注單位盈虧"], "+0.95U")
-        self.assertEqual(at.dataframe[1].value["Match"].tolist(), ["較新紀錄", "較早紀錄"])
-        self.assertEqual(at.dataframe[1].value["CLV"].tolist(), [8.33, 0.0])
-        evidence = at.dataframe[2].value
-        self.assertEqual(evidence["全部注數"].sum(), 5)
-        self.assertEqual(evidence["已結算"].sum(), 4)
+        self.assertEqual(headings.count("##### 最近 15 注 CLV 明細"), 2)
+        self.assertEqual([t.label for t in at.tabs], ["11 月 22 日前", "11 月 22 日 00:00 起"])
+        self.assertEqual([m.value for m in at.metric if m.label == "可計算 CLV 的注單"], ["0 注", "1 注"])
+        self.assertEqual([m.value for m in at.metric if m.label == "舊版可比對紀錄"], ["1 注", "1 注"])
+        self.assertEqual([m.value for m in at.metric if m.label == "平均 CLV"], ["無估計", "+0.00%"])
+        price_details = [d.value for d in at.dataframe if "價格差%" in d.value.columns]
+        self.assertEqual(price_details[0]["Match"].tolist(), ["較早紀錄"])
+        self.assertEqual(price_details[1]["價格差%"].tolist(), [8.33])
+        evidence = next(d.value for d in at.dataframe if "全部注數" in d.value.columns)
+        self.assertEqual(evidence["全部注數"].sum(), 7)
+        self.assertEqual(evidence["已結算"].sum(), 6)
+        self.assertTrue(any("缺有效時間" in m.value for m in at.caption))
         at.selectbox(key="mc_account").select("User").run()
         self.assertFalse(at.exception)
         self.assertFalse(at.error)
         self.assertTrue(any("User 帳戶" in m.value for m in at.info))
+
+    def test_empty_ledger_shows_both_tabs_and_all_five_headings(self):
+        at = self.boot([], full=True)
+        self.assertEqual(len(at.tabs), 2)
+        self.assertEqual(sum(m.value == "##### 平均 CLV 按月趨勢" for m in at.markdown), 2)
+        self.assertEqual([m.value for m in at.metric if m.label == "可計算 CLV 的注單"], ["0 注", "0 注"])
 
     def test_preview_excel_and_csv_keep_missing_distinct_from_zero(self):
         preview, = nodes({"preview_db_dialog"})

@@ -14,8 +14,10 @@ from uuid import uuid4
 from fb_app_clv_cohorts import (
     ENTRY as CLV_ENTRY, QUOTE as CLV_QUOTE, classify as classify_clv,
     entry_note as clv_entry_note, fixture_id as clv_fixture_id, local as clv_local,
-    quote_tag as clv_quote_tag,
+    quote_tag as clv_quote_tag, report_period as clv_report_period,
+    record_handicap_forecast as clv_record_handicap_forecast,
 )
+from fb_app_handicap_audit import handicap_audit
 # ==============================================================================
 # V16.4.1 (2026-11-18)：主表增量寫入和墓碑/Undo 同一事務；只按明示 ID 刪除。
 # 保留差量備份，不再把「本次某些列成功」當作全份備份可清空的證據。
@@ -32,7 +34,7 @@ from fb_app_clv_cohorts import (
 # V16.4.11：自動分析及入庫只讀本批次已核對的快照，不讀手動表單的 widget。
 # V16.4.12：排程以有效日期及正式庫核對確認完成，不把缺值或掃描結束當成功。
 # V18：香港固定時段可各自啟用，沿用既有結算；原每日排程及歷史補建保留。
-FB_APP_RELEASE = 'V18.1'
+FB_APP_RELEASE = 'V18.2'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -2251,49 +2253,46 @@ def render_clv_closing_updater(db_file, db_table):
         st.markdown("**最新快照（未必符合主 CLV）**")
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-def render_legacy_clv_section(df_settled):
-    """Restore the V18 dashboard without mixing its sample with the evidence panel."""
-    st.markdown("#### CLV (收盤線價值) 追蹤")
-    st.caption("V18 歷史口徑：入注賠率 ÷ 同線末筆歷史賠率 − 1。正數代表所記錄的入注價較高。"
-               "末筆不一定是入注之後的報價；收盤回填亦可能得到 0%。此指標比較價格，不是預測命中率。")
-    if df_settled is None or df_settled.empty:
-        st.info("尚無已結算注單，無法計算 CLV。")
-        return
-    d = df_settled.copy()
-    d['CLV'] = pd.to_numeric(d.apply(compute_legacy_bet_clv, axis=1), errors='coerce')
-    valid = d[d['CLV'].notna()].copy()
-    if valid.empty:
-        st.info("現有已結算注單的同線賠率紀錄不足，未能計算 V18 歷史 CLV。")
-        return
+def render_clv_period_stats(valid, *, archive=False):
+    """Both date tabs have the same five sections, including for an empty period."""
+    valid = valid.copy()
+    title = "舊版價格差（歷史參考）" if archive else "CLV (收盤線價值) 追蹤"
+    label = "價格差" if archive else "CLV"
+    st.markdown(f"#### {title}")
+    if archive:
+        st.caption("舊版公式僅作歷史對照，可能含收盤回填或無法核實的入注。以下不計入正式 CLV。")
+    else:
+        st.caption("只計已結算而且可核對為開賽前入注的同線報價。模擬注及實注均可；可獨立核對同價才記 0%。")
     values = valid['CLV']
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("可計算 CLV 的注單", f"{len(valid)} 注")
-    c2.metric("平均 CLV", f"{values.mean() * 100:+.2f}%")
-    c3.metric("CLV 中位數", f"{values.median() * 100:+.2f}%")
-    c4.metric("跑贏收盤線比率", f"{values.gt(0).mean() * 100:.1f}%")
-    if values.eq(0).mean() > 0.5:
-        st.info(f"有 {int(values.eq(0).sum()):,} 注的 V18 歷史 CLV 等於 0%。若末筆就是入注價或屬收盤回填，"
-                "0% 並不表示市場價格沒變。請另看下方的賽前快照證據分組。")
+    c1.metric("舊版可比對紀錄" if archive else "可計算 CLV 的注單", f"{len(valid):,} 注")
+    c2.metric(f"平均 {label}", f"{values.mean() * 100:+.2f}%" if len(values) else "無估計")
+    c3.metric(f"{label} 中位數", f"{values.median() * 100:+.2f}%" if len(values) else "無估計")
+    c4.metric("正價格差比率" if archive else "跑贏收盤線比率",
+              f"{values.gt(0).mean() * 100:.1f}%" if len(values) else "無估計")
 
     valid['_bt'] = valid['Bet_Type'].astype(str).apply(v9_clean_bt)
-    st.markdown("##### 分盤口類型 CLV 統計")
+    st.markdown(f"##### 分盤口類型 {label} 統計")
     market_rows = []
     for bt, g in valid.groupby('_bt'):
         staked = pd.to_numeric(g['System_Stake'], errors='coerce').gt(0)
         unit_sum = pd.to_numeric(g.loc[staked, 'Unit_Profit'], errors='coerce').sum()
         market_rows.append({'盤口類型': bt, '注數': len(g),
-                            '平均CLV': f"{g['CLV'].mean() * 100:+.2f}%",
+                            f'平均{label}': f"{g['CLV'].mean() * 100:+.2f}%",
                             '跑贏收盤率': f"{g['CLV'].gt(0).mean() * 100:.0f}%",
                             '實注單位盈虧': f"{unit_sum:+.2f}U"})
-    st.dataframe(pd.DataFrame(market_rows), width="stretch", hide_index=True)
+    if market_rows:
+        st.dataframe(pd.DataFrame(market_rows), width="stretch", hide_index=True)
+    else:
+        st.info("本時段尚無合資格的已結算注單。")
 
-    st.markdown("##### CLV 與賽果的關係")
+    st.markdown(f"##### {label} 與賽果的關係")
     st.caption("下面是這批已結算注單（含模擬注）的歷史結果，不是模型的樣本外精準度或長期盈利證明。")
     ev1, ev2 = st.columns(2)
-    for col, label, part in ((ev1, "CLV 為正", valid[values.gt(0)]),
-                             (ev2, "CLV 為零或負", valid[values.le(0)])):
+    for col, side_title, part in ((ev1, f"{label} 為正", valid[values.gt(0)]),
+                                  (ev2, f"{label} 為零或負", valid[values.le(0)])):
         with col:
-            st.markdown(f"**{label}**")
+            st.markdown(f"**{side_title}**")
             if part.empty:
                 st.write("無樣本")
                 continue
@@ -2304,16 +2303,45 @@ def render_legacy_clv_section(df_settled):
             m3.metric("單位盈虧", f"{unit.sum():+.2f}U")
 
     valid['_month'] = valid['Match_Date'].fillna('').astype(str).str[:7]
-    monthly = valid[valid['_month'].ne('')].groupby('_month')['CLV'].mean().sort_index()
+    monthly = valid[valid['_month'].str.fullmatch(r'\d{4}-(?:0[1-9]|1[012])')].groupby('_month')['CLV'].mean().sort_index()
+    st.markdown(f"##### 平均 {label} 按月趨勢")
     if not monthly.empty:
-        st.markdown("##### 平均 CLV 按月趨勢")
-        st.line_chart(pd.DataFrame({'平均CLV%': (monthly * 100).round(2)}), width="stretch")
+        st.line_chart(pd.DataFrame({f'平均{label}%': (monthly * 100).round(2)}), width="stretch")
+    else:
+        st.write("無月度數據")
 
-    st.markdown("##### 最近 15 注 CLV 明細")
+    st.markdown(f"##### 最近 15 注 {label} 明細")
     cols = ['Date', 'Match', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 'CLV', 'Result_Label']
-    recent = valid.sort_values('Date', ascending=False).head(15).reindex(columns=cols)
+    recent = valid.sort_values('_entry_order', ascending=False, kind='stable').head(15).reindex(columns=cols)
     recent['CLV'] = (recent['CLV'] * 100).round(2)
-    st.dataframe(recent, width="stretch", hide_index=True)
+    if not recent.empty:
+        st.dataframe(recent.rename(columns={'CLV': f'{label}%'}), width="stretch", hide_index=True)
+    else:
+        st.write("無明細")
+
+
+def render_clv_date_tabs(settled):
+    columns = ['Date', 'Match_Date', 'Match', 'Bet_Type', 'Selection', 'Initial_Line',
+               'Initial_Odds', 'System_Stake', 'Unit_Profit', 'Result_Label', 'Odds_History']
+    data = settled.reindex(columns=list(dict.fromkeys([*settled.columns, *columns])))
+    periods = data['Date'].map(clv_report_period)
+    excluded = int(periods.isna().sum())
+    st.caption("以帳本入注／登記時間按香港時間分組，分界為 2026-11-22 00:00。"
+               + (f"有 {excluded:,} 筆已結算紀錄缺有效時間，未放入兩區。" if excluded else ""))
+    verified = _v16_clv_rows(data)
+    frames = st.tabs(["11 月 22 日前", "11 月 22 日 00:00 起"])
+    for period, container in enumerate(frames):
+        with container:
+            section = data.loc[periods.eq(period)].copy()
+            section['_entry_order'] = section['Date'].map(lambda x: clv_local(x.strip() if isinstance(x, str) else x))
+            cohort = verified.loc[periods.eq(period)]
+            section['CLV'] = cohort['clv'].where(cohort['group'].eq('snapshot')).to_numpy()
+            render_clv_period_stats(section[section['CLV'].notna()])
+            with st.expander("舊版價格差紀錄（不計入可計算 CLV 注單）"):
+                archive = section.copy()
+                archive['CLV'] = (pd.to_numeric(archive.apply(compute_legacy_bet_clv, axis=1), errors='coerce')
+                                  if not archive.empty else pd.Series(dtype=float))
+                render_clv_period_stats(archive[archive['CLV'].notna()], archive=True)
 
 
 CLV_GROUPS = {
@@ -2333,7 +2361,8 @@ def render_clv_section(df):
     st.markdown("#### 賽前快照證據分組（V18.1）")
     st.caption("本區顯示報價證據覆蓋，並非預測命中率。"
                "原始價格 CLV = 記錄入注賠率 ÷ 同場、同方向、同線的近收盤賠率 − 1。"
-               "對照用完場後取得、開賽前 15 分鐘內且晚於入注的最後一筆合規報價。"
+               "對照用完場後取得的最後一筆賽前報價：開賽前 15 分鐘內晚於入注，"
+               "或獨立證實入注時已採用同一筆末筆報價。"
                "這是可核對的收盤近似，不是馬會成交證明、去水 EV 或盈利保證。")
     if df is None or df.empty:
         st.info("尚無注單可檢視。")
@@ -2341,7 +2370,7 @@ def render_clv_section(df):
     classified = _v16_clv_rows(df)
     buckets = classified.group.value_counts()
     settled_buckets = classified.loc[df.Status.eq('Settled'), 'group'].value_counts()
-    matched = classified.group.eq('snapshot')
+    matched = classified.group.eq('snapshot') & df.Status.eq('Settled')
     valid = df.loc[matched].copy()
     valid['CLV%'] = classified.loc[matched, 'clv'].to_numpy() * 100
     valid['對照賠率'] = classified.loc[matched, 'closing'].to_numpy()
@@ -2365,7 +2394,8 @@ def render_clv_section(df):
                f"系統注碼 >0 {int(sys.gt(0).sum())} 注；用家注碼 >0 {int(usr.gt(0).sum())} 注。"
                "兩個有注碼組別可能重疊；帳面注碼不證明實際成交。")
     cols = ['Date', 'Match', 'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', '對照賠率', '對照時間', 'CLV%']
-    st.dataframe(valid.sort_values('Date', ascending=False).head(15)[cols].round({'CLV%': 2}),
+    ordered = valid.assign(_entry_order=valid['Date'].map(clv_local))
+    st.dataframe(ordered.sort_values('_entry_order', ascending=False, kind='stable').head(15)[cols].round({'CLV%': 2}),
                  width="stretch", hide_index=True)
 
 
@@ -2375,9 +2405,9 @@ def render_clv_tab(df, db_file, db_table, sys_bankroll):
     st.divider()
     settled = df[df['Status'].eq('Settled')] if not df.empty else df.copy()
     try:
-        render_legacy_clv_section(settled)
+        render_clv_date_tabs(settled)
     except Exception as e:
-        st.error(f"V18 歷史 CLV 追蹤發生錯誤：{e}")
+        st.error(f"分期 CLV 追蹤發生錯誤：{e}")
     st.divider()
     try:
         render_monte_carlo_section(settled, sys_bankroll)
@@ -2388,6 +2418,33 @@ def render_clv_tab(df, db_file, db_table, sys_bankroll):
         render_clv_section(df)
     except Exception as e:
         st.error(f"賽前快照證據分組發生錯誤：{e}")
+    with st.expander("讓球前向驗證：模型與同期去水市場對照"):
+        render_handicap_audit(df)
+
+
+def render_handicap_audit(df):
+    info = handicap_audit(df.to_dict('records'))
+    st.caption("由 2026-11-22 00:00（香港）起。只讀目前帳本；不改注碼、模型或風控。"
+               "以提交時鎖定的盤口及機率為準，不用完場資料重算。")
+    if not info['rows']:
+        st.info("此期帳本沒有帶有效時間的讓球紀錄，無法核對策略注數。")
+        return
+    st.write(f"帳本 {info['rows']:,} 筆｜存有 Gate 結果 {info['logged_scores']:,} 筆"
+             f"（其中 Y {info['logged_pass']:,} 筆，未要求賽前證據）｜"
+             f"可核對賽前入注 {info['verified']:,} 筆")
+    if not info['forecasts']:
+        st.info("未有合資格的同線賽前預測可供對照；策略注數未能驗證，不顯示為 0。")
+        return
+    st.write(f"同線賽前預測 {info['forecasts']:,} 場｜過閘 {info['passes']:,} 場"
+             f"（其中帳本系統注碼大於 0：{info['staked_passes']:,} 場）")
+    st.caption("同場只取最早一筆可證明的預測；模型使用的市場概率必須與入注時的同線去水報價一致。"
+               "概率評分只用已結算半球線等沒有走盤的樣本；分數越低越好。")
+    if info['months']:
+        st.dataframe(pd.DataFrame(info['months']), width="stretch", hide_index=True)
+    else:
+        st.info("尚無已結算樣本可比較預測或單位回報。")
+    st.caption("過閘單位回報按帳本派彩等額計算（含賠率水錢，不含帳本沒有記錄的額外費用）；"
+               "並非實際收益或盈利保證。")
 
 
 def build_mc_records(df_settled, start_bankroll, stake_col='System_Stake', profit_col='System_Profit'):
@@ -5267,6 +5324,7 @@ V10_SETTING_DEFAULTS = {
 V10_MODE_OPTIONS = [V11_MODE_AUTO, '看盤規則', V11_MODE_STRICT, '看盤規則 + V9', '只用 V9 模型']
 V11_LS_PREFIX = 'LS|'
 _V10_META_KEYS = {'v10_schema', 'v11_migrated'}
+_V10_RESTORE_KEYS = ('v11_new_league_paper', 'v11_league_breaker', 'v11_auto_sys')
 _V10_LIMITS = {
     'v9_min_ev': (0, 20), 'v9_max_pct': (0.5, 10), 'v9_max_picks': (1, 3),
     'v9_min_hd': (10, 5000), 'v9_min_other': (0, 5000),
@@ -5466,8 +5524,9 @@ def _v10_apply_settings(rows):
             invalid.append(key)
             values[key] = (state.get('_v10_confirmed') or {}).get(key, values[key])
     state['_v10_rows'] = rows
-    if not invalid:
-        state['_v10_confirmed'] = values
+    confirmed = dict(state.get('_v10_confirmed') or {})
+    confirmed.update((k, v) for k, v in values.items() if k not in invalid)
+    state['_v10_confirmed'] = confirmed
     state['_v10_settings_invalid'] = sorted(invalid)
     state['_v10_settings_read_ok'] = True
     for key, value in values.items():
@@ -5480,7 +5539,15 @@ def v10_load_settings_into_state(force=False):
     """在建立 widget 前讀取。失聯時保留上次已驗證值，僅作顯示，禁止跨來源補寫。"""
     state = st.session_state
     source = _v10_settings_source()
+    if state.get('_v10_source_seen') != source:
+        # A confirmed read/receipt from a different store is not a confirmed
+        # read of this store. In particular, do not skip the first GitHub read.
+        for key in ('_v10_confirmed', '_v10_rows', '_v10_settings_read_ok', '_v10_settings_invalid',
+                    '_v10_notice', '_v11_ls_map', '_v11_ign'):
+            state.pop(key, None)
+        state['_v10_source_seen'] = source
     if not force and source == 'GitHub' and state.get('_v10_settings_read_ok'):
+        _v10_apply_settings(state['_v10_rows'])  # rehydrate widgets without a network read
         return  # GitHub-only 不在每次 rerun 打 API；另有手動刷新及寫入比對
     try:
         _v10_apply_settings(_v10_settings_store(source))
@@ -5497,7 +5564,7 @@ def _v10_settings_write(changes, expected=None, *, reset=False, auxiliary=False)
     state = st.session_state
     source = _v10_settings_source()
     try:
-        if not state.get('_v10_settings_read_ok') or (
+        if state.get('_v10_source_seen') != source or not state.get('_v10_settings_read_ok') or (
                 state.get('_v10_settings_invalid') and not (reset or auxiliary)):
             raise RuntimeError('Settings not readable')
         rows = _v10_settings_store(source, changes, expected)
@@ -5535,10 +5602,28 @@ def v10_reset_settings():
         v10_load_settings_into_state(force=True)
 
 
+def v10_restore_risk_controls():
+    """Restore the requested trio only, with compare-and-set on the same store."""
+    state = st.session_state
+    expected = {key: _v10_key_values(state.get('_v10_rows', []), key) for key in _V10_RESTORE_KEYS}
+    changes = {key: 'True' for key, raw in expected.items()
+               if len(raw) != 1 or str(raw[0]).strip().lower() not in ('true', '1', 'yes')}
+    if not changes:
+        state['_v10_notice'] = ('info', '這三項已開啟，沒有寫入。')
+    elif _v10_settings_write(changes, expected, reset=True):
+        state['_v10_notice'] = ('success', f'三項設定已核對為開啟（{_v10_settings_source()}）。其餘設定不變。')
+    else:
+        notice = state.get('_v10_notice')
+        v10_load_settings_into_state(force=True)
+        if notice:
+            state['_v10_notice'] = notice
+
+
 def _v10_settings_allow_automation():
     """只對已配置 Supabase 的部署，在設定不可核對時暫停自動導入。"""
     return _v10_settings_source() != 'Supabase' or (
-        st.session_state.get('_v10_settings_read_ok') and not st.session_state.get('_v10_settings_invalid')
+        st.session_state.get('_v10_source_seen') == 'Supabase' and st.session_state.get('_v10_settings_read_ok')
+        and not st.session_state.get('_v10_settings_invalid')
     )
 
 
@@ -7144,7 +7229,7 @@ def preview_db_dialog(df_db, df_cap, db_file, capital_file, db_table, cap_table)
         clv_rows = _v16_clv_rows(df_db)
         if mask is not None:
             clv_rows = clv_rows.loc[mask]
-        show_df['CLV%'] = (clv_rows['clv'] * 100).round(2).to_numpy()
+        show_df['CLV%'] = (clv_rows['clv'].where(show_df['Status'].eq('Settled')) * 100).round(2).to_numpy()
         show_df['CLV_組別'] = clv_rows['group'].map(CLV_GROUPS).to_numpy()
 
         summary_data = {col: None for col in show_df.columns}
@@ -7919,9 +8004,10 @@ def _tipsme_add_market(rows_out, btype, recs, line_fn, up_fn, lw_fn, max_tail=0,
     max_tail > 0 時只保留最新 max_tail 筆 (用於其他玩法，控制 JSON 大小)"""
     rows = []
     for r in recs or []:
-        t = _tipsme_iso_time(r.get('create_time'))
-        if t is not None:
-            t = t + timedelta(hours=8)  # API 為 UTC，轉香港時間顯示 (與 Tipsme 網站一致)
+        source = clv_local(r.get('create_time'), zone=True) if source_times is not None else None
+        t = source.replace(tzinfo=None, microsecond=0) if source else _tipsme_iso_time(r.get('create_time'))
+        if t is not None and source is None:
+            t = t + timedelta(hours=8)  # for legacy display only, assume API timestamps are UTC
         line = line_fn(r)
         try:
             up, lw = float(up_fn(r)), float(lw_fn(r))
@@ -7932,10 +8018,8 @@ def _tipsme_add_market(rows_out, btype, recs, line_fn, up_fn, lw_fn, max_tail=0,
         item = (t, btype, float(line), up, lw)
         rows.append(item)
         if source_times is not None:
-            source = clv_local(r.get('create_time'), zone=True)
             # Do not let a naive timestamp inherit trust from another record.
-            valid = source if source and source.replace(tzinfo=None, microsecond=0) == t else None
-            source_times.setdefault(item, set()).add(valid)
+            source_times.setdefault(item, set()).add(source)
     rows.sort(key=lambda x: x[0])
     dedup = []
     for t, bt, line, up, lw in rows:
@@ -7999,20 +8083,36 @@ def tipsme_build_odds_history(api_odds, *, clv_mid=None, close_kickoff=None):
                            lambda r: r.get('big_odds'), lambda r: r.get('small_odds'), max_tail=8)
 
     market_final = {}
-    if close_kickoff is not None and source_times:
+    if source_times:
         # Look at the whole raw market, not the last occurrence of an old line.
         # Stay conservative if the last report is naive or ambiguous at second precision.
-        ko_wall = close_kickoff.replace(tzinfo=None)
-        for t, bt, _, _, _ in source_times:
-            if t < ko_wall and (bt not in market_final or t > market_final[bt]):
-                market_final[bt] = t
+        ko_wall = close_kickoff.replace(tzinfo=None) if close_kickoff is not None else None
+        finals = {}
+        for item in source_times:
+            t, bt, *_ = item
+            if ko_wall is not None and t >= ko_wall:
+                continue
+            if bt not in finals or t > finals[bt][0][0]:
+                finals[bt] = [item]
+            elif t == finals[bt][0][0]:
+                finals[bt].append(item)
+        for bt, items in finals.items():
+            if len(items) != 1:
+                continue
+            item = items[0]
+            stamps = source_times[item]
+            if len(stamps) == 1 and None not in stamps and (
+                    close_kickoff is None or next(iter(stamps)) < close_kickoff):
+                market_final[bt] = item
+                if item not in core:  # a same-price update after kickoff may have collapsed it
+                    core.append(item)
 
     def _to_history(rows, seen_times=None):
         out = []
         for i, (t, bt, line, up, lw) in enumerate(rows):
             entry = _tipsme_oh_entry(i, bt, t.strftime('%m-%d %H:%M'), line, up, lw)
             times = (seen_times or {}).get((t, bt, line, up, lw), set())
-            if len(times) == 1 and (close_kickoff is None or t == market_final.get(bt)):
+            if len(times) == 1 and (t, bt, line, up, lw) == market_final.get(bt):
                 tag = clv_quote_tag(clv_mid, next(iter(times)), close_kickoff)
                 if tag:
                     entry[CLV_QUOTE] = tag
@@ -8133,6 +8233,7 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams, *, schedule_matc
     info = tipsme_fetch_match_info(mid)
     if not info:
         return False, "讀取比賽資料失敗 (網絡或網站問題)，請稍後再試或改為手動輸入。", None
+    source_kickoff = clv_local(info.get('kickoff'))
 
     # V16.1 空隊名防護 (2026-11-18 02:32 盧頓 vs 彼德堡事故)：Tipsme API 回傳
     # 空白隊名 (如全空白字串) 時，舊版仍當「填充成功」寫出 " vs " 無名注單，
@@ -8250,8 +8351,12 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams, *, schedule_matc
     # --- 6. 盤口賠率 (馬會全部玩法 + 其他莊家比較) ---
     odds_ok = False
     extra_hist = []
-    capture_mode = bool(schedule_match and _v15_on('FILL')
-                        and (st.session_state.get('v15_auto') or {}).get('mode') == 'clv')
+    auto_fill = _v15_on('FILL')
+    capture_mode = bool(source_kickoff and info.get('clv_id_confirmed') is True
+                        and info.get('finished') is False and kickoff is not None
+                        and get_hkt_now() < source_kickoff
+                        and (not auto_fill or (schedule_match and
+                             (st.session_state.get('v15_auto') or {}).get('mode') == 'clv')))
     api_odds = tipsme_fetch_hkjc_odds(mid)
     clv_observed = get_hkt_now().isoformat() if capture_mode and api_odds else ''
     if api_odds:
@@ -8306,6 +8411,9 @@ def tipsme_auto_fill(link, df_db, opts_tournaments, opts_teams, *, schedule_matc
                  'h_rank': st.session_state.get('h_rank'), 'a_rank': st.session_state.get('a_rank'),
                  'rank_source': rank_source,
                  'core_count': len(st.session_state.odds_history) if odds_ok else 0}
+    if capture_mode and not auto_fill and odds_ok:
+        fill_data['clv_manual_prices'] = deepcopy(core_hist)
+        fill_data['clv_manual_kickoff'] = (schedule_match or {}).get('match_time', source_kickoff.timestamp())
     # V14.4：記錄 Tipsme 比賽 ID 到注單 (結算時可直接自動讀取賽果，不用再貼鏈結)
     if mid:
         ctx['Tipsme_Match_ID'] = str(mid)
@@ -8334,6 +8442,29 @@ def _tipsme_context_fields(home_team, away_team):
     if _norm(info.get('home')) != _norm(home_team) or _norm(info.get('away')) != _norm(away_team):
         return {}
     return {k: v for k, v in (fd.get('ctx') or {}).items() if v}
+
+
+def _clv_manual_entry_note(row, candidate, fill, current, recorded):
+    """Match the actual form selection against a separate immutable API snapshot."""
+    locked = fill.get('clv_manual_prices') or []
+    mid = clv_fixture_id((fill.get('info') or {}).get('match_id'))
+    idx = candidate.get('history_idx')
+    if not mid or type(idx) is not int or not 0 <= idx < len(current):
+        return None
+    market = row.get('Bet_Type')
+    indices = [i for i, q in enumerate(locked) if q.get('type') == market]
+    current_market = [q for q in current if q.get('type') == market]
+    # The data editor rebuilds plain rows even on a no-op rerun; only the locked
+    # copy may supply evidence. Match all displayed odds terms, not editor IDs.
+    def terms(q):
+        return tuple(q.get(k) for k in ('type', 'record_time', 'line', 'upper', 'lower'))
+    if (not indices or terms(current[idx]) != terms(locked[indices[-1]])
+            or list(map(terms, current_market)) != [terms(locked[i]) for i in indices]):
+        return None
+    prepared = dict(token=('manual', 0, mid), fill=fill, odds=locked)
+    return clv_entry_note(row, {**candidate, 'history_idx': indices[-1]},
+                          prepared, fill.get('clv_manual_kickoff'), recorded)
+
 
 def _tipsme_fetch_page_html(url, timeout=25, marker='scheduleDetails'):
     """V15.4 泛化：下載 Tipsme 頁面 HTML (賽程頁 / 比賽頁 / h2h / 賠率頁通用)。
@@ -12314,6 +12445,11 @@ def main():
                     help="每種盤口類型在莊家最新仍提供的盤口線中，自動選出系統認為最合適的一邊：通過驗證的 ✅ 建議用 Kelly 注碼實注，其餘為 $0 模擬注。"
                          "確保每場輸入的比賽都會存入數據庫供學習，並追蹤系統每種盤口的真實表現。舊盤口及同方向的相關盤口線 (例如 2.5 小之外再加 2.75 小) 不會重複預選。"
                          "V15.5：自動導入歷史賽事 (V14.12 自動輸入) 時此開關一律視為開啟 — 自動導入的目的就是記錄 $0 模擬注供學習，關閉此開關只影響手動模式。")
+        if _v10_read_ok and (set(_v10_invalid).intersection(_V10_RESTORE_KEYS)
+                             or any(not st.session_state.get(key, True) for key in _V10_RESTORE_KEYS)):
+            st.button("只恢復這三項為開啟", key="v182_restore_risk_controls",
+                      on_click=v10_restore_risk_controls,
+                      help="只恢復觀察期、聯賽熔斷及自動預選，其餘設定不變。")
         st.checkbox("🚫 停用角球大小 (不建議、不作模擬注記錄)", key="v11_corner_off", on_change=v10_save_settings, args=('v11_corner_off',), disabled=_v10_disabled,
                     help="角球大小樣本已達統計顯著虧損 (580 注、每注 −15.3 單位，95% 區間全為負)，繼續記錄只會令模型學到雜訊。"
                          "開啟後角球完全不參與自動預選、模擬注及記錄 (分析表中仍會顯示「⏸ 角球已停用」供參考)；日後想恢復記錄隨時可關閉此選項。")
@@ -13272,6 +13408,11 @@ def main():
                                     'Odds_History': json.dumps(st.session_state.odds_history, ensure_ascii=False)
                                 })
                                 new_record.update(_tipsme_context_fields(home_team, away_team))
+                                if str(new_record.get('Note', '')).startswith(CLV_ENTRY) and any(
+                                        str(new_record.get(k)) != str(orig_record.get(k)) for k in
+                                        ('Tipsme_Match_ID', 'Match_Date', 'Home_Team', 'Away_Team',
+                                         'Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds')):
+                                    new_record['Note'] = '編輯改動了原賽前入注條件，CLV 證據已撤銷'
                             else:
                                 _recorded_at = get_hkt_now()
                                 new_record = {
@@ -13288,8 +13429,14 @@ def main():
                                 if _auto_inputs and _auto_clv.get('mode') == 'clv':
                                     _scheduled = _auto_clv['queue'][_auto_clv['idx']].get('match_time')
                                     _note = clv_entry_note(new_record, cand, _auto_inputs, _scheduled, _recorded_at)
-                                    if _note:
-                                        new_record['Note'] = _note
+                                elif not _auto_inputs and not _auto_clv.get('active') and not is_editing:
+                                    _note = _clv_manual_entry_note(new_record, cand,
+                                                                   st.session_state.get('tipsme_fill_data') or {},
+                                                                   st.session_state.odds_history, _recorded_at)
+                                else:
+                                    _note = None
+                                if _note:
+                                    new_record['Note'] = _note
                             # V15.8：LR 落注閘門 — 凍結模型計算 Model_Prob / Market_Prob /
                             # Edge / Gate 四欄並寫入注單；讓球且 Edge ≤ 2% 時系統注碼強制 $0
                             # (只作記錄供學習，不實注；所有注單照常記錄，前向驗證對照組不變)。
@@ -13306,6 +13453,8 @@ def main():
                                     _v158_gated.append(
                                         f"【{sel}】模型 {new_record['Model_Prob'] * 100:.1f}% vs 市場 {new_record['Market_Prob'] * 100:.1f}%"
                                         f" (Edge {new_record['Edge'] * 100:+.1f}%) → 系統注碼 $0")
+                                if not is_editing:
+                                    clv_record_handicap_forecast(new_record, _g158)
                             except Exception:
                                 pass
                             new_records.append(new_record)

@@ -10,6 +10,7 @@ HKT = timezone(timedelta(hours=8))
 MARKETS = {"讓球": ("Home", "Away"), "入球大小": ("Over", "Under"), "角球大小": ("Over", "Under")}
 QUOTE = "_clv_tipsme_hkjc_v1"
 ENTRY = "CLV_ENTRY_V1:"
+CUTOFF = datetime(2026, 11, 22, tzinfo=HKT)
 
 
 class Cohort(NamedTuple):
@@ -36,6 +37,14 @@ def local(value, *, zone=False):
         return None if zone else ts.replace(tzinfo=HKT)
     except (ValueError, OverflowError):
         return None
+
+
+def report_period(value):
+    """Use the recorded entry clock in HKT, never the match/settlement date."""
+    if isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value.strip()):
+        return None  # a date without a recorded time is not an entry timestamp
+    dt = local(value.strip() if isinstance(value, str) else value)
+    return None if dt is None else int(dt >= CUTOFF)
 
 
 def number(value, minimum=None):
@@ -113,18 +122,61 @@ def entry_note(row, candidate, prepared, scheduled, recorded):
     idx = candidate.get("history_idx")
     if type(idx) is not int or not 0 <= idx < len(snapshots) or candidate.get("is_latest") is not True:
         return None
+    if any(isinstance(s, dict) and s.get("type") == key[2] for s in snapshots[idx + 1:]):
+        return None
     quote = tagged_quote(snapshots[idx], key)
     if quote is None:
         return None
-    qtime, pair, _ = quote
+    qtime, pair, archive_ko = quote
     side = MARKETS[key[2]].index(key[3])
-    if (not taken - timedelta(minutes=30) <= qtime <= taken
+    if (archive_ko is not None or not taken - timedelta(minutes=30) <= qtime <= taken
             or not math.isclose(pair[side], key[5], abs_tol=1e-6, rel_tol=0)):
         return None
     return ENTRY + json.dumps(
         [key, qtime.isoformat(), taken.isoformat(), entered.isoformat(), kickoff.isoformat(), pair],
         ensure_ascii=False, separators=(",", ":"),
     )
+
+
+def verified_entry(row):
+    """Return the locked entry before looking at settlement or the closing history."""
+    key = row_key(row)
+    note = str(row.get("Note", "")).strip()
+    if not key or not note.startswith(ENTRY):
+        return None
+    try:
+        parts = json.loads(note[len(ENTRY):])
+        if not isinstance(parts, list) or len(parts) not in (6, 7):
+            return None
+        bound, qt, ct, rt, kt, pair = parts[:6]
+        q, capture, entered, kickoff = [local(t, zone=True) for t in (qt, ct, rt, kt)]
+        row_date = local(row.get("Date"))
+        side = MARKETS[key[2]].index(key[3])
+        if (bound != key or not all(key[:2]) or not all((q, capture, entered, kickoff, row_date))
+                or not capture - timedelta(minutes=30) <= q <= capture <= entered <= kickoff - timedelta(minutes=1)
+                or entered - capture > timedelta(minutes=5)
+                or report_period(row.get("Date")) is None
+                or row_date.replace(second=0, microsecond=0) != entered.replace(second=0, microsecond=0)
+                or str(row.get("Match_Date"))[:10] != kickoff.date().isoformat()
+                or len(pair) != 2 or any(number(n, 1) is None for n in pair)
+                or not math.isclose(float(pair[side]), key[5], abs_tol=1e-6, rel_tol=0)):
+            return None
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return key, q, entered, kickoff, tuple(map(float, pair)), parts[6] if len(parts) == 7 else None
+
+
+def record_handicap_forecast(row, forecast):
+    """Freeze the submit-time prediction separately from mutable display columns."""
+    proof = verified_entry(row)
+    if not proof or proof[0][2] != "讓球" or proof[5] is not None:
+        return
+    p, pm, edge = [number(forecast.get(k)) for k in ("p_model", "p_mkt", "edge")]
+    if p is None or pm is None or edge is None or not 0 < p < 1 or not 0 < pm < 1:
+        return
+    parts = json.loads(row["Note"][len(ENTRY):])
+    parts.append(["V15.8_LR", p, pm])
+    row["Note"] = ENTRY + json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
 
 
 def classify(row):
@@ -144,21 +196,11 @@ def classify(row):
         if day and logged and logged.date() > day:
             return Cohort("historical_late")
         return Cohort("historical_unknown")
-    try:
-        bound, qt, ct, rt, kt, pair = json.loads(note[len(ENTRY):])
-        q, capture, entered, kickoff = [local(t, zone=True) for t in (qt, ct, rt, kt)]
-        row_date = local(row.get("Date"))
-        side = MARKETS[key[2]].index(key[3])
-        if (bound != key or not all(key[:2]) or not all((q, capture, entered, kickoff, row_date))
-                or not capture - timedelta(minutes=30) <= q <= capture <= entered <= kickoff - timedelta(minutes=1)
-                or entered - capture > timedelta(minutes=5)
-                or row_date.replace(second=0, microsecond=0) != entered.replace(second=0, microsecond=0)
-                or str(row.get("Match_Date"))[:10] != kickoff.date().isoformat()
-                or len(pair) != 2 or any(number(n, 1) is None for n in pair)
-                or not math.isclose(float(pair[side]), key[5], abs_tol=1e-6, rel_tol=0)):
-            return Cohort("entry_invalid")
-    except (TypeError, ValueError, RecursionError):
+    proof = verified_entry(row)
+    if proof is None:
         return Cohort("entry_invalid")
+    key, q, entered, kickoff, pair, _ = proof
+    side = MARKETS[key[2]].index(key[3])
     closes = []
     for raw in history(row.get("Odds_History")):
         quote = tagged_quote(raw, key, same_line=False)
@@ -166,16 +208,26 @@ def classify(row):
             stamp, price_pair, actual_kickoff = quote
             if actual_kickoff is not None and actual_kickoff != kickoff:
                 return Cohort("kickoff_conflict")
-            if (actual_kickoff == kickoff and entered < stamp < kickoff
-                    and kickoff - stamp <= timedelta(minutes=15)):
+            if actual_kickoff == kickoff and stamp < kickoff:
                 closes.append((stamp, round(float(raw["line"]), 6), price_pair))
     if not closes:
         return Cohort("pending")
     last = max(t for t, _, _ in closes)
-    pairs = {p for t, line, p in closes if t == last and line == key[4]}
-    if not pairs:
-        return Cohort("pending")
-    if len(pairs) != 1:
+    finals = {(line, p) for t, line, p in closes if t == last}
+    if len(finals) != 1:
         return Cohort("close_conflict")
-    closing = next(iter(pairs))[side]
+    line, final_pair = next(iter(finals))
+    if line != key[4]:
+        return Cohort("pending")
+    # If the pre-kickoff entry actually used the final quote, the independent
+    # completed-fixture archive must confirm the very same two-sided quote.
+    # A different or older pre-entry quote, or a duplicate live snapshot, is not proof.
+    same_final_quote = last == q and all(
+        math.isclose(x, float(y), abs_tol=1e-6, rel_tol=0) for x, y in zip(final_pair, pair)
+    )
+    if not same_final_quote and not (entered < last and kickoff - last <= timedelta(minutes=15)):
+        return Cohort("pending")
+    closing = final_pair[side]
+    if same_final_quote:
+        return Cohort("snapshot", 0.0, closing, last.isoformat())
     return Cohort("snapshot", key[5] / closing - 1, closing, last.isoformat())
