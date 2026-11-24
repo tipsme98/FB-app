@@ -78,14 +78,91 @@ class ProfitableRules(unittest.TestCase):
              'odds': [{'type':'讓球','line':0,'upper':2.,'lower':1.9,'unlock':True,
                        app.CLV_QUOTE: quote_tag('11', t-timedelta(minutes=1))}]}
         a = hist([[1]*25+[-1]*16])
-        one = {'profitable_snapshot': a, 'close_pos': 0, 'snapshots':2}
+        one = {'profitable_triggers': [a], 'close_pos': 0, 'snapshots':2}
         res = {('讓球',0,'Home'): {**one,'lookup_odds':2.0},
-               ('讓球',0,'Away'): {**one,'lookup_odds':1.9}}
+               ('讓球',0,'Away'): {**one,'profitable_triggers': [],'lookup_odds':1.9}}
         self.assertEqual(len(app._profitable_lock(res,p,ko.timestamp(),t,True)), 1)
+        both = {**res, ('讓球',0,'Away'): {**one,'lookup_odds':1.1}}
+        self.assertEqual(app._profitable_lock(both,p,ko.timestamp(),t,True), [])
+        stacked = {**res, ('讓球',0,'Home'): {**res[('讓球',0,'Home')],
+                                             'profitable_triggers':[a, {**a,'rule':'another'}]}}
+        self.assertEqual(app._profitable_lock(stacked,p,ko.timestamp(),t,True), [])
         self.assertEqual(app._profitable_lock(res,p,ko.timestamp(),ko,True), [])
         self.assertEqual(app._profitable_lock(res,p,0,t,True), [])
         p['odds'][0].pop(app.CLV_QUOTE)
         self.assertEqual(app._profitable_lock(res,p,ko.timestamp(),t,True), [])
+
+    def test_shared_frozen_status(self):
+        r = hist([[1]*25+[-1]*16])
+        self.assertEqual(pr.frozen_display(r, None)[1], '')
+        self.assertEqual(pr.frozen_display(r, r)[1], '模擬候選')
+        self.assertEqual(pr.rule_status(dict(active=False, ever=True)), '移出／待重入')
+        self.assertEqual(pr.frozen_display(dict(r,candidate_status='移出／待重入'), None)[1], '移出／待重入')
+        self.assertEqual(pr.rule_status({}), '未入選')
+
+    def test_chronological_all_vs_reverse_use_quoted_side(self):
+        rows = []
+        for i in range(43):
+            d = pd.Timestamp('2026-01-01') + pd.Timedelta(days=i)
+            is_late = i>=41
+            rows.extend([
+                dict(date=d, bet_type='讓球', key=str(i), line=0.25, nsnap=2, side='Home',
+                     ret=(.90 if i==42 else -1.), odds=1.90, mask=True),
+                dict(date=d, bet_type='讓球', key=str(i), line=0.25, nsnap=2, side='Away',
+                     ret=((-1. if i==42 else .37) if is_late else .40), odds=1.40, mask=False)])
+        frame = pd.DataFrame(rows)
+        start = pd.Timestamp('2026-02-11')
+        def fit(train):
+            self.assertTrue(train.date.max() < start)
+        def masks(d,n=None):
+            return ['R'], d[['mask']].to_numpy()
+        out = pr.chronological_research(frame,[(start,start+pd.Timedelta(days=1))],
+                                        fit, lambda d,c:d, masks)
+        self.assertEqual(out['all']['總體']['n'], 2)
+        self.assertEqual(out['all']['入球大小']['n'], 0)
+        self.assertAlmostEqual(out['all']['讓球']['roi'], -.05)
+        self.assertEqual(out['all']['讓球']['first'], -1.)
+        self.assertEqual(out['all']['讓球']['second'], .90)
+        self.assertAlmostEqual(out['reverse']['讓球']['roi'], (.37-1)/2)
+        self.assertEqual(out['reverse_rules'][0]['opposite']['n'], 2)
+        self.assertEqual(out['reverse_detail'][0]['opposite_odds'], 1.4)
+        self.assertEqual(out['reverse_detail'][0]['opposite_return'], .37)
+        # A bad future outcome must not qualify a rule not bad enough on earlier rows.
+        frame.loc[frame['date'].lt(start) & frame['mask'],'ret'] = -.08
+        self.assertEqual(pr.chronological_research(frame,[(start,start)],
+                            fit,lambda d,c:d,masks)['reverse']['總體']['n'], 0)
+
+    def test_scope_filters_all_and_history(self):
+        stub = """
+import sys
+sys.path.insert(0, {root!r})
+import importlib.util
+import pandas as pd
+s = importlib.util.spec_from_file_location('fb_ui_metrics', {src!r})
+a=importlib.util.module_from_spec(s)
+s.loader.exec_module(a)
+a._profitable_paper_enabled = lambda: False
+def rep(df):
+    row=dict(n=41,roi=.07,net=1,hit=.6,ci=[.01,.10],first=.05,second=.07)
+    report={{k:{{m:dict(row,n=i) for i,m in enumerate(('總體','讓球','入球大小','角球大小'),1)}} for k in ('all','reverse')}}
+    report['reverse_rules']=[dict(market='讓球',rule='R',original=row,opposite=row)]
+    report['reverse_detail']=[dict(market='讓球',rule='R',side='Home',opposite='Away')]
+    hist={{('讓球','H'):dict(row,avg=1.9,floor=1.8,active=True,ever=True),
+          ('入球大小','G'):dict(row,avg=1.9,floor=1.8,active=False,ever=True)}}
+    return hist,report
+a._profitable_report=rep
+a._profitable_show(pd.DataFrame())
+""".format(root=str(Path(__file__).parents[1]), src=str(Path(__file__).parents[1]/'FB-app.py'))
+        at = AppTest.from_string(stub).run()
+        at.button(key='profitable_history_v1').click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual(at.dataframe[0].value['樣本外注數'].iloc[0],1)
+        self.assertEqual(set(at.dataframe[-1].value['看盤規則']),{'H','G'})
+        self.assertEqual(at.dataframe[2].value['看盤規則'].tolist(), ['R'])
+        at.selectbox(key='profitable_scope_v2').set_value('入球大小').run()
+        self.assertFalse(at.exception)
+        self.assertEqual(at.dataframe[0].value['樣本外注數'].iloc[0],3)
+        self.assertEqual(at.dataframe[-1].value['狀態'].tolist(),['移出／待重入'])
 
     def test_history_input_excludes_after_cutoff_and_follow(self):
         rows = [

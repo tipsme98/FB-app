@@ -36,7 +36,7 @@ import fb_app_profitable_rules as pr
 # V16.4.11：自動分析及入庫只讀本批次已核對的快照，不讀手動表單的 widget。
 # V16.4.12：排程以有效日期及正式庫核對確認完成，不把缺值或掃描結束當成功。
 # V18：香港固定時段可各自啟用，沿用既有結算；原每日排程及歷史補建保留。
-FB_APP_RELEASE = 'V18.3.0'
+FB_APP_RELEASE = 'V18.3.1'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -5320,8 +5320,8 @@ def v10_predict(engine, odds_history, ctx, hs, as_, hfp, afp, ref_date, thr, unk
         fired_z = [f for f in fired if f.get('z', 0.0) >= V11_Z_MIN]
         best_z = fired_z[0] if fired_z else None
         active = [f for f in fired if f['shr'] >= thr]
-        qualified = pr.choose([early[(row['bet_type'], names[j])] for j in np.flatnonzero(M[i])
-                               if (row['bet_type'], names[j]) in early], row['odds'])
+        triggers = [r for j in np.flatnonzero(M[i])
+                    if (r := early.get((row['bet_type'], names[j]))) and r['active']]
         res[(row['bet_type'], round(float(row['line']), 3), row['side'])] = {
             'ev_kp': float(best['shr']) if best else None,
             'kp_rule': best['rule'] if best else '',
@@ -5331,7 +5331,7 @@ def v10_predict(engine, odds_history, ctx, hs, as_, hfp, afp, ref_date, thr, unk
             'kp_fired': [f"{f['rule']} (n={f['n']}, ROI {f['roi']*100:.1f}%, 估計EV {f['shr']*100:+.1f}%, z={f.get('z', 0):.1f})" for f in fired[:5]],
             'ev_kz': float(best_z['shr']) if best_z else None, 'kz_rule': best_z['rule'] if best_z else '',
             'kp_snapshot': {k: best[k] for k in ('rule', 'n', 'roi', 'hit')} if best else None,
-            'profitable_snapshot': qualified,
+            'profitable_triggers': triggers,
             'lookup_odds': float(row['odds']), 'snapshots': int(row['nsnap']),
             'mv_imp': float(row['mv_imp']), 'imp_o': float(row['imp_o']), 'imp_c': float(row['imp_c']),
             'line_o': float(row['line_o']), 'odds_o': float(row['odds_o']), 'pub': float(row['pub']), 'resid': float(row['resid']),
@@ -5347,16 +5347,31 @@ def _profitable_paper_enabled():
 
 
 @st.cache_data(max_entries=4, show_spinner=False)
+def _profitable_design(df):
+    return v10_build_dataset(v9_build_match_table(df))
+
+
+@st.cache_data(max_entries=4, show_spinner=False)
 def _profitable_engine(df):
     """Separate cache, training data and thresholds. No legacy model/P&L gates."""
-    mt = v9_build_match_table(df)
-    D = v10_build_dataset(mt)
+    D = _profitable_design(df)
     if D.empty:
         return {}
     coef = v10_fit_resid(D)
     D = v10_apply_resid(D, coef)
     names, M = v10_rule_matrix(D)
     return {'trained': True, 'coef': coef, 'profitable': pr.historical(D, M, names)}
+
+
+@st.cache_data(max_entries=2, show_spinner=False)
+def _profitable_report(df):
+    D = _profitable_design(df)
+    if D.empty:
+        return {}, None
+    engine = _profitable_engine(df)
+    folds = v9_folds(D['date'], n_folds=6, init_frac=.4)
+    return engine['profitable'], pr.chronological_research(
+        D, folds, v10_fit_resid, v10_apply_resid, v10_rule_matrix)
 
 
 def _profitable_history_input(df, before=None):
@@ -5372,7 +5387,7 @@ def _profitable_history_input(df, before=None):
 
 def _profitable_lock(res, prepared, scheduled, now, corner_off):
     """Select strictly source-tagged, indicative paper prices; no old gates or cash."""
-    picks = {}
+    picks = []
     end = clv_local((prepared.get('fill') or {}).get('clv_observed'), zone=True)
     start = clv_local(now)
     if not end or not start:
@@ -5381,9 +5396,10 @@ def _profitable_lock(res, prepared, scheduled, now, corner_off):
     odds = prepared['odds']
     day = prepared['date'].isoformat()
     _, home, away = prepared['names']
-    for (bt, line, side), item in res.items():
-        rule, idx = item.get('profitable_snapshot'), item.get('close_pos')
-        if not rule or item['snapshots'] < 2 or (corner_off and bt == '角球大小'):
+    for (bt, line, side), item, rule in pr.unique_market_signals(res):
+        idx = item.get('close_pos')
+        if (pr.choose([rule], item['lookup_odds']) is None or item['snapshots'] < 2
+                or (corner_off and bt == '角球大小')):
             continue
         row = dict(ID=f'paper-v1:{mid}:{bt}', Tipsme_Match_ID=mid, Match_Date=day,
                    Bet_Type=bt, Selection=side, Initial_Line=line, Initial_Odds=item['lookup_odds'])
@@ -5396,11 +5412,8 @@ def _profitable_lock(res, prepared, scheduled, now, corner_off):
         versioned = dict(mid=mid, day=day, home=home, away=away, market=bt, line=key[4],
                          side=side, odds=key[5], pair=pair, source=source, seen=seen,
                          observed=entered, kickoff=ko, stats=rule, version=pr.VERSION)
-        prior = picks.get(bt)
-        rank = lambda p: (-p['stats']['roi'], -p['stats']['n'], p['stats']['rule'], p['side'])
-        if prior is None or rank(versioned) < rank(prior):
-            picks[bt] = versioned
-    return list(picks.values())
+        picks.append(versioned)
+    return picks
 
 
 def _profitable_write(picks):
@@ -5447,9 +5460,22 @@ def _profitable_read(days):
         return [p for p, _ in pairs], [r for _, rows in pairs for r in (rows or [])]
 
 
+def _profitable_metrics(summary):
+    pct = lambda v: f'{v:+.2%}' if v is not None else '無估計'
+    ci = summary['ci']
+    st.dataframe(pd.DataFrame([{
+        '樣本外注數': summary['n'], 'ROI': pct(summary['roi']),
+        '95%誤差範圍': f'{pct(ci[0])} 至 {pct(ci[1])}' if ci else '無估計',
+        '單位盈虧': f"{summary['net']:+.2f} U", '命中率': (
+            f"{summary['hit']:.2%}" if summary['hit'] is not None else '無估計'),
+        '前半段ROI': pct(summary['first']), '後半段ROI': pct(summary['second']),
+    }]), hide_index=True)
+
+
 def _profitable_show(df):
-    st.subheader('盈利看盤規則')
-    st.info('歷史達標只代表入選模擬，不是實注批准。舊策略、注碼及熔斷不變；此分頁的模擬與原帳本分開。')
+    st.subheader('看盤規則盈虧')
+    scope = st.selectbox('看盤規則盈虧範圍', ('總體', *pr.MARKETS), key='profitable_scope_v2')
+    st.info('全部看盤研究、獨立 $0 候選模擬及反向研究分開。現有實注、注碼及熔斷不變。')
     st.caption('首次及重入：歷史樣本 >40、ROI >2%、命中 >55%；累計 ROI 跌至負數移出。'
                '命中為贏半或以上，走盤留在分母。最低參考價按完整／半盤盈虧換算，並非未來盈利保證。')
     toggle = _profitable_paper_enabled()
@@ -5457,19 +5483,52 @@ def _profitable_show(df):
         st.warning('自動模擬鎖定未啟用；本頁不會寫下注單，也不會以歷史資料補造前瞻紀錄。')
     if st.button('計算歷史候選規則', key='profitable_history_v1'):
         try:
-            eng = _profitable_engine(_profitable_history_input(df))
-            st.session_state['_profitable_hist_display'] = eng.get('profitable', {})
+            st.session_state['_profitable_report_v2'] = _profitable_report(_profitable_history_input(df))
         except Exception:
-            st.session_state['_profitable_hist_display'] = None
-    if '_profitable_hist_display' in st.session_state:
-        hist = st.session_state['_profitable_hist_display']
+            st.session_state['_profitable_report_v2'] = None, None
+    if '_profitable_report_v2' in st.session_state:
+        hist, report = st.session_state['_profitable_report_v2']
+        if report is not None:
+            st.markdown('#### 全部規則樣本外盈虧')
+            _profitable_metrics(report['all'][scope])
+            st.caption('每次觸發一條原規則計 1 單位，重疊規則及兩邊可重複計數。這不是實注、候選旁表或單一投組。'
+                       '按周叢集重抽樣估 95% 區間；以篩選後有注的比賽日分前後兩半，同日不拆開。')
+            with st.expander('反向盈虧對照（只讀研究，不自動下注）'):
+                st.caption('每段只以較早資料選歷史樣本 >40、ROI <−10%、命中率 <40% 的規則；'
+                           '逐筆以同盤對家的賠率、盤線及正式結算口徑重算，非把原盈虧改符號。'
+                           '同規則兩邊都觸發則跳過。這是歷史對照，不寫下注單、旁表或實注。')
+                _profitable_metrics(report['reverse'][scope])
+                reverse = [r for r in report['reverse_rules'] if scope == '總體' or r['market'] == scope]
+                if reverse:
+                    view = pd.DataFrame([{
+                        '盤口': r['market'], '看盤規則': r['rule'], '樣本外注數': r['opposite']['n'],
+                        '原向ROI': r['original']['roi'], '反向ROI': r['opposite']['roi'],
+                        '反向單位盈虧': r['opposite']['net'], '反向命中率': r['opposite']['hit'],
+                    } for r in reverse])
+                    st.dataframe(view, hide_index=True, column_config={
+                        col: st.column_config.NumberColumn(format='percent')
+                        for col in ('原向ROI','反向ROI','反向命中率')})
+                    st.download_button('下載反向盈虧對照', view.to_csv(index=False).encode('utf-8-sig'),
+                                       'reverse-odds-research.csv', 'text/csv', key='profitable_reverse_export_v2')
+                    detail = pd.DataFrame([r for r in report['reverse_detail']
+                                           if scope == '總體' or r['market'] == scope])
+                    if not detail.empty:
+                        st.download_button('下載逐筆反向模擬盈虧', detail.to_csv(index=False).encode('utf-8-sig'),
+                                           'reverse-odds-research-detail.csv', 'text/csv',
+                                           key='profitable_reverse_detail_v2')
+        st.markdown('#### 歷史候選規則')
         if hist:
-            shown = sorted(hist.items(), key=lambda x: (not x[1]['active'], -x[1]['roi'], x[0]))
-            st.dataframe(pd.DataFrame([{
+            shown = sorted((x for x in hist.items() if scope == '總體' or x[0][0] == scope),
+                           key=lambda x: (not x[1]['active'], -x[1]['roi'], x[0]))
+            view = pd.DataFrame([{
                 '盤口': bt, '看盤規則': name, '歷史樣本': r['n'],
                 '歷史 ROI': r['roi'], '命中率': r['hit'], '平均賠率': r['avg'], '最低參考價': r['floor'],
-                '狀態': '模擬候選' if r['active'] else '移出／待重入' if r['ever'] else '未入選',
-            } for (bt, name), r in shown]), hide_index=True,
+                '狀態': pr.rule_status(r),
+            } for (bt, name), r in shown])
+            if view.empty:
+                st.info('所選盤口沒有可顯示的歷史規則。')
+            else:
+                st.dataframe(view, hide_index=True,
                 column_config={'歷史 ROI': st.column_config.NumberColumn(format='percent'),
                                '命中率': st.column_config.NumberColumn(format='percent'),
                                '最低參考價': st.column_config.NumberColumn(format='%.3f')})
@@ -5478,13 +5537,21 @@ def _profitable_show(df):
         else:
             st.error('歷史候選計算未完成；未把失敗當成沒有達標規則。')
         st.caption('歷史樣本使用既有 V10 收盤主盤重建；不可和 T−30 的實時價格混為同一驗證。')
+    st.markdown('#### 獨立候選 $0 前瞻盈虧')
+    st.caption('只有唯一候選規則與方向、賽前報價合格才可鎖定；不從全部規則或反向研究寫入。')
     _days = st.selectbox('前瞻模擬查詢期間', (30, 90, 365), key='profitable_days_v1')
     if st.button('讀取已鎖定的前瞻模擬', key='profitable_read_v1'):
         try:
-            papers, settled = _profitable_read(_days)
+            st.session_state['_profitable_forward_v2'] = _days, _profitable_read(_days)
         except Exception:
+            st.session_state['_profitable_forward_v2'] = _days, None
+    days_loaded, loaded = st.session_state.get('_profitable_forward_v2', (None, None))
+    if days_loaded == _days:
+        if loaded is None:
             st.error('未能讀取 Supabase 模擬旁表；不可把查詢失敗當成 0 注。')
             return
+        papers, settled = loaded
+        papers = [p for p in papers if scope == '總體' or p['market'] == scope]
         if not papers:
             st.info('所選期間未有已鎖定模擬，不代表 ROI 為 0。')
             return
@@ -5492,16 +5559,18 @@ def _profitable_show(df):
             args = (0, 0, h, a) if p['market'] == '角球大小' else (h, a, 0, 0)
             return v9_unit_return(v9_diff(p['market'], p['side'], p['line'], *args), p['odds'])
         results = pr.settled_returns(papers, settled, settle)
-        vals = [r['return'] for r in results if r['return'] is not None]
-        st.write(f'已鎖定 {len(results)} 注；以正式庫賽果可核對 {len(vals)} 注；其餘留空。'
-                 + (f'｜等額 ROI {sum(vals)/len(vals):+.2%}' if vals else '｜ROI 無估計'))
+        for version in sorted({p.get('version', 1) for p in results}):
+            cohort = [p for p in results if p.get('version', 1) == version]
+            vals = [r['return'] for r in cohort if r['return'] is not None]
+            st.write(f'策略版本 {version}：已鎖定 {len(cohort)} 注；可核對 {len(vals)} 注；其餘留空。'
+                     + (f'｜等額 ROI {sum(vals)/len(vals):+.2%}' if vals else '｜ROI 無估計'))
         cohorts = {}
         for p in results:
-            cohorts.setdefault((p['market'], p['stats']['rule']), []).append(p['return'])
+            cohorts.setdefault((p.get('version', 1), p['market'], p['stats']['rule']), []).append(p['return'])
         grouped = []
-        for (market, rule), values in sorted(cohorts.items()):
+        for (version, market, rule), values in sorted(cohorts.items()):
             known = [v for v in values if v is not None]
-            grouped.append({'盤口': market, '看盤規則': rule, '已鎖': len(values), '可核對': len(known),
+            grouped.append({'版本': version, '盤口': market, '看盤規則': rule, '已鎖': len(values), '可核對': len(known),
                             '模擬 ROI': sum(known)/len(known) if known else None,
                             '模擬命中率': sum(v > 0 for v in known)/len(known) if known else None})
         st.dataframe(pd.DataFrame(grouped), hide_index=True,
@@ -10960,7 +11029,7 @@ def _v162_follow_match_sections(open_df):
 def v162_render_follow_tab():
     """V16.2「👤 用家跟投」分頁：監察系統待結算注單 + 賽前分析結果，
     用家自行決定跟投 (自訂注碼) 或觀望。任何裝置可用 (含唯讀查看裝置)。"""
-    from fb_app_profitable_rules import frozen as frozen_rule
+    from fb_app_profitable_rules import STATUS as rule_states, frozen as frozen_rule, frozen_display
     st.subheader("👤 用家跟投 — 監察系統注單與分析，自行決定跟投或觀望")
     st.caption("💡 此分頁的數據全部來自雲端資料庫 (毋須執行賽前分析)：系統注單的"
                "模型概率 / 市場概率 / Edge / 閘門 / 近況 / 排名一目了然。勾選跟投並輸入"
@@ -11024,11 +11093,11 @@ def v162_render_follow_tab():
                                       'System_Stake', 'User_Stake'] if c in _rows.columns]
             st.markdown("**系統注單及賽前分析：**")
             _display = _rows[_disp_cols].copy()
-            _labels, _ns, _rois, _hits, _is_candidate = [], [], [], [], []
+            _labels, _ns, _rois, _hits, _states = [], [], [], [], []
             for _record in _rows.to_dict('records'):
                 _legacy, _eligible = frozen_rule(_record)
-                _rule = _eligible or _legacy
-                _is_candidate.append(bool(_eligible))
+                _rule, _status = frozen_display(_legacy, _eligible)
+                _states.append(_status)
                 _labels.append(_rule['rule'] if _rule else '—')
                 _ns.append(_rule['n'] if _rule else None)
                 _rois.append(_rule['roi'] if _rule else None)
@@ -11037,14 +11106,15 @@ def v162_render_follow_tab():
             _display['歷史樣本'] = _ns
             _display['歷史 ROI'] = _rois
             _display['命中率'] = _hits
-            _display['模擬候選'] = ['盈利看盤規則（候選）' if b else '' for b in _is_candidate]
+            _display['狀態'] = _states
             _styled = _display.style.apply(
-                lambda col: ['background-color:#d9eee9;color:#163b38' if b else '' for b in _is_candidate],
-                subset=['看盤規則', '歷史樣本', '歷史 ROI', '命中率', '模擬候選'])
+                lambda col: ['background-color:#d9eee9;color:#163b38' if s == rule_states[0] else '' for s in _states],
+                subset=['看盤規則', '歷史樣本', '歷史 ROI', '命中率', '狀態'])
             st.dataframe(_styled, use_container_width=True, hide_index=True,
                          column_config={'歷史 ROI': st.column_config.NumberColumn(format='percent'),
                                         '命中率': st.column_config.NumberColumn(format='percent')})
-            st.caption('這些欄位為建檔時凍結的歷史資料；舊注單無紀錄時留空。高亮只代表模擬候選，不代表已鎖模擬或建議實注。')
+            st.caption('狀態與歷史候選表用同一套名稱，這裡顯示建檔當時的狀態；舊注單無紀錄時留空。'
+                       '高亮不代表已鎖模擬或建議實注。')
             if _followed:
                 st.markdown(f"**你已跟投的注單 ({_followed} 注)：**")
                 st.dataframe(_rows[_usr_stake > 0][_disp_cols], use_container_width=True, hide_index=True)
@@ -12895,7 +12965,7 @@ def main():
     v1511_render_sched_status()   # V15.11：每日排程背景檢查 (每 5 分鐘)
     v16_render_clv_recorder()     # V16：開賽前 CLV 記錄器背景檢查 (每 5 分鐘)
 
-    t_pre, t_follow, t_inplay, t_settle, t_ai, t_time_pnl, t_clv, t_profit = st.tabs(["📝 賽前建檔與投注", "👤 用家跟投", "⏱️ 即場賽事與預測", "⚖ 賽果結算與管理", "🤖 全局模型", "📅 時間維度盈虧記錄分析", "🎯 CLV 與本金模擬", "盈利看盤規則"])
+    t_pre, t_follow, t_inplay, t_settle, t_ai, t_time_pnl, t_clv = st.tabs(["📝 賽前建檔與投注", "👤 用家跟投", "⏱️ 即場賽事與預測", "⚖ 賽果結算與管理", "🤖 全局模型", "📅 時間維度盈虧記錄分析", "🎯 CLV 與本金模擬"])
 
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
@@ -13307,6 +13377,7 @@ def main():
                     kp_map = {}
                     st.warning(f"看盤引擎分析失敗，已改用 V9 模型: {_kp_err}")
                 _paper_map = {}
+                _paper_hist = None
                 if _auto_inputs and (st.session_state.get('v15_auto') or {}).get('mode') == 'clv':
                     _asof = clv_local(_auto_inputs['fill'].get('clv_observed'), zone=True)
                     if _asof:
@@ -13315,8 +13386,9 @@ def main():
                             _paper_map = v10_predict(_paper_engine, _auto_inputs['odds'], v9_ctx, hr_val, ar_val,
                                                      hf_val, af_val, _md_ts, v9_set['min_ev'], _unk_now,
                                                      sim_asof=_asof)
+                            _paper_hist = _paper_engine.get('profitable')
                         except Exception:
-                            st.warning('盈利規則獨立模擬計算失敗；原策略不變。')
+                            st.warning('看盤規則獨立模擬計算失敗；原策略不變。')
                 try:
                     arena = v11_get_arena(st.session_state.df_db)
                 except Exception as _ar_err:
@@ -13390,7 +13462,7 @@ def main():
                              v9_dimension_stats(df_settled, "C. 宏觀 (全局數據)")],
                     'engine': {k: engine.get(k) for k in ('trained', 'msg', 'w', 'kind', 'groups', 'n_matches', 'n_rows', 'll_market', 'll_model')},
                     'candidates': scored, 'picks': picks, 'paper_picks': paper_picks, 'kp_summary': kp_summary,
-                    'kp_frozen': kp_map, 'profitable_paper': _paper_map,
+                    'kp_frozen': kp_map, 'profitable_paper': _paper_map, 'profitable_history': _paper_hist,
                     'auto_sys': v11_auto_sys_picks(scored, picks, _v15_set_autosys),  # V15.5：自動導入時強制預選
                     'arena_msg': arena.get('msg', ''), 'league_ctx': _league_ctx, 'no_rank': bool(no_rank),
                     'kp_engine': {k: kp_engine.get(k) for k in ('trained', 'msg', 'n_matches', 'n_rows')}, 'mode': v9_set['mode'],
@@ -13679,10 +13751,10 @@ def main():
                                                          get_hkt_now(), v9_set.get('corner_off', True))
                             _saved_v1 = _profitable_write(_picks_v1)
                             if _saved_v1:
-                                _v15_log(_paper_auto, f'盈利看盤規則：獨立旁表新增 {_saved_v1} 注 ($0)。')
+                                _v15_log(_paper_auto, f'看盤規則盈虧：獨立旁表新增 {_saved_v1} 注 ($0)。')
                         except Exception:
-                            _v15_log(_paper_auto, '盈利看盤規則：旁表寫入未獲確認，不當成已鎖定；原流程繼續。')
-                            st.warning('盈利看盤規則旁表未獲寫入確認。')
+                            _v15_log(_paper_auto, '看盤規則盈虧：旁表寫入未獲確認，不當成已鎖定；原流程繼續。')
+                            st.warning('看盤規則盈虧旁表未獲寫入確認。')
                     all_keys = set(sys_selected + usr_selected)
                     if not all_keys:
                         st.warning("⚠️ 請至少在系統或用家選擇一項投注！")
@@ -13825,11 +13897,19 @@ def main():
                                     _lookup = res.get('kp_frozen', {}).get(_kp_key, {})
                                     if (cand.get('is_latest') is True and cand.get('is_offered') is True
                                             and _lookup.get('lookup_odds') == float(cand['odds'])):
-                                        _paper_lookup = res.get('profitable_paper', {}).get(_kp_key, {})
-                                        pr.freeze(new_record, _lookup.get('kp_snapshot'),
-                                                  _paper_lookup.get('profitable_snapshot')
-                                                  if _note and _paper_lookup.get('lookup_odds') == float(cand['odds'])
-                                                  and _paper_lookup.get('snapshots', 0) >= 2 else None)
+                                        _legacy_rule = _lookup.get('kp_snapshot')
+                                        _hist = res.get('profitable_history')
+                                        if _legacy_rule and _hist is not None:
+                                            _state = pr.rule_status(_hist.get((_kp_key[0], _legacy_rule['rule']), {}))
+                                            _legacy_rule = dict(_legacy_rule, candidate_status=_state)
+                                        _sole = next(((item, rule) for key, item, rule in
+                                                      pr.unique_market_signals(res.get('profitable_paper', {}))
+                                                      if key == _kp_key), None)
+                                        _eligible = None
+                                        if (_note and _sole and _sole[0].get('snapshots', 0) >= 2
+                                                and _sole[0].get('lookup_odds') == float(cand['odds'])):
+                                            _eligible = _sole[1]
+                                        pr.freeze(new_record, _legacy_rule, _eligible)
                             # V15.8：LR 落注閘門 — 凍結模型計算 Model_Prob / Market_Prob /
                             # Edge / Gate 四欄並寫入注單；讓球且 Edge ≤ 2% 時系統注碼強制 $0
                             # (只作記錄供學習，不實注；所有注單照常記錄，前向驗證對照組不變)。
@@ -13926,8 +14006,6 @@ def main():
     # --- V16.2 用家跟投分頁 ---
     with t_follow:
         v162_render_follow_tab()
-    with t_profit:
-        _profitable_show(st.session_state.df_db)
     with t_inplay:
         st.subheader("⏱ 即場賽事實時更新與智慧火力分析")
         
@@ -14907,6 +14985,8 @@ def main():
 
     with t_ai:
         st.subheader("🤖 全局模型與績效分析")
+        _profitable_show(st.session_state.df_db)
+        st.divider()
         df_settled = st.session_state.df_db[st.session_state.df_db['Status'] == 'Settled'].copy()
         
         if df_settled.empty:

@@ -56,14 +56,20 @@ class FollowNewestFirst(unittest.TestCase):
     def test_frozen_candidate_is_labelled_and_old_row_remains_blank(self):
         new = slip("新場", "B1", "2026-11-21 21:00")
         old = slip("新場", "B2", "2026-11-21 20:00")
+        removed = slip("新場", "B3", "2026-11-21 19:00")
         new["Odds_History"] = "[{}]"
+        removed["Odds_History"] = "[{}]"
         freeze(new, None, {"rule": "盤水不變", "n": 60, "roi": .08, "hit": .60})
-        at = boot(new, old)
+        freeze(removed, {"rule": "收盤高水", "n": 70, "roi": -.02, "hit": .51,
+                         "candidate_status": "移出／待重入"}, None)
+        at = boot(new, old, removed)
         self.assertFalse(at.exception)
         view = at.dataframe[0].value.set_index("ID")
         self.assertEqual(view.loc["B1", "看盤規則"], "盤水不變")
-        self.assertEqual(view.loc["B1", "模擬候選"], "盈利看盤規則（候選）")
+        self.assertEqual(view.loc["B1", "狀態"], "模擬候選")
         self.assertEqual(view.loc["B2", "看盤規則"], "—")
+        self.assertEqual(view.loc["B2", "狀態"], "")
+        self.assertEqual(view.loc["B3", "狀態"], "移出／待重入")
 
     def assert_order(self, at, *matches):
         self.assertFalse(at.exception)

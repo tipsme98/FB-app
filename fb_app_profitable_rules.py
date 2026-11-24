@@ -7,12 +7,33 @@ import numpy as np
 
 from fb_app_clv_cohorts import fixture_id, history, number
 
-VERSION = 1
+VERSION = 2
 TAG = '_fb_kanpan_v1'
 TARGET = 0.02
 HIT = 0.55
 MIN_N = 40
 EPS = 1e-10
+MARKETS = ('讓球', '入球大小', '角球大小')
+STATUS = ('模擬候選', '移出／待重入', '未入選')
+
+
+def rule_status(record):
+    return STATUS[0] if record.get('active') else STATUS[1] if record.get('ever') else STATUS[2]
+
+
+def frozen_display(legacy, eligible):
+    """Do not infer a historical status for records saved before the status field."""
+    r = eligible or legacy
+    return r, (STATUS[0] if eligible else (r or {}).get('candidate_status', ''))
+
+
+def unique_market_signals(res):
+    """No fallback: reject many rule/side matches before any price/source filtering."""
+    markets = {}
+    for key, item in res.items():
+        for rule in item.get('profitable_triggers', ()):
+            markets.setdefault(key[0], []).append((key, item, rule))
+    return [matches[0] for matches in markets.values() if len(matches) == 1]
 
 
 def _earned(n, total, wins):
@@ -106,6 +127,8 @@ def frozen(row):
                 or type(r.get('n')) is not int or r['n'] < 1
                 or number(r.get('roi')) is None or number(r.get('hit')) is None):
             return None
+        if 'candidate_status' in r and r['candidate_status'] not in STATUS:
+            return {k: v for k, v in r.items() if k != 'candidate_status'}
         return r
     return checked(item[1]), checked(item[2])
 
@@ -133,3 +156,104 @@ def settled_returns(papers, rows, compute):
                 outcome = None
         result.append({**p, 'return': outcome})
     return result
+
+
+def _daily_summary(day_map):
+    """Report pooled unit returns; bootstrap weeks to keep same-date overlaps together."""
+    result = dict(n=0, roi=None, ci=None, net=0., hit=None, first=None, second=None)
+    if not day_map:
+        return result
+    days = sorted(day_map)
+    values = np.array([day_map[d] for d in days], dtype=float)
+    n, net, wins = values.sum(axis=0)
+    result.update(n=int(n), roi=float(net/n), net=float(net), hit=float(wins/n))
+    if len(days) >= 2:
+        mid = len(days)//2
+        halves = [part.sum(axis=0) for part in (values[:mid], values[mid:])]
+        result.update(first=float(halves[0][1]/halves[0][0]),
+                      second=float(halves[1][1]/halves[1][0]))
+    by_week = {}
+    for d, part in zip(days, values):
+        date = d.date()
+        week = date.toordinal() - date.weekday()
+        by_week.setdefault(week, np.zeros(3))[:] += part
+    if len(by_week) >= 2:
+        weeks = np.array(list(by_week.values()))
+        rng = np.random.default_rng(1831)
+        draws = weeks[rng.integers(len(weeks), size=(2000, len(weeks)))].sum(axis=1)
+        result['ci'] = np.quantile(draws[:,1]/draws[:,0], [.025,.975]).tolist()
+    return result
+
+
+def chronological_research(design, folds, fit, apply, matrix):
+    """All-rule and reverse comparison only. This code cannot create an order."""
+    totals = {m:{} for m in ('總體', *MARKETS)}
+    reverse_totals = {m:{} for m in totals}
+    reverse_by_rule = {}
+    reverse_detail = []
+    covered = set()
+    def record(target, day, values, weights=None):
+        if len(values):
+            v = np.ones(len(values), dtype=int) if weights is None else weights
+            target.setdefault(day, np.zeros(3))[:] += (v.sum(), v@values, v@(values>0))
+    for start, end in folds:
+        train = design[design['date'] < start]
+        test = design[design['date'].between(start, end)]
+        if train.empty or test.empty:
+            continue
+        coef = fit(train)
+        train, test = (apply(d, coef).reset_index(drop=True) for d in (train,test))
+        names, trained_masks = matrix(train)
+        _, M = matrix(test, names)
+        stats = historical(train, trained_masks, names)
+        for m in MARKETS:
+            name_index = [j for j,name in enumerate(names)
+                          if (r := stats.get((m,name))) and r['n']>40 and r['roi']<-.10-EPS and r['hit']<.40-EPS]
+            md = test[test['bet_type'].eq(m)]
+            for d, group in md.groupby('date', sort=True):
+                datum = d.to_pydatetime()
+                if (d,m) in covered:
+                    raise ValueError('Overlapping out-of-sample folds')
+                covered.add((d,m))
+                indices = group.index.to_numpy()
+                vals = group['ret'].to_numpy(float)
+                valid = np.isfinite(vals) & group['odds'].gt(1).to_numpy()
+                active = M[indices,:]
+                weights = active.sum(axis=1)
+                keep = valid & (weights>0)
+                for k in (m,'總體'):
+                    record(totals[k], datum, vals[keep], weights[keep])
+                if not name_index:
+                    continue
+                # Look up the opposite side from the same reconstructed main quote,
+                # never use 1-hit or -ROI. Require a unique opposite for each row.
+                paired = {}
+                for i,(key,line,nsnap,side,ok) in enumerate(zip(group['key'],group['line'],
+                            group['nsnap'],group['side'],valid)):
+                    if ok:
+                        paired.setdefault((key,round(line,6),nsnap),[]).append((i,side))
+                for (_,line,_), members in paired.items():
+                    if len(members)!=2 or {s for _,s in members} not in ({'Home','Away'},{'Over','Under'}):
+                        continue
+                    (a,_),(b,_) = members
+                    for j in name_index:
+                        if active[a,j] == active[b,j]:
+                            continue  # neither triggers, or a conflicting two-sided rule
+                        original, opposite = (a,b) if active[a,j] else (b,a)
+                        own = reverse_by_rule.setdefault((m,names[j]), ({},{}))
+                        record(own[0],datum,vals[[original]])
+                        record(own[1],datum,vals[[opposite]])
+                        orig, inv = group.iloc[original], group.iloc[opposite]
+                        reverse_detail.append(dict(day=datum.date().isoformat(), market=m, rule=names[j],
+                                                   line=float(line), side=orig['side'], odds=float(orig['odds']),
+                                                   opposite=inv['side'], opposite_odds=float(inv['odds']),
+                                                   original_return=float(vals[original]),
+                                                   opposite_return=float(vals[opposite])))
+                        for k in (m,'總體'):
+                            record(reverse_totals[k],datum,vals[[opposite]])
+    return dict(all={m:_daily_summary(day) for m,day in totals.items()},
+                reverse={m:_daily_summary(day) for m,day in reverse_totals.items()},
+                reverse_detail=reverse_detail,
+                reverse_rules=[dict(market=m, rule=rule, original=_daily_summary(before),
+                                    opposite=_daily_summary(after))
+                               for (m,rule),(before,after) in sorted(reverse_by_rule.items())])
