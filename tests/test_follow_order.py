@@ -4,6 +4,7 @@ from pathlib import Path
 import unittest
 
 from streamlit.testing.v1 import AppTest
+from fb_app_profitable_rules import freeze
 
 APP = Path(__file__).resolve().parents[1] / "FB-app.py"
 FOLLOW_FUNCTIONS = {
@@ -52,6 +53,18 @@ def boot(*rows):
 
 
 class FollowNewestFirst(unittest.TestCase):
+    def test_frozen_candidate_is_labelled_and_old_row_remains_blank(self):
+        new = slip("新場", "B1", "2026-11-21 21:00")
+        old = slip("新場", "B2", "2026-11-21 20:00")
+        new["Odds_History"] = "[{}]"
+        freeze(new, None, {"rule": "盤水不變", "n": 60, "roi": .08, "hit": .60})
+        at = boot(new, old)
+        self.assertFalse(at.exception)
+        view = at.dataframe[0].value.set_index("ID")
+        self.assertEqual(view.loc["B1", "看盤規則"], "盤水不變")
+        self.assertEqual(view.loc["B1", "模擬候選"], "盈利看盤規則（候選）")
+        self.assertEqual(view.loc["B2", "看盤規則"], "—")
+
     def assert_order(self, at, *matches):
         self.assertFalse(at.exception)
         labels = [e.label for e in at.get("expander")]

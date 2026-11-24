@@ -19,6 +19,7 @@ from fb_app_clv_cohorts import (
 )
 from fb_app_handicap_audit import handicap_audit
 from fb_app_historical_clv import overlay as overlay_historical_clv, sql_rows as historical_clv_sql_rows
+import fb_app_profitable_rules as pr
 # ==============================================================================
 # V16.4.1 (2026-11-18)：主表增量寫入和墓碑/Undo 同一事務；只按明示 ID 刪除。
 # 保留差量備份，不再把「本次某些列成功」當作全份備份可清空的證據。
@@ -35,7 +36,7 @@ from fb_app_historical_clv import overlay as overlay_historical_clv, sql_rows as
 # V16.4.11：自動分析及入庫只讀本批次已核對的快照，不讀手動表單的 widget。
 # V16.4.12：排程以有效日期及正式庫核對確認完成，不把缺值或掃描結束當成功。
 # V18：香港固定時段可各自啟用，沿用既有結算；原每日排程及歷史補建保留。
-FB_APP_RELEASE = 'V18.2.5'
+FB_APP_RELEASE = 'V18.3.0'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -1429,8 +1430,10 @@ def load_db(filename, columns, table_name, force_cloud=False):
                 # (涵蓋「刪除成功但其他裝置稍後又寫回」等一切殘留情況)
                 if table_name == 'football_bets':
                     df = _v164_drop_tombs(df)
+                    st.session_state['_fb_main_load_verified'] = get_hkt_now().strftime('%m-%d %H:%M:%S')
         except Exception:
-            pass
+            if table_name == 'football_bets':
+                st.session_state['_fb_main_load_verified'] = ''
 
     # 其次從 GitHub 雲端倉庫讀取
     sql_empty_authoritative = sql_loaded and table_name == 'football_bets'
@@ -5286,13 +5289,15 @@ def v10_type_gate(engine, bt, thr, override=False):
     return True, ''
 
 
-def v10_predict(engine, odds_history, ctx, hs, as_, hfp, afp, ref_date, thr, unk=False):
+def v10_predict(engine, odds_history, ctx, hs, as_, hfp, afp, ref_date, thr, unk=False, *, sim_asof=None):
     """即將比賽：以最新 (收盤) 主盤計算看盤特徵，找出觸發且已啟用的最佳規則
     回傳 {(bet_type, line, side): {...}}"""
     res = {}
     if not engine or not engine.get('trained'):
         return res
     snaps = v10_snapshots(odds_history, ref_date)
+    if sim_asof is not None:
+        snaps = [s for s in snaps if s['has_t'] and s['t'] <= sim_asof.replace(tzinfo=None)]
     if not snaps:
         return res
     rows = v10_market_rows(snaps, ctx, hs, as_, hfp, afp, unk)
@@ -5301,6 +5306,7 @@ def v10_predict(engine, odds_history, ctx, hs, as_, hfp, afp, ref_date, thr, unk
     D = v10_apply_resid(pd.DataFrame(rows), engine.get('coef', {}))
     names, M = v10_rule_matrix(D)
     lookup = {(r['rule'], r['bet_type']): r for r in engine.get('rules', [])}
+    early = engine.get('profitable', {})
     minn = engine.get('params', {}).get('minn', V10_MIN_N)
     for i in range(len(D)):
         row = D.iloc[i]
@@ -5314,6 +5320,8 @@ def v10_predict(engine, odds_history, ctx, hs, as_, hfp, afp, ref_date, thr, unk
         fired_z = [f for f in fired if f.get('z', 0.0) >= V11_Z_MIN]
         best_z = fired_z[0] if fired_z else None
         active = [f for f in fired if f['shr'] >= thr]
+        qualified = pr.choose([early[(row['bet_type'], names[j])] for j in np.flatnonzero(M[i])
+                               if (row['bet_type'], names[j]) in early], row['odds'])
         res[(row['bet_type'], round(float(row['line']), 3), row['side'])] = {
             'ev_kp': float(best['shr']) if best else None,
             'kp_rule': best['rule'] if best else '',
@@ -5322,11 +5330,180 @@ def v10_predict(engine, odds_history, ctx, hs, as_, hfp, afp, ref_date, thr, unk
             'kp_active': len(active),
             'kp_fired': [f"{f['rule']} (n={f['n']}, ROI {f['roi']*100:.1f}%, 估計EV {f['shr']*100:+.1f}%, z={f.get('z', 0):.1f})" for f in fired[:5]],
             'ev_kz': float(best_z['shr']) if best_z else None, 'kz_rule': best_z['rule'] if best_z else '',
+            'kp_snapshot': {k: best[k] for k in ('rule', 'n', 'roi', 'hit')} if best else None,
+            'profitable_snapshot': qualified,
+            'lookup_odds': float(row['odds']), 'snapshots': int(row['nsnap']),
             'mv_imp': float(row['mv_imp']), 'imp_o': float(row['imp_o']), 'imp_c': float(row['imp_c']),
             'line_o': float(row['line_o']), 'odds_o': float(row['odds_o']), 'pub': float(row['pub']), 'resid': float(row['resid']),
             'close_pos': int(row['close_pos']),
         }
     return res
+
+
+def _profitable_paper_enabled():
+    if _has_secret('FB_PROFITABLE_PAPER_V1'):
+        return str(st.secrets['FB_PROFITABLE_PAPER_V1']).strip().lower() in ('1', 'true')
+    return False
+
+
+@st.cache_data(max_entries=4, show_spinner=False)
+def _profitable_engine(df):
+    """Separate cache, training data and thresholds. No legacy model/P&L gates."""
+    mt = v9_build_match_table(df)
+    D = v10_build_dataset(mt)
+    if D.empty:
+        return {}
+    coef = v10_fit_resid(D)
+    D = v10_apply_resid(D, coef)
+    names, M = v10_rule_matrix(D)
+    return {'trained': True, 'coef': coef, 'profitable': pr.historical(D, M, names)}
+
+
+def _profitable_history_input(df, before=None):
+    if df.empty:
+        return df
+    df = _v162_excl_user_bets(df)
+    dates = pd.to_datetime(df['Match_Date'].astype(str).str[:10], format='%Y-%m-%d', errors='coerce')
+    ok = dates.notna() & df['Status'].eq('Settled') & ~df['Bet_Type'].astype(str).str.contains('即場')
+    if before is not None:
+        ok &= dates < before
+    return v9_engine_input(df.loc[ok].copy())
+
+
+def _profitable_lock(res, prepared, scheduled, now, corner_off):
+    """Select strictly source-tagged, indicative paper prices; no old gates or cash."""
+    picks = {}
+    end = clv_local((prepared.get('fill') or {}).get('clv_observed'), zone=True)
+    start = clv_local(now)
+    if not end or not start:
+        return []
+    mid = clv_fixture_id(prepared['token'][2])
+    odds = prepared['odds']
+    day = prepared['date'].isoformat()
+    _, home, away = prepared['names']
+    for (bt, line, side), item in res.items():
+        rule, idx = item.get('profitable_snapshot'), item.get('close_pos')
+        if not rule or item['snapshots'] < 2 or (corner_off and bt == '角球大小'):
+            continue
+        row = dict(ID=f'paper-v1:{mid}:{bt}', Tipsme_Match_ID=mid, Match_Date=day,
+                   Bet_Type=bt, Selection=side, Initial_Line=line, Initial_Odds=item['lookup_odds'])
+        if type(idx) is not int or not 0 <= idx < len(odds) or odds[idx].get('unlock') is not True:
+            continue
+        note = clv_entry_note(row, {'history_idx': idx, 'is_latest': True}, prepared, scheduled, start)
+        if not note:
+            continue
+        key, source, seen, entered, ko, pair = json.loads(note[len(CLV_ENTRY):])
+        versioned = dict(mid=mid, day=day, home=home, away=away, market=bt, line=key[4],
+                         side=side, odds=key[5], pair=pair, source=source, seen=seen,
+                         observed=entered, kickoff=ko, stats=rule, version=pr.VERSION)
+        prior = picks.get(bt)
+        rank = lambda p: (-p['stats']['roi'], -p['stats']['n'], p['stats']['rule'], p['side'])
+        if prior is None or rank(versioned) < rank(prior):
+            picks[bt] = versioned
+    return list(picks.values())
+
+
+def _profitable_write(picks):
+    if not picks:
+        return 0
+    from sqlalchemy import text
+    engine = _v163_sql_engine()
+    if engine is None:
+        raise RuntimeError('paper store unavailable')
+    with engine.begin() as conn:
+        conn.execute(text("SET LOCAL statement_timeout = '4000ms'"))
+        sql = text("""INSERT INTO public.fb_profitable_paper_v1(mid,kickoff,observed,market,payload)
+            SELECT :mid,CAST(:kickoff AS timestamptz),CAST(:observed AS timestamptz),:market,CAST(:payload AS jsonb)
+            WHERE clock_timestamp() <= CAST(:kickoff AS timestamptz) - interval '1 minute'
+            ON CONFLICT (mid,kickoff,market) DO NOTHING RETURNING mid""")
+        return sum(conn.execute(sql, {**p, 'payload': json.dumps(p, ensure_ascii=False)}).scalar() is not None for p in picks)
+
+
+def _profitable_read(days):
+    from sqlalchemy import text
+    engine = _v163_sql_engine()
+    if engine is None:
+        raise RuntimeError('paper store unavailable')
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL statement_timeout = '4000ms'"))
+        pairs = conn.execute(text("""WITH papers AS MATERIALIZED (
+                SELECT * FROM public.fb_profitable_paper_v1
+                WHERE kickoff >= now() - CAST(:days AS integer) * interval '1 day'
+            ), scores AS MATERIALIZED (
+                SELECT p.mid,p.kickoff,p.market,jsonb_agg(DISTINCT jsonb_build_object(
+                    'Tipsme_Match_ID',p.mid,'Match_Date',b."Match_Date",'Home_Team',b."Home_Team",
+                    'Away_Team',b."Away_Team",'Home_Goal',b."Home_Goal",'Away_Goal',b."Away_Goal",
+                    'Home_Corner',b."Home_Corner",'Away_Corner',b."Away_Corner")) AS outcomes
+                FROM papers p JOIN public.football_bets b
+                    ON regexp_replace(b."Tipsme_Match_ID",'[.]0+$','') = p.mid
+                    AND b."Match_Date" = p.payload->>'day' AND b."Status" = 'Settled'
+                    AND b."Home_Team" = p.payload->>'home' AND b."Away_Team" = p.payload->>'away'
+                WHERE COALESCE(btrim(b."Note"),'') <> '用家跟投'
+                    AND NOT EXISTS (SELECT 1 FROM public.football_bets_deleted t WHERE t.id=b."ID")
+                GROUP BY p.mid,p.kickoff,p.market
+            )
+            SELECT p.payload,s.outcomes FROM papers p LEFT JOIN scores s USING (mid,kickoff,market)
+            ORDER BY p.kickoff DESC,p.market,p.mid"""), {'days': days}).all()
+        return [p for p, _ in pairs], [r for _, rows in pairs for r in (rows or [])]
+
+
+def _profitable_show(df):
+    st.subheader('盈利看盤規則')
+    st.info('歷史達標只代表入選模擬，不是實注批准。舊策略、注碼及熔斷不變；此分頁的模擬與原帳本分開。')
+    st.caption('首次及重入：歷史樣本 >40、ROI >2%、命中 >55%；累計 ROI 跌至負數移出。'
+               '命中為贏半或以上，走盤留在分母。最低參考價按完整／半盤盈虧換算，並非未來盈利保證。')
+    toggle = _profitable_paper_enabled()
+    if not toggle:
+        st.warning('自動模擬鎖定未啟用；本頁不會寫下注單，也不會以歷史資料補造前瞻紀錄。')
+    if st.button('計算歷史候選規則', key='profitable_history_v1'):
+        eng = _profitable_engine(_profitable_history_input(df))
+        hist = eng.get('profitable', {})
+        if hist:
+            shown = sorted(hist.items(), key=lambda x: (not x[1]['active'], -x[1]['roi'], x[0]))
+            st.dataframe(pd.DataFrame([{
+                '盤口': bt, '看盤規則': name, '歷史樣本': r['n'],
+                '歷史 ROI': r['roi'], '命中率': r['hit'], '平均賠率': r['avg'], '最低參考價': r['floor'],
+                '狀態': '模擬候選' if r['active'] else '移出／待重入' if r['ever'] else '未入選',
+            } for (bt, name), r in shown]), hide_index=True,
+                column_config={'歷史 ROI': st.column_config.NumberColumn(format='percent'),
+                               '命中率': st.column_config.NumberColumn(format='percent'),
+                               '最低參考價': st.column_config.NumberColumn(format='%.3f')})
+        else:
+            st.warning('目前載入的資料不足，未能計算規則。')
+        st.caption('歷史樣本使用既有 V10 收盤主盤重建；不可和 T−30 的實時價格混為同一驗證。')
+    _days = st.selectbox('前瞻模擬查詢期間', (30, 90, 365), key='profitable_days_v1')
+    if st.button('讀取已鎖定的前瞻模擬', key='profitable_read_v1'):
+        try:
+            papers, settled = _profitable_read(_days)
+        except Exception:
+            st.error('未能讀取 Supabase 模擬旁表；不可把查詢失敗當成 0 注。')
+            return
+        if not papers:
+            st.info('所選期間未有已鎖定模擬，不代表 ROI 為 0。')
+            return
+        def settle(p, h, a):
+            args = (0, 0, h, a) if p['market'] == '角球大小' else (h, a, 0, 0)
+            return v9_unit_return(v9_diff(p['market'], p['side'], p['line'], *args), p['odds'])
+        results = pr.settled_returns(papers, settled, settle)
+        vals = [r['return'] for r in results if r['return'] is not None]
+        st.write(f'已鎖定 {len(results)} 注；以正式庫賽果可核對 {len(vals)} 注；其餘留空。'
+                 + (f'｜等額 ROI {sum(vals)/len(vals):+.2%}' if vals else '｜ROI 無估計'))
+        cohorts = {}
+        for p in results:
+            cohorts.setdefault((p['market'], p['stats']['rule']), []).append(p['return'])
+        grouped = []
+        for (market, rule), values in sorted(cohorts.items()):
+            known = [v for v in values if v is not None]
+            grouped.append({'盤口': market, '看盤規則': rule, '已鎖': len(values), '可核對': len(known),
+                            '模擬 ROI': sum(known)/len(known) if known else None,
+                            '模擬命中率': sum(v > 0 for v in known)/len(known) if known else None})
+        st.dataframe(pd.DataFrame(grouped), hide_index=True,
+                     column_config={k: st.column_config.NumberColumn(format='percent')
+                                    for k in ('模擬 ROI', '模擬命中率')})
+        st.dataframe(pd.DataFrame([{
+            '鎖定時間（香港）': p['observed'], '賽事 ID': p['mid'], '盤口': p['market'], '方向': p['side'],
+            '盤線': p['line'], '模擬價': p['odds'], '看盤規則': p['stats']['rule'], '單位盈虧': p['return']
+        } for p in results]), hide_index=True)
 
 
 def v10_apply_to_candidates(cands, kp_map, mode, settings, kp_engine, arena=None, league_ctx=None):
@@ -10776,6 +10953,7 @@ def _v162_follow_match_sections(open_df):
 def v162_render_follow_tab():
     """V16.2「👤 用家跟投」分頁：監察系統待結算注單 + 賽前分析結果，
     用家自行決定跟投 (自訂注碼) 或觀望。任何裝置可用 (含唯讀查看裝置)。"""
+    from fb_app_profitable_rules import frozen as frozen_rule
     st.subheader("👤 用家跟投 — 監察系統注單與分析，自行決定跟投或觀望")
     st.caption("💡 此分頁的數據全部來自雲端資料庫 (毋須執行賽前分析)：系統注單的"
                "模型概率 / 市場概率 / Edge / 閘門 / 近況 / 排名一目了然。勾選跟投並輸入"
@@ -10838,7 +11016,28 @@ def v162_render_follow_tab():
                                       'Model_Prob', 'Market_Prob', 'Edge', 'Gate',
                                       'System_Stake', 'User_Stake'] if c in _rows.columns]
             st.markdown("**系統注單及賽前分析：**")
-            st.dataframe(_rows[_disp_cols], use_container_width=True, hide_index=True)
+            _display = _rows[_disp_cols].copy()
+            _labels, _ns, _rois, _hits, _is_candidate = [], [], [], [], []
+            for _record in _rows.to_dict('records'):
+                _legacy, _eligible = frozen_rule(_record)
+                _rule = _eligible or _legacy
+                _is_candidate.append(bool(_eligible))
+                _labels.append(_rule['rule'] if _rule else '—')
+                _ns.append(_rule['n'] if _rule else None)
+                _rois.append(_rule['roi'] if _rule else None)
+                _hits.append(_rule['hit'] if _rule else None)
+            _display['看盤規則'] = _labels
+            _display['歷史樣本'] = _ns
+            _display['歷史 ROI'] = _rois
+            _display['命中率'] = _hits
+            _display['模擬候選'] = ['盈利看盤規則（候選）' if b else '' for b in _is_candidate]
+            _styled = _display.style.apply(
+                lambda col: ['background-color:#d9eee9;color:#163b38' if b else '' for b in _is_candidate],
+                subset=['看盤規則', '歷史樣本', '歷史 ROI', '命中率', '模擬候選'])
+            st.dataframe(_styled, use_container_width=True, hide_index=True,
+                         column_config={'歷史 ROI': st.column_config.NumberColumn(format='percent'),
+                                        '命中率': st.column_config.NumberColumn(format='percent')})
+            st.caption('這些欄位為建檔時凍結的歷史資料；舊注單無紀錄時留空。高亮只代表模擬候選，不代表已鎖模擬或建議實注。')
             if _followed:
                 st.markdown(f"**你已跟投的注單 ({_followed} 注)：**")
                 st.dataframe(_rows[_usr_stake > 0][_disp_cols], use_container_width=True, hide_index=True)
@@ -12416,7 +12615,12 @@ def main():
         st.sidebar.error("本分頁有未獲主儲存確認的 BET，已暫停自動化及注單寫入。"
                          "保持本頁並下載報表，先按注單 ID 核對正式庫；勿重送或按合併同步。")
     if has_sql:
-        st.sidebar.success("✅ 已連接 PostgreSQL/SQL 雲端資料庫")
+        st.sidebar.info("已設定 PostgreSQL/SQL；不代表當刻讀寫成功。")
+        _sql_seen = st.session_state.get('_fb_main_load_verified')
+        if _sql_seen:
+            st.sidebar.caption(f"本分頁上次完整主表讀取確認：{_sql_seen} 香港時間。")
+        elif _sql_seen == '':
+            st.sidebar.warning("本分頁最近一次完整主表載入未獲 SQL 確認；勿將後備資料當成最新。")
     elif has_gh:
         st.sidebar.success(f"✅ 已連接 GitHub 倉庫同步 (`{st.secrets['GITHUB_REPO']}`)")
     else:
@@ -12684,7 +12888,7 @@ def main():
     v1511_render_sched_status()   # V15.11：每日排程背景檢查 (每 5 分鐘)
     v16_render_clv_recorder()     # V16：開賽前 CLV 記錄器背景檢查 (每 5 分鐘)
 
-    t_pre, t_follow, t_inplay, t_settle, t_ai, t_time_pnl, t_clv = st.tabs(["📝 賽前建檔與投注", "👤 用家跟投", "⏱️ 即場賽事與預測", "⚖ 賽果結算與管理", "🤖 全局模型", "📅 時間維度盈虧記錄分析", "🎯 CLV 與本金模擬"])
+    t_pre, t_follow, t_inplay, t_settle, t_ai, t_time_pnl, t_clv, t_profit = st.tabs(["📝 賽前建檔與投注", "👤 用家跟投", "⏱️ 即場賽事與預測", "⚖ 賽果結算與管理", "🤖 全局模型", "📅 時間維度盈虧記錄分析", "🎯 CLV 與本金模擬", "盈利看盤規則"])
 
     with t_pre:
         st.subheader("📝 賽事建檔與智能盤口走勢分析")
@@ -13095,6 +13299,17 @@ def main():
                 except Exception as _kp_err:
                     kp_map = {}
                     st.warning(f"看盤引擎分析失敗，已改用 V9 模型: {_kp_err}")
+                _paper_map = {}
+                if _auto_inputs and (st.session_state.get('v15_auto') or {}).get('mode') == 'clv':
+                    _asof = clv_local(_auto_inputs['fill'].get('clv_observed'), zone=True)
+                    if _asof:
+                        try:
+                            _paper_engine = _profitable_engine(_profitable_history_input(st.session_state.df_db, _md_ts))
+                            _paper_map = v10_predict(_paper_engine, _auto_inputs['odds'], v9_ctx, hr_val, ar_val,
+                                                     hf_val, af_val, _md_ts, v9_set['min_ev'], _unk_now,
+                                                     sim_asof=_asof)
+                        except Exception:
+                            st.warning('盈利規則獨立模擬計算失敗；原策略不變。')
                 try:
                     arena = v11_get_arena(st.session_state.df_db)
                 except Exception as _ar_err:
@@ -13168,6 +13383,7 @@ def main():
                              v9_dimension_stats(df_settled, "C. 宏觀 (全局數據)")],
                     'engine': {k: engine.get(k) for k in ('trained', 'msg', 'w', 'kind', 'groups', 'n_matches', 'n_rows', 'll_market', 'll_model')},
                     'candidates': scored, 'picks': picks, 'paper_picks': paper_picks, 'kp_summary': kp_summary,
+                    'kp_frozen': kp_map, 'profitable_paper': _paper_map,
                     'auto_sys': v11_auto_sys_picks(scored, picks, _v15_set_autosys),  # V15.5：自動導入時強制預選
                     'arena_msg': arena.get('msg', ''), 'league_ctx': _league_ctx, 'no_rank': bool(no_rank),
                     'kp_engine': {k: kp_engine.get(k) for k in ('trained', 'msg', 'n_matches', 'n_rows')}, 'mode': v9_set['mode'],
@@ -13448,6 +13664,18 @@ def main():
             if (_v15_on('BET') and _auto_inputs) or (not _pre_automatic and
                     st.button(submit_btn_label, type="primary", use_container_width=True, disabled=not match_date)):
                 try:
+                    _paper_auto = st.session_state.get('v15_auto') or {}
+                    if _auto_inputs and _paper_auto.get('mode') == 'clv' and _profitable_paper_enabled():
+                        try:
+                            _picks_v1 = _profitable_lock(res.get('profitable_paper', {}), _auto_inputs,
+                                                         _paper_auto['queue'][_paper_auto['idx']].get('match_time'),
+                                                         get_hkt_now(), v9_set.get('corner_off', True))
+                            _saved_v1 = _profitable_write(_picks_v1)
+                            if _saved_v1:
+                                _v15_log(_paper_auto, f'盈利看盤規則：獨立旁表新增 {_saved_v1} 注 ($0)。')
+                        except Exception:
+                            _v15_log(_paper_auto, '盈利看盤規則：旁表寫入未獲確認，不當成已鎖定；原流程繼續。')
+                            st.warning('盈利看盤規則旁表未獲寫入確認。')
                     all_keys = set(sys_selected + usr_selected)
                     if not all_keys:
                         st.warning("⚠️ 請至少在系統或用家選擇一項投注！")
@@ -13585,6 +13813,16 @@ def main():
                                     _note = None
                                 if _note:
                                     new_record['Note'] = _note
+                                if (_auto_inputs and _auto_clv.get('mode') == 'clv'):
+                                    _kp_key = (cand['bet_type'], round(float(cand['line']), 3), cand['selection'])
+                                    _lookup = res.get('kp_frozen', {}).get(_kp_key, {})
+                                    if (cand.get('is_latest') is True and cand.get('is_offered') is True
+                                            and _lookup.get('lookup_odds') == float(cand['odds'])):
+                                        _paper_lookup = res.get('profitable_paper', {}).get(_kp_key, {})
+                                        pr.freeze(new_record, _lookup.get('kp_snapshot'),
+                                                  _paper_lookup.get('profitable_snapshot')
+                                                  if _note and _paper_lookup.get('lookup_odds') == float(cand['odds'])
+                                                  and _paper_lookup.get('snapshots', 0) >= 2 else None)
                             # V15.8：LR 落注閘門 — 凍結模型計算 Model_Prob / Market_Prob /
                             # Edge / Gate 四欄並寫入注單；讓球且 Edge ≤ 2% 時系統注碼強制 $0
                             # (只作記錄供學習，不實注；所有注單照常記錄，前向驗證對照組不變)。
@@ -13681,6 +13919,8 @@ def main():
     # --- V16.2 用家跟投分頁 ---
     with t_follow:
         v162_render_follow_tab()
+    with t_profit:
+        _profitable_show(st.session_state.df_db)
     with t_inplay:
         st.subheader("⏱ 即場賽事實時更新與智慧火力分析")
         
