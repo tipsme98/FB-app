@@ -93,11 +93,14 @@ def freeze(row, legacy, eligible=None):
 
 def frozen(row):
     h = history(row.get('Odds_History'))
-    if not h or not isinstance(h[0], dict):
+    if not h:
         return None, None
-    item = h[0].get(TAG)
-    if not isinstance(item, list) or len(item) != 3 or item[0] != terms(row):
+    key = terms(row)
+    found = [item for q in h if isinstance(q, dict)
+             if isinstance(item := q.get(TAG), list) and len(item) == 3 and item[0] == key]
+    if len(found) != 1:
         return None, None
+    item = found[0]
     def checked(r):
         if (not isinstance(r, dict) or not isinstance(r.get('rule'), str)
                 or type(r.get('n')) is not int or r['n'] < 1

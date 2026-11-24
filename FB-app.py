@@ -5456,8 +5456,13 @@ def _profitable_show(df):
     if not toggle:
         st.warning('自動模擬鎖定未啟用；本頁不會寫下注單，也不會以歷史資料補造前瞻紀錄。')
     if st.button('計算歷史候選規則', key='profitable_history_v1'):
-        eng = _profitable_engine(_profitable_history_input(df))
-        hist = eng.get('profitable', {})
+        try:
+            eng = _profitable_engine(_profitable_history_input(df))
+            st.session_state['_profitable_hist_display'] = eng.get('profitable', {})
+        except Exception:
+            st.session_state['_profitable_hist_display'] = None
+    if '_profitable_hist_display' in st.session_state:
+        hist = st.session_state['_profitable_hist_display']
         if hist:
             shown = sorted(hist.items(), key=lambda x: (not x[1]['active'], -x[1]['roi'], x[0]))
             st.dataframe(pd.DataFrame([{
@@ -5468,8 +5473,10 @@ def _profitable_show(df):
                 column_config={'歷史 ROI': st.column_config.NumberColumn(format='percent'),
                                '命中率': st.column_config.NumberColumn(format='percent'),
                                '最低參考價': st.column_config.NumberColumn(format='%.3f')})
-        else:
+        elif hist is not None:
             st.warning('目前載入的資料不足，未能計算規則。')
+        else:
+            st.error('歷史候選計算未完成；未把失敗當成沒有達標規則。')
         st.caption('歷史樣本使用既有 V10 收盤主盤重建；不可和 T−30 的實時價格混為同一驗證。')
     _days = st.selectbox('前瞻模擬查詢期間', (30, 90, 365), key='profitable_days_v1')
     if st.button('讀取已鎖定的前瞻模擬', key='profitable_read_v1'):

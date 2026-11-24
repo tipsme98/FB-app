@@ -55,6 +55,8 @@ class ProfitableRules(unittest.TestCase):
         self.assertEqual(pr.frozen(row), (None, a))
         self.assertEqual(json.loads(row['Odds_History'])[0]['upper'], 1.95)
         self.assertEqual(row['Note'], 'CLV_ENTRY_V1:test')
+        later = json.loads(row['Odds_History'])
+        self.assertEqual(pr.frozen({**row, 'Odds_History': json.dumps([{'type':'讓球'}, *later])}), (None, a))
         self.assertEqual(pr.frozen({**row, 'Initial_Odds': 2.0}), (None, None))
         self.assertEqual(pr.frozen({**row, 'ID': 'user-copy'}), (None, None))
 
