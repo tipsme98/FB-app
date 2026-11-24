@@ -11325,12 +11325,14 @@ def v162_render_follow_tab():
                 subset=['看盤規則', '歷史樣本', '歷史 ROI', '命中率', '狀態',
                         '單位盈虧', '反向單位盈虧', '反向ROI', '反向命中率'])
             st.dataframe(_styled, use_container_width=True, hide_index=True,
-                         column_config={'歷史 ROI': st.column_config.NumberColumn(format='percent'),
-                                        '命中率': st.column_config.NumberColumn(format='percent'),
-                                        '單位盈虧': st.column_config.NumberColumn(format='%.2f U'),
-                                        '反向單位盈虧': st.column_config.NumberColumn(format='%.2f U'),
-                                        '反向ROI': st.column_config.NumberColumn(format='percent'),
-                                        '反向命中率': st.column_config.NumberColumn(format='percent')})
+                         column_config={'看盤規則': st.column_config.TextColumn(width='medium'),
+                                        '歷史 ROI': st.column_config.NumberColumn(format='percent', width='small'),
+                                        '命中率': st.column_config.NumberColumn(format='percent', width='small'),
+                                        '狀態': st.column_config.TextColumn(width='small'),
+                                        '單位盈虧': st.column_config.NumberColumn(format='%.2f U', width='small'),
+                                        '反向單位盈虧': st.column_config.NumberColumn(format='%.2f U', width='medium'),
+                                        '反向ROI': st.column_config.NumberColumn(format='percent', width='small'),
+                                        '反向命中率': st.column_config.NumberColumn(format='percent', width='small')})
             st.caption('狀態以注單建檔日前已結算的資料重播判定（模擬候選／移出·待重入／未入選），'
                        '已凍結的注單沿用建檔時證據。單位盈虧、反向單位盈虧、反向ROI 及反向命中率為'
                        '該注單對應看盤規則的歷史／反向研究數值，不是這張注單的賽果，也不代表建議實注。')
