@@ -36,7 +36,7 @@ import fb_app_profitable_rules as pr
 # V16.4.11：自動分析及入庫只讀本批次已核對的快照，不讀手動表單的 widget。
 # V16.4.12：排程以有效日期及正式庫核對確認完成，不把缺值或掃描結束當成功。
 # V18：香港固定時段可各自啟用，沿用既有結算；原每日排程及歷史補建保留。
-FB_APP_RELEASE = 'V18.3.1'
+FB_APP_RELEASE = 'V18.3.2'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -5490,14 +5490,32 @@ def _profitable_show(df):
         hist, report = st.session_state['_profitable_report_v2']
         if report is not None:
             st.markdown('#### 全部規則樣本外盈虧')
-            _profitable_metrics(report['all'][scope])
+            _stat_pick = st.selectbox('規則樣本外盈虧', ('全部', *pr.STATUS), key='profitable_status_v1')
+            _summary = (report['all'][scope] if _stat_pick == '全部'
+                        else report.get('by_status', {}).get(scope, {}).get(_stat_pick))
+            if _summary and _summary.get('n'):
+                _profitable_metrics(_summary)
+            else:
+                st.info('所選狀態在此範圍沒有樣本；不代表 ROI 為 0。')
             st.caption('每次觸發一條原規則計 1 單位，重疊規則及兩邊可重複計數。這不是實注、候選旁表或單一投組。'
-                       '按周叢集重抽樣估 95% 區間；以篩選後有注的比賽日分前後兩半，同日不拆開。')
+                       '按周叢集重抽樣估 95% 區間；以篩選後有注的比賽日分前後兩半，同日不拆開。'
+                       '狀態以每段只用較早資料判定的規則分類，同一批注會因狀態不同而分開呈現。')
             with st.expander('反向盈虧對照（只讀研究，不自動下注）'):
                 st.caption('每段只以較早資料選歷史樣本 >40、ROI <−10%、命中率 <40% 的規則；'
                            '逐筆以同盤對家的賠率、盤線及正式結算口徑重算，非把原盈虧改符號。'
                            '同規則兩邊都觸發則跳過。這是歷史對照，不寫下注單、旁表或實注。')
-                _profitable_metrics(report['reverse'][scope])
+                _sign = st.radio('反向盈虧對照', ('總體', '反向單位盈虧>0', '反向單位盈虧<0'),
+                                 horizontal=True, key='profitable_reverse_sign_v1')
+                if _sign == '總體':
+                    _rev = report['reverse'][scope]
+                else:
+                    _rev = report.get('reverse_sign', {}).get(scope, {}).get(
+                        'positive' if '>0' in _sign else 'negative')
+                if _rev and _rev.get('n'):
+                    _profitable_metrics(_rev)
+                else:
+                    st.info('此分組在這個範圍沒有樣本；不代表 ROI 為 0。')
+                st.caption('正／負分組按每條規則在整段研究的反向單位盈虧劃分；零盈虧不歸入任何一組。')
                 reverse = [r for r in report['reverse_rules'] if scope == '總體' or r['market'] == scope]
                 if reverse:
                     view = pd.DataFrame([{
@@ -5516,6 +5534,28 @@ def _profitable_show(df):
                         st.download_button('下載逐筆反向模擬盈虧', detail.to_csv(index=False).encode('utf-8-sig'),
                                            'reverse-odds-research-detail.csv', 'text/csv',
                                            key='profitable_reverse_detail_v2')
+                st.markdown('##### 弱規則：樣本 >40、賠率 ≥1.8、ROI <−10%、命中率 <40%')
+                st.caption('在同一時間折分內，只以較早資料同時符合四項條件的規則；顯示其後樣本外的原向及反向表現。'
+                           '賠率取該規則歷史平均賠率。這是研究對照，不是入選或下注條件。')
+                _weak = report.get('weak', {}).get(scope)
+                if _weak and _weak.get('n'):
+                    _profitable_metrics(_weak)
+                else:
+                    st.info('此範圍沒有同時符合四項條件的樣本外規則。')
+                _weak_rules = [r for r in report.get('weak_rules', [])
+                               if scope == '總體' or r['market'] == scope]
+                if _weak_rules:
+                    _wview = pd.DataFrame([{
+                        '盤口': r['market'], '看盤規則': r['rule'], '歷史樣本': r['sample'],
+                        '平均賠率': r['odds'], '原向注數': r['original']['n'], '原向ROI': r['original']['roi'],
+                        '反向注數': r['opposite']['n'], '反向ROI': r['opposite']['roi'],
+                        '反向單位盈虧': r['opposite']['net'], '反向命中率': r['opposite']['hit'],
+                    } for r in _weak_rules])
+                    st.dataframe(_wview, hide_index=True, column_config={
+                        col: st.column_config.NumberColumn(format='percent')
+                        for col in ('原向ROI','反向ROI','反向命中率')})
+                    st.download_button('下載弱規則對照', _wview.to_csv(index=False).encode('utf-8-sig'),
+                                       'weak-rule-research.csv', 'text/csv', key='profitable_weak_export_v1')
         st.markdown('#### 歷史候選規則')
         if hist:
             shown = sorted((x for x in hist.items() if scope == '總體' or x[0][0] == scope),
@@ -11026,6 +11066,159 @@ def _v162_follow_match_sections(open_df):
     return [(key, rows) for _, key, rows in ranked]
 
 
+def _follow_analysis(df_db):
+    """Session memo of the rule replay used by the follow tab (no writes)."""
+    try:
+        sig = (len(df_db), str(df_db['Date'].max()), str(df_db['ID'].iloc[-1]))
+    except Exception:
+        sig = (len(df_db), '', '')
+    box = st.session_state.get('_follow_analysis_v1')
+    if box and box.get('sig') == sig:
+        return box.get('data')
+    data = None
+    try:
+        D = _profitable_design(_profitable_history_input(df_db))
+        if not D.empty:
+            coef = v10_fit_resid(D)
+            D = v10_apply_resid(D, coef)
+            names, M = v10_rule_matrix(D)
+            hist = pr.historical(D, M, names)
+            folds = v9_folds(D['date'], n_folds=6, init_frac=.4)
+            report = pr.chronological_research(D, folds, v10_fit_resid, v10_apply_resid, v10_rule_matrix)
+            data = dict(D=D, names=names, M=M, coef=coef, hist=hist, report=report)
+    except Exception:
+        data = None
+    st.session_state['_follow_analysis_v1'] = {'sig': sig, 'data': data}
+    return data
+
+
+def _follow_open_design(df_db, open_df, coef):
+    """Rebuild the closing-main-line features of unplayed matches from their own
+    odds history, using only settled matches for team context. No goals needed."""
+    settled = df_db[df_db['Status'].astype(str) == 'Settled']
+    mt_hist = v9_build_match_table(settled)
+    if mt_hist is None or mt_hist.empty:
+        return pd.DataFrame()
+    tl_hist = v9_team_long(mt_hist)
+    d = open_df.copy()
+    d['_md'] = pd.to_datetime(d['Match_Date'], errors='coerce')
+    d['_dt'] = pd.to_datetime(d['Date'], errors='coerce')
+    d['_md'] = d['_md'].fillna(d['_dt'].dt.normalize())
+    d = d[d['_md'].notna() & d['Match'].notna()]
+    rows = []
+    for (match, md), g in d.groupby(['Match', '_md'], sort=False):
+        src = g[~g['Bet_Type'].astype(str).str.contains('即場', na=False)]
+        best_oh, best_len = [], -1
+        for s in (src if not src.empty else g)['Odds_History'].dropna():
+            try:
+                oh = json.loads(str(s))
+                if isinstance(oh, list) and len(oh) > best_len:
+                    best_oh, best_len = oh, len(oh)
+            except Exception:
+                continue
+        if not best_oh:
+            continue
+        snaps = v10_snapshots(best_oh, md)
+        if not snaps:
+            continue
+        r0 = g.iloc[0]
+        ls = get_league_size(r0)
+        unk = v11_strength_unknown(r0.get('Home_Rating'), r0.get('Away_Rating'), ls,
+                                   r0.get('Tournament_Name', ''), r0.get('Tournament_Category'))
+        hs = 3.0 if unk else v9_strength(r0.get('Home_Rating'), ls)
+        as_ = 3.0 if unk else v9_strength(r0.get('Away_Rating'), ls)
+        hfp = float(extract_form_points(r0.get('Home_Form', '0W0D0L')))
+        afp = float(extract_form_points(r0.get('Away_Form', '0W0D0L')))
+        home, away = str(r0.get('Home_Team', '')), str(r0.get('Away_Team', ''))
+        tourn = str(r0.get('Tournament_Name', ''))
+        try:
+            ctx = v9_match_context(mt_hist, tl_hist, home, away, tourn, md, hs, as_, hfp, afp)
+        except Exception:
+            continue
+        for r in v10_market_rows(snaps, ctx, hs, as_, hfp, afp, bool(unk)):
+            r['key'] = f"{match}|{md.strftime('%Y-%m-%d')}"
+            r['date'] = md
+            r['match'] = match
+            r['tourn'] = tourn
+            rows.append(r)
+    D = pd.DataFrame(rows)
+    if D.empty:
+        return D
+    return v10_apply_resid(D.reset_index(drop=True), coef)
+
+
+def _follow_rule_states(df_db, open_df, data):
+    """Map every open system order to one rule and its build-time status.
+
+    Frozen evidence wins. Orders built before the freeze existed are matched to
+    the unique rule that fires on the same match, market and side; the status is
+    replayed only up to the order's build date. No stored row is modified.
+    """
+    from fb_app_profitable_rules import frozen as frozen_rule, frozen_display
+    out = {}
+    hist = data.get('hist') or {}
+    report = data.get('report', {}) or {}
+    reverse = {(r['market'], r['rule']): r for r in report.get('reverse_rules', [])}
+    opposite = report.get('opposite') or {}
+    Dad = data.get('D')
+    names_all = data.get('names') or []
+    asof_cache = {}
+
+    def pack(rule, status, mkt):
+        if not rule:
+            return dict(status=status or '未入選', rule=None)
+        name = rule.get('rule')
+        stats = hist.get((mkt, name)) or rule
+        rv = (opposite.get((mkt, name)) or (reverse.get((mkt, name)) or {}).get('opposite') or {})
+        return dict(status=status or '未入選', rule=name,
+                    n=stats.get('n'), roi=stats.get('roi'), hit=stats.get('hit'),
+                    net=(stats['roi'] * stats['n']) if stats.get('roi') is not None and stats.get('n') else None,
+                    rv_net=rv.get('net'), rv_roi=rv.get('roi'), rv_hit=rv.get('hit'))
+
+    D_open = _follow_open_design(df_db, open_df, data['coef']) if data.get('coef') is not None else pd.DataFrame()
+    idx = {}
+    names_open, M_open = [], None
+    if not D_open.empty:
+        names_open, M_open = v10_rule_matrix(D_open)
+        for i, r in enumerate(D_open.itertuples(index=False)):
+            idx.setdefault((r.key, r.bet_type, r.side), []).append(i)
+
+    for row in open_df.to_dict('records'):
+        rid = str(row.get('ID'))
+        legacy, eligible = frozen_rule(row)
+        bt = v9_clean_bt(str(row.get('Bet_Type') or ''))
+        if eligible:
+            out[rid] = pack(eligible, '模擬候選', bt)
+            continue
+        derived = None
+        md = str(row.get('Match_Date') or '')[:10]
+        ii = idx.get((f"{row.get('Match')}|{md}", bt, str(row.get('Selection') or '')), [])
+        if ii and M_open is not None:
+            fired = [names_open[j] for j in np.flatnonzero(M_open[ii[0]])
+                     if (bt, names_open[j]) in hist]
+            if fired:
+                fired.sort(key=lambda n: (not hist[(bt, n)]['active'],
+                                          -hist[(bt, n)]['roi'], -hist[(bt, n)]['n'], n))
+                derived = fired[0]
+        if derived:
+            bdate = str(row.get('Date') or '')[:10]
+            if bdate not in asof_cache:
+                try:
+                    asof_cache[bdate] = pr.historical(Dad, data['M'], names_all,
+                                                      until=np.datetime64(bdate))
+                except Exception:
+                    asof_cache[bdate] = {}
+            status = pr.rule_status(asof_cache[bdate].get((bt, derived), {}))
+            out[rid] = pack(hist.get((bt, derived), {'rule': derived}), status, bt)
+            continue
+        rule, status = frozen_display(legacy, eligible)
+        if rule:
+            out[rid] = pack(rule, status, bt)
+        else:
+            out[rid] = dict(status='未入選', rule=None)
+    return out
+
+
 def v162_render_follow_tab():
     """V16.2「👤 用家跟投」分頁：監察系統待結算注單 + 賽前分析結果，
     用家自行決定跟投 (自訂注碼) 或觀望。任何裝置可用 (含唯讀查看裝置)。"""
@@ -11069,6 +11262,12 @@ def v162_render_follow_tab():
         st.info("📭 目前沒有待結算注單。")
         return
 
+    with st.spinner("正在對照歷史候選規則（首次約 20–30 秒，之後同一版本即時顯示）..."):
+        _fdata = _follow_analysis(df_db)
+        _rule_map = _follow_rule_states(df_db, open_df, _fdata) if _fdata else {}
+    if not _fdata:
+        st.warning("規則重建暫時失敗；以下只顯示已凍結的規則證據，未把缺失當成「未入選」。")
+
     for (_tourn, _match, _md), _rows in sections:
         _md = _md[:10]
         _sys_stake = pd.to_numeric(_rows['System_Stake'], errors='coerce').fillna(0)
@@ -11093,28 +11292,48 @@ def v162_render_follow_tab():
                                       'System_Stake', 'User_Stake'] if c in _rows.columns]
             st.markdown("**系統注單及賽前分析：**")
             _display = _rows[_disp_cols].copy()
-            _labels, _ns, _rois, _hits, _states = [], [], [], [], []
+            (_labels, _ns, _rois, _hits, _states,
+             _nets, _rvnets, _rvrois, _rvhits) = ([] for _ in range(9))
             for _record in _rows.to_dict('records'):
-                _legacy, _eligible = frozen_rule(_record)
-                _rule, _status = frozen_display(_legacy, _eligible)
-                _states.append(_status)
-                _labels.append(_rule['rule'] if _rule else '—')
-                _ns.append(_rule['n'] if _rule else None)
-                _rois.append(_rule['roi'] if _rule else None)
-                _hits.append(_rule['hit'] if _rule else None)
+                _info = _rule_map.get(str(_record.get('ID'))) or {}
+                if not _info:
+                    _legacy, _eligible = frozen_rule(_record)
+                    _rule, _status = frozen_display(_legacy, _eligible)
+                    _info = dict(status=_status, rule=(_rule or {}).get('rule'),
+                                 n=(_rule or {}).get('n'), roi=(_rule or {}).get('roi'),
+                                 hit=(_rule or {}).get('hit'))
+                _states.append(_info.get('status') or '')
+                _labels.append(_info.get('rule') or '—')
+                _ns.append(_info.get('n'))
+                _rois.append(_info.get('roi'))
+                _hits.append(_info.get('hit'))
+                _nets.append(_info.get('net'))
+                _rvnets.append(_info.get('rv_net'))
+                _rvrois.append(_info.get('rv_roi'))
+                _rvhits.append(_info.get('rv_hit'))
             _display['看盤規則'] = _labels
             _display['歷史樣本'] = _ns
             _display['歷史 ROI'] = _rois
             _display['命中率'] = _hits
             _display['狀態'] = _states
+            _display['單位盈虧'] = _nets
+            _display['反向單位盈虧'] = _rvnets
+            _display['反向ROI'] = _rvrois
+            _display['反向命中率'] = _rvhits
             _styled = _display.style.apply(
                 lambda col: ['background-color:#d9eee9;color:#163b38' if s == rule_states[0] else '' for s in _states],
-                subset=['看盤規則', '歷史樣本', '歷史 ROI', '命中率', '狀態'])
+                subset=['看盤規則', '歷史樣本', '歷史 ROI', '命中率', '狀態',
+                        '單位盈虧', '反向單位盈虧', '反向ROI', '反向命中率'])
             st.dataframe(_styled, use_container_width=True, hide_index=True,
                          column_config={'歷史 ROI': st.column_config.NumberColumn(format='percent'),
-                                        '命中率': st.column_config.NumberColumn(format='percent')})
-            st.caption('狀態與歷史候選表用同一套名稱，這裡顯示建檔當時的狀態；舊注單無紀錄時留空。'
-                       '高亮不代表已鎖模擬或建議實注。')
+                                        '命中率': st.column_config.NumberColumn(format='percent'),
+                                        '單位盈虧': st.column_config.NumberColumn(format='%.2f U'),
+                                        '反向單位盈虧': st.column_config.NumberColumn(format='%.2f U'),
+                                        '反向ROI': st.column_config.NumberColumn(format='percent'),
+                                        '反向命中率': st.column_config.NumberColumn(format='percent')})
+            st.caption('狀態以注單建檔日前已結算的資料重播判定（模擬候選／移出·待重入／未入選），'
+                       '已凍結的注單沿用建檔時證據。單位盈虧、反向單位盈虧、反向ROI 及反向命中率為'
+                       '該注單對應看盤規則的歷史／反向研究數值，不是這張注單的賽果，也不代表建議實注。')
             if _followed:
                 st.markdown(f"**你已跟投的注單 ({_followed} 注)：**")
                 st.dataframe(_rows[_usr_stake > 0][_disp_cols], use_container_width=True, hide_index=True)

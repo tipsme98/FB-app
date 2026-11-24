@@ -198,6 +198,87 @@ a._profitable_show(pd.DataFrame())
         self.assertFalse(at.exception)
         self.assertIn('不可把查詢失敗當成 0 注', at.error[0].value)
 
+    def test_status_split_reverse_sign_and_price_weak_rules(self):
+        rows = []
+        for i in range(44):
+            d = pd.Timestamp('2026-01-01') + pd.Timedelta(days=i)
+            good = i < 30
+            rows.extend([
+                dict(date=d, bet_type='讓球', key=f'{i}a', line=.25, nsnap=2, side='Home',
+                     ret=(-1. if i == 43 else 1.), odds=2.0, g=good, b=False),
+                dict(date=d, bet_type='讓球', key=f'{i}a', line=.25, nsnap=2, side='Away',
+                     ret=(1. if i == 43 else -1.), odds=2.0, g=False, b=False),
+                dict(date=d, bet_type='讓球', key=f'{i}b', line=.5, nsnap=2, side='Home',
+                     ret=(-1.), odds=1.9, g=False, b=True),
+                dict(date=d, bet_type='讓球', key=f'{i}b', line=.5, nsnap=2, side='Away',
+                     ret=(.95), odds=2.1, g=False, b=False),
+            ])
+        frame = pd.DataFrame(rows)
+        start = pd.Timestamp('2026-02-12')
+        def masks(d, n=None):
+            return ['GOOD', 'BAD'], d[['g', 'b']].to_numpy()
+        out = pr.chronological_research(frame, [(start, start + pd.Timedelta(days=1))],
+                                        lambda t: None, lambda d, c: d, masks)
+        self.assertEqual(sum(v['n'] for v in out['by_status']['總體'].values()),
+                         out['all']['總體']['n'])
+        self.assertEqual(sum(v['n'] for v in out['reverse_sign']['總體'].values())
+                         + sum(1 for r in out['reverse_rules']
+                               if r['opposite']['net'] == 0), out['reverse']['總體']['n'])
+        self.assertEqual([r['rule'] for r in out['weak_rules']], ['BAD'])
+        self.assertAlmostEqual(out['weak']['總體']['roi'], -1.)
+        self.assertAlmostEqual(out['weak_opposite']['總體']['roi'], .95)
+
+    def test_historical_until_freezes_build_time_status(self):
+        frame = pd.DataFrame([
+            dict(date=pd.Timestamp('2026-01-01') + pd.Timedelta(days=i), bet_type='讓球',
+                 ret=(1. if i < 25 else -1.), odds=2.0)
+            for i in range(60)])
+        M = np.ones((len(frame), 1), dtype=bool)
+        self.assertEqual(pr.historical(frame, M, ['R'], until=np.datetime64('2026-01-30')), {})
+        mid = pr.historical(frame, M, ['R'], until=np.datetime64('2026-02-15'))
+        self.assertTrue(mid[('讓球', 'R')]['active'])
+        self.assertFalse(pr.historical(frame, M, ['R'])[('讓球', 'R')]['active'])
+
+    def test_new_filters_and_weak_table_render(self):
+        stub = """
+import sys
+sys.path.insert(0, {root!r})
+import importlib.util
+import pandas as pd
+s = importlib.util.spec_from_file_location('fb_ui_filters', {src!r})
+a = importlib.util.module_from_spec(s)
+s.loader.exec_module(a)
+a._profitable_paper_enabled = lambda: False
+def rep(df):
+    row = dict(n=41, roi=.07, net=1, hit=.6, ci=[.01,.10], first=.05, second=.07)
+    mk = lambda n: dict(row, n=n)
+    report = {{k: {{m: mk(1) for m in ('總體','讓球','入球大小','角球大小')}} for k in ('all','reverse')}}
+    report['by_status'] = {{m: {{s: mk(5) for s in ('模擬候選','移出／待重入','未入選')}}
+                            for m in ('總體','讓球','入球大小','角球大小')}}
+    report['reverse_sign'] = {{m: {{'positive': mk(2), 'negative': mk(3)}}
+                              for m in ('總體','讓球','入球大小','角球大小')}}
+    report['weak'] = {{m: mk(4) for m in ('總體','讓球','入球大小','角球大小')}}
+    report['weak_opposite'] = report['weak']
+    report['weak_rules'] = [dict(market='讓球', rule='W', sample=50, odds=2.1,
+                                 original=mk(4), opposite=mk(4))]
+    report['reverse_rules'] = [dict(market='讓球', rule='R', original=row, opposite=row)]
+    report['reverse_detail'] = []
+    hist = {{('讓球','H'): dict(row, avg=1.9, floor=1.8, active=True, ever=True),
+             ('入球大小','G'): dict(row, avg=1.9, floor=1.8, active=False, ever=True)}}
+    return hist, report
+a._profitable_report = rep
+a._profitable_show(pd.DataFrame())
+""".format(root=str(Path(__file__).parents[1]), src=str(Path(__file__).parents[1]/'FB-app.py'))
+        at = AppTest.from_string(stub).run()
+        at.button(key='profitable_history_v1').click().run()
+        self.assertFalse(at.exception)
+        at.selectbox(key='profitable_status_v1').set_value('模擬候選').run()
+        self.assertEqual(at.dataframe[0].value['樣本外注數'].iloc[0], 5)
+        at.radio(key='profitable_reverse_sign_v1').set_value('反向單位盈虧<0').run()
+        self.assertEqual(at.dataframe[1].value['樣本外注數'].iloc[0], 3)
+        self.assertEqual(at.dataframe[3].value['樣本外注數'].iloc[0], 4)
+        self.assertEqual(at.dataframe[4].value['看盤規則'].tolist(), ['W'])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -40,8 +40,13 @@ def _earned(n, total, wins):
     return (n > MIN_N) & (total > (TARGET + EPS) * n) & (wins > (HIT + EPS) * n)
 
 
-def historical(D, matrix, names, *, price_guard=True):
-    """Replay admissions by settled match day; positive but weaker rules stay in."""
+def historical(D, matrix, names, *, price_guard=True, until=None):
+    """Replay admissions by settled match day; positive but weaker rules stay in.
+
+    `until` freezes the replay at that match day (inclusive) so the status of a
+    rule at the moment an order was built can be reproduced without rewriting
+    any stored record.
+    """
     if D.empty:
         return {}
     out = {}
@@ -54,6 +59,9 @@ def historical(D, matrix, names, *, price_guard=True):
         order = np.argsort(dates[valid], kind='stable')
         dates, odds, ret = (x[valid][order] for x in (dates, odds, ret))
         M = matrix[sub][valid][order]
+        if until is not None and len(dates):
+            keep = dates <= np.datetime64(until)
+            dates, odds, ret, M = dates[keep], odds[keep], ret[keep], M[keep]
         if not len(dates):
             continue
         n = np.zeros(len(names), dtype=int)
@@ -185,11 +193,25 @@ def _daily_summary(day_map):
     return result
 
 
+def _merge_days(maps):
+    out = {}
+    for day_map in maps:
+        for day, part in day_map.items():
+            out[day] = out[day] + part if day in out else part
+    return out
+
+
 def chronological_research(design, folds, fit, apply, matrix):
-    """All-rule and reverse comparison only. This code cannot create an order."""
+    """All-rule, status-split, weak-rule and reverse comparison. Cannot create an order."""
     totals = {m:{} for m in ('總體', *MARKETS)}
     reverse_totals = {m:{} for m in totals}
+    status_totals = {m:{s:{} for s in STATUS} for m in totals}
+    weak_totals = {m:{} for m in totals}
+    weak_opposite = {m:{} for m in totals}
     reverse_by_rule = {}
+    opposite_by_rule = {}
+    weak_by_rule = {}
+    weak_meta = {}
     reverse_detail = []
     covered = set()
     def record(target, day, values, weights=None):
@@ -209,6 +231,15 @@ def chronological_research(design, folds, fit, apply, matrix):
         for m in MARKETS:
             name_index = [j for j,name in enumerate(names)
                           if (r := stats.get((m,name))) and r['n']>40 and r['roi']<-.10-EPS and r['hit']<.40-EPS]
+            # Same admission test plus a price floor: a reverse candidate priced
+            # below 1.80 cannot turn a loss into a profit even at 100% hit rate.
+            weak_index = [j for j,name in enumerate(names)
+                          if (r := stats.get((m,name))) and r['n']>40 and r['roi']<-.10-EPS
+                          and r['hit']<.40-EPS and r['avg']+EPS>=1.8]
+            for j in weak_index:
+                weak_meta[(m,names[j])] = dict(stats[(m,names[j])])
+            stat_of = [rule_status(stats.get((m,name), {})) for name in names]
+            cls = {s: np.array([v==s for v in stat_of], dtype=bool) for s in STATUS}
             md = test[test['bet_type'].eq(m)]
             for d, group in md.groupby('date', sort=True):
                 datum = d.to_pydatetime()
@@ -223,7 +254,11 @@ def chronological_research(design, folds, fit, apply, matrix):
                 keep = valid & (weights>0)
                 for k in (m,'總體'):
                     record(totals[k], datum, vals[keep], weights[keep])
-                if not name_index:
+                    for s in STATUS:
+                        ws = (active & cls[s]).sum(axis=1)
+                        ks = valid & (ws>0)
+                        record(status_totals[k][s], datum, vals[ks], ws[ks])
+                if not (name_index or weak_index):
                     continue
                 # Look up the opposite side from the same reconstructed main quote,
                 # never use 1-hit or -ROI. Require a unique opposite for each row.
@@ -232,10 +267,21 @@ def chronological_research(design, folds, fit, apply, matrix):
                             group['nsnap'],group['side'],valid)):
                     if ok:
                         paired.setdefault((key,round(line,6),nsnap),[]).append((i,side))
+                rule_ids = range(len(names))
                 for (_,line,_), members in paired.items():
                     if len(members)!=2 or {s for _,s in members} not in ({'Home','Away'},{'Over','Under'}):
                         continue
                     (a,_),(b,_) = members
+                    # Opposite-side return of every rule that fires on exactly one
+                    # side of the same reconstructed quote (no threshold applied).
+                    fa, fb = np.atleast_1d(active[a]), np.atleast_1d(active[b])
+                    one = np.atleast_2d(fa ^ fb)
+                    opp_vals = np.atleast_2d(np.where(fa, vals[b], vals[a]))
+                    for j in rule_ids:
+                        hit = one[:, j]
+                        if hit.any():
+                            record(opposite_by_rule.setdefault((m,names[j]), {}),
+                                   datum, opp_vals[hit, j])
                     for j in name_index:
                         if active[a,j] == active[b,j]:
                             continue  # neither triggers, or a conflicting two-sided rule
@@ -251,8 +297,39 @@ def chronological_research(design, folds, fit, apply, matrix):
                                                    opposite_return=float(vals[opposite])))
                         for k in (m,'總體'):
                             record(reverse_totals[k],datum,vals[[opposite]])
+                    for j in weak_index:
+                        if active[a,j] == active[b,j]:
+                            continue
+                        original, opposite = (a,b) if active[a,j] else (b,a)
+                        own = weak_by_rule.setdefault((m,names[j]), ({},{}))
+                        record(own[0],datum,vals[[original]])
+                        record(own[1],datum,vals[[opposite]])
+                        for k in (m,'總體'):
+                            record(weak_totals[k],datum,vals[[original]])
+                            record(weak_opposite[k],datum,vals[[opposite]])
+    reverse_sign = {}
+    for m in totals:
+        groups = {'positive': [], 'negative': []}
+        for (rm,_rule),(before,after) in reverse_by_rule.items():
+            if m != '總體' and rm != m:
+                continue
+            s = _daily_summary(after)
+            if s['net'] > 0:
+                groups['positive'].append(after)
+            elif s['net'] < 0:
+                groups['negative'].append(after)
+        reverse_sign[m] = {k: _daily_summary(_merge_days(v)) for k, v in groups.items()}
     return dict(all={m:_daily_summary(day) for m,day in totals.items()},
+                by_status={m:{s:_daily_summary(d) for s,d in v.items()} for m,v in status_totals.items()},
                 reverse={m:_daily_summary(day) for m,day in reverse_totals.items()},
+                reverse_sign=reverse_sign,
+                opposite={k:_daily_summary(v) for k,v in opposite_by_rule.items()},
+                weak={m:_daily_summary(day) for m,day in weak_totals.items()},
+                weak_opposite={m:_daily_summary(day) for m,day in weak_opposite.items()},
+                weak_rules=[dict(market=m, rule=rule, odds=weak_meta.get((m,rule),{}).get('avg'),
+                                 sample=weak_meta.get((m,rule),{}).get('n'),
+                                 original=_daily_summary(before), opposite=_daily_summary(after))
+                            for (m,rule),(before,after) in sorted(weak_by_rule.items())],
                 reverse_detail=reverse_detail,
                 reverse_rules=[dict(market=m, rule=rule, original=_daily_summary(before),
                                     opposite=_daily_summary(after))

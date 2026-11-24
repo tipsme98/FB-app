@@ -25,6 +25,8 @@ _v162_runner_mode_on = lambda: True
 _v162_is_runner = lambda: False
 _v162_hb_fresh = lambda: True
 _v161_refresh_db_from_sql = lambda: None
+_follow_analysis = lambda df: None
+_follow_rule_states = lambda *a, **k: {}
 def save_db(df, filename, table):
     assert filename == 'football_betting_db.csv' and table == 'football_bets'
     st.session_state['test_writes'] = st.session_state.get('test_writes', 0) + 1
