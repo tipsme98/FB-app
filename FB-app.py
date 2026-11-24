@@ -11329,8 +11329,8 @@ def v162_render_follow_tab():
                                         '歷史 ROI': st.column_config.NumberColumn(format='percent', width='small'),
                                         '命中率': st.column_config.NumberColumn(format='percent', width='small'),
                                         '狀態': st.column_config.TextColumn(width='small'),
-                                        '單位盈虧': st.column_config.NumberColumn(format='%.2f U', width='small'),
-                                        '反向單位盈虧': st.column_config.NumberColumn(format='%.2f U', width='medium'),
+                                        '單位盈虧': st.column_config.NumberColumn(format='%.2f U', width='medium'),
+                                        '反向單位盈虧': st.column_config.NumberColumn(format='%.2f U', width='large'),
                                         '反向ROI': st.column_config.NumberColumn(format='percent', width='small'),
                                         '反向命中率': st.column_config.NumberColumn(format='percent', width='small')})
             st.caption('狀態以注單建檔日前已結算的資料重播判定（模擬候選／移出·待重入／未入選），'
