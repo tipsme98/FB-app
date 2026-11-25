@@ -1,2 +1,2 @@
 active,rounds,mode,daily,daily_verified,rdate,win,total,idx,done,bets,failed,sid,owner,step,finished,updated,updated_ts,log
-1,,clv,0,0,2026-11-25,,16,0,0,0,0,S20261125173114-13bc301917a74817aeca60ca3089b0a9,42b675f9cd5d4d0d91868b969edd7b47,FILL,0,2026-11-25 17:31:14,1795599074,"[[""11-25 17:31:14"", ""info"", ""🎯 V16 開賽前 CLV 記錄自動啟動：16 場即將開賽 (開賽前 30 分鐘觸發) — 自動 填充 → 分析 → 投注；Initial_Odds = 下注時真實市價，收盤價翌晨結算時自動補上 → CLV 自動計算""]]"
+1,,clv,0,0,2026-11-25,,1,0,0,0,0,S20261125175308-340c0ed354484085a1f639bfa09331fe,6e59095735ab4d64ad5c723ca7b6c5c6,FILL,0,2026-11-25 17:53:08,1795600388,"[[""11-25 17:53:08"", ""info"", ""🎯 V16 開賽前 CLV 記錄自動啟動：1 場即將開賽 (開賽前 30 分鐘觸發) — 自動 填充 → 分析 → 投注；Initial_Odds = 下注時真實市價，收盤價翌晨結算時自動補上 → CLV 自動計算""]]"
