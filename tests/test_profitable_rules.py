@@ -40,6 +40,17 @@ class ProfitableRules(unittest.TestCase):
         self.assertTrue(hist([base, [-.05]*30, [.05]*20])['active'])
         self.assertFalse(hist([[1]*101, [-1]*90])['active'])   # hit 52.9%, ROI +5.8%
 
+    def test_default_window_starts_on_2026_11_24(self):
+        from datetime import date
+        self.assertEqual(app._profitable_default_window((date(2026, 2, 28), date(2026, 11, 25))),
+                         (date(2026, 11, 24), date(2026, 11, 25)))
+        # data ends before the default start -> clamp to the latest day
+        self.assertEqual(app._profitable_default_window((date(2026, 2, 28), date(2026, 11, 20))),
+                         (date(2026, 11, 20), date(2026, 11, 20)))
+        # data starts after the default start -> keep the data start
+        self.assertEqual(app._profitable_default_window((date(2026, 12, 1), date(2026, 12, 5))),
+                         (date(2026, 12, 1), date(2026, 12, 5)))
+
     def test_price_weights_and_best(self):
         r = hist([[.5]*72 + [-.5]*24+[0]*24])
         self.assertAlmostEqual(r['floor'], 1+(12+3.6)/36)

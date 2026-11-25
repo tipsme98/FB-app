@@ -9,7 +9,7 @@ import requests
 import itertools
 from copy import deepcopy
 from tempfile import NamedTemporaryFile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 from fb_app_clv_cohorts import (
     ENTRY as CLV_ENTRY, QUOTE as CLV_QUOTE, classify as classify_clv,
@@ -36,7 +36,7 @@ import fb_app_profitable_rules as pr
 # V16.4.11：自動分析及入庫只讀本批次已核對的快照，不讀手動表單的 widget。
 # V16.4.12：排程以有效日期及正式庫核對確認完成，不把缺值或掃描結束當成功。
 # V18：香港固定時段可各自啟用，沿用既有結算；原每日排程及歷史補建保留。
-FB_APP_RELEASE = 'V18.3.5'
+FB_APP_RELEASE = 'V18.3.6'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -5387,6 +5387,15 @@ def _profitable_date_bounds(df):
     return d[ok].min().date(), d[ok].max().date()
 
 
+PROFITABLE_DEFAULT_FROM = date(2026, 11, 24)  # 樣本外日期區間的預設起始日
+
+
+def _profitable_default_window(bounds):
+    """Default window: 2026-11-24 to the latest settled day, clamped to data."""
+    lo, hi = bounds
+    return max(lo, min(PROFITABLE_DEFAULT_FROM, hi)), hi
+
+
 def _profitable_history_input(df, before=None):
     if df.empty:
         return df
@@ -5506,14 +5515,15 @@ def _profitable_show(df):
     st.subheader('看盤規則盈虧')
     scope = st.selectbox('看盤規則盈虧範圍', ('總體', *pr.MARKETS), key='profitable_scope_v2')
     st.info('全部看盤研究、獨立 $0 候選模擬及反向研究分開。現有實注、注碼及熔斷不變。')
+    st.caption('預設日期區間由 2026-11-24 起至資料最新一日，可自行改動後再按「計算歷史候選規則」。')
     st.caption('首次及重入：歷史樣本 >100、ROI >3%、命中 >55%，三項必須同時符合；任一項跌穿即移出（不再等累計 ROI 轉負）。'
                '命中為贏半或以上，走盤留在分母。最低參考價按完整／半盤盈虧換算，並非未來盈利保證。')
     _paper_on = _profitable_paper_enabled()
     _bounds = _profitable_date_bounds(df)
     _win = None
     if _bounds:
-        _win = st.date_input('樣本外日期區間（香港時間）', value=_bounds,
-                             min_value=_bounds[0], max_value=_bounds[1], key='profitable_dates_v1')
+        _win = st.date_input('樣本外日期區間（香港時間）', value=_profitable_default_window(_bounds),
+                             min_value=_bounds[0], max_value=_bounds[1], key='profitable_dates_v2')
     if st.button('計算歷史候選規則', key='profitable_history_v1'):
         try:
             _d1, _d2 = (pd.Timestamp(_win[0]), pd.Timestamp(_win[1])) if _bounds and _win else (None, None)
