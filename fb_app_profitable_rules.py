@@ -9,9 +9,10 @@ from fb_app_clv_cohorts import fixture_id, history, number
 
 VERSION = 2
 TAG = '_fb_kanpan_v1'
-TARGET = 0.02
+TARGET = 0.03
 HIT = 0.55
-MIN_N = 40
+MIN_N = 100
+OUT_N = 40
 EPS = 1e-10
 MARKETS = ('讓球', '入球大小', '角球大小')
 STATUS = ('模擬候選', '移出／待重入', '未入選')
@@ -41,7 +42,7 @@ def _earned(n, total, wins):
 
 
 def historical(D, matrix, names, *, price_guard=True, until=None):
-    """Replay admissions by settled match day; positive but weaker rules stay in.
+    """Replay admissions by settled match day; all three hurdles must hold at once.
 
     `until` freezes the replay at that match day (inclusive) so the status of a
     rule at the moment an order was built can be reproduced without rewriting
@@ -78,13 +79,15 @@ def historical(D, matrix, names, *, price_guard=True, until=None):
             win += ((r[:, None] > 0) & chunk).sum(axis=0)
             pnl += (r @ chunk)
             earned = _earned(n, pnl, win)
-            active = (active & (pnl >= -EPS)) | earned
+            # No hysteresis: a rule is a candidate only while it meets sample,
+            # ROI and hit hurdles together. ever keeps the "moved out" memory.
+            active = earned.copy()
             ever |= earned
             lo = hi
         exposure = (np.maximum(ret, 0) / (odds - 1)) @ M
         loss = np.maximum(-ret, 0) @ M
         avg = odds @ M
-        for i in np.flatnonzero(n >= MIN_N):
+        for i in np.flatnonzero(n >= OUT_N):
             floor = 1 + (loss[i] + TARGET * n[i]) / exposure[i] if exposure[i] > 0 else None
             out[(market, names[i])] = dict(
                 rule=names[i], n=int(n[i]), roi=float(pnl[i]/n[i]), hit=float(win[i]/n[i]),

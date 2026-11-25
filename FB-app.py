@@ -36,7 +36,7 @@ import fb_app_profitable_rules as pr
 # V16.4.11：自動分析及入庫只讀本批次已核對的快照，不讀手動表單的 widget。
 # V16.4.12：排程以有效日期及正式庫核對確認完成，不把缺值或掃描結束當成功。
 # V18：香港固定時段可各自啟用，沿用既有結算；原每日排程及歷史補建保留。
-FB_APP_RELEASE = 'V18.3.4'
+FB_APP_RELEASE = 'V18.3.5'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -5506,7 +5506,7 @@ def _profitable_show(df):
     st.subheader('看盤規則盈虧')
     scope = st.selectbox('看盤規則盈虧範圍', ('總體', *pr.MARKETS), key='profitable_scope_v2')
     st.info('全部看盤研究、獨立 $0 候選模擬及反向研究分開。現有實注、注碼及熔斷不變。')
-    st.caption('首次及重入：歷史樣本 >40、ROI >2%、命中 >55%；累計 ROI 跌至負數移出。'
+    st.caption('首次及重入：歷史樣本 >100、ROI >3%、命中 >55%，三項必須同時符合；任一項跌穿即移出（不再等累計 ROI 轉負）。'
                '命中為贏半或以上，走盤留在分母。最低參考價按完整／半盤盈虧換算，並非未來盈利保證。')
     _paper_on = _profitable_paper_enabled()
     _bounds = _profitable_date_bounds(df)

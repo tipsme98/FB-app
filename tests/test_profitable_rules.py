@@ -26,26 +26,25 @@ def hist(groups):
 
 class ProfitableRules(unittest.TestCase):
     def test_strict_thresholds(self):
-        self.assertFalse(hist([[1]*25+[-1]*15])['active'])  # exactly 40
-        self.assertFalse(hist([[1]*33+[0]*27])['active'])  # exactly 55%
-        self.assertFalse(hist([[.30]*30+[-.48]*10+[-.32]*10])['active'])  # exactly +2%
-        self.assertTrue(hist([[1]*25+[-1]*16])['active'])
+        self.assertFalse(hist([[1]*100])['active'])            # exactly 100 is not >100
+        self.assertTrue(hist([[1]*101])['active'])             # 101, 100% hit, +100% ROI
+        self.assertFalse(hist([[1]*110+[-1]*90])['active'])    # hit exactly 55%
+        self.assertTrue(hist([[1]*111+[-1]*89])['active'])     # hit 55.5%
+        self.assertFalse(hist([[.03]*101])['active'])          # ROI exactly +3%
+        self.assertFalse(hist([[1]*55+[-.5]*46])['active'])    # hit 54.5%, ROI +31.7%
 
-    def test_exit_hysteresis_and_reentry(self):
-        a = [1]*30 + [-1]*20
-        b = [-1]*10
-        c = [-1]
-        d = [1]*3
-        self.assertTrue(hist([a, b])['active'])  # 0 does not deactivate
-        self.assertFalse(hist([a, b, c])['active'])
-        self.assertFalse(hist([a, b, c, d])['active'])  # positive but below hit hurdle
-        self.assertTrue(hist([a, b, c, d, [1]*8])['active'])
+    def test_all_three_required_every_day(self):
+        base = [.05]*101
+        self.assertTrue(hist([base])['active'])
+        self.assertFalse(hist([base, [-.05]*30])['active'])    # ROI 2.71% while hit 77%
+        self.assertTrue(hist([base, [-.05]*30, [.05]*20])['active'])
+        self.assertFalse(hist([[1]*101, [-1]*90])['active'])   # hit 52.9%, ROI +5.8%
 
     def test_price_weights_and_best(self):
-        r = hist([[.5]*36 + [-.5]*12+[0]*12])
-        self.assertAlmostEqual(r['floor'], 1+(6+1.2)/18)
-        self.assertEqual(pr.choose([r], 1.399), None)
-        self.assertEqual(pr.choose([r], 1.40), r)
+        r = hist([[.5]*72 + [-.5]*24+[0]*24])
+        self.assertAlmostEqual(r['floor'], 1+(12+3.6)/36)
+        self.assertEqual(pr.choose([r], 1.43), None)
+        self.assertEqual(pr.choose([r], 1.44), r)
 
     def test_bound_freeze_preserves_odds_and_note(self):
         row = dict(ID='B1', Bet_Type='讓球', Selection='Home', Initial_Line=-.25,
@@ -77,7 +76,7 @@ class ProfitableRules(unittest.TestCase):
                       'clv_observed': t.isoformat(), 'odds_ok': True},
              'odds': [{'type':'讓球','line':0,'upper':2.,'lower':1.9,'unlock':True,
                        app.CLV_QUOTE: quote_tag('11', t-timedelta(minutes=1))}]}
-        a = hist([[1]*25+[-1]*16])
+        a = hist([[1]*101])
         one = {'profitable_triggers': [a], 'close_pos': 0, 'snapshots':2}
         res = {('讓球',0,'Home'): {**one,'lookup_odds':2.0},
                ('讓球',0,'Away'): {**one,'profitable_triggers': [],'lookup_odds':1.9}}
@@ -134,12 +133,12 @@ class ProfitableRules(unittest.TestCase):
 
     def test_shared_bets_are_counted_once_and_statuses_partition(self):
         rows = []
-        for i in range(43):
-            d = pd.Timestamp('2026-01-01') + pd.Timedelta(days=i)
+        for i in range(112):
+            d = pd.Timestamp('2025-12-01') + pd.Timedelta(days=i)
             rows.append(dict(date=d, bet_type='讓球', key=str(i), line=0.25, nsnap=2, side='Home',
-                             ret=(.90 if i >= 41 else .5), odds=1.90, maskA=True, maskB=i >= 41))
+                             ret=(.90 if i >= 110 else .5), odds=1.90, maskA=True, maskB=i >= 110))
         frame = pd.DataFrame(rows)
-        start = pd.Timestamp('2026-02-11')
+        start = pd.Timestamp('2026-03-21')
         def masks(d, n=None):
             return ['A', 'B'], d[['maskA', 'maskB']].to_numpy()
         out = pr.chronological_research(frame, [(start, start + pd.Timedelta(days=1))],
@@ -272,11 +271,11 @@ a._profitable_show(pd.DataFrame())
     def test_historical_until_freezes_build_time_status(self):
         frame = pd.DataFrame([
             dict(date=pd.Timestamp('2026-01-01') + pd.Timedelta(days=i), bet_type='讓球',
-                 ret=(1. if i < 25 else -1.), odds=2.0)
-            for i in range(60)])
+                 ret=(1. if i < 101 else -1.), odds=2.0)
+            for i in range(200)])
         M = np.ones((len(frame), 1), dtype=bool)
         self.assertEqual(pr.historical(frame, M, ['R'], until=np.datetime64('2026-01-30')), {})
-        mid = pr.historical(frame, M, ['R'], until=np.datetime64('2026-02-15'))
+        mid = pr.historical(frame, M, ['R'], until=np.datetime64('2026-04-11'))
         self.assertTrue(mid[('讓球', 'R')]['active'])
         self.assertFalse(pr.historical(frame, M, ['R'])[('讓球', 'R')]['active'])
 
