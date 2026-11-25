@@ -74,7 +74,8 @@ def main():
     whole = app.v10_apply_resid(design, app.v10_fit_resid(design))
     names, matrix = app.v10_rule_matrix(whole)
     active = pr.historical(whole, matrix, names)
-    strict = [k for k,v in active.items() if v['n']>40 and v['roi']>.0200000001 and v['hit']>.5500000001]
+    strict = [k for k,v in active.items()
+              if v['n'] > pr.MIN_N and v['roi'] > pr.TARGET and v['hit'] > pr.HIT]
     print(json.dumps(dict(matches=len(mt), rows=len(design), combinations=len(names), strict=len(strict),
                           active=sum(x['active'] for x in active.values()),
                           periods=[(str(a.date()), str(b.date())) for a,b in folds],
