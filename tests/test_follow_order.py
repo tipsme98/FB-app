@@ -75,12 +75,12 @@ class FollowTableDefaults(unittest.TestCase):
         self.assertFalse(at.exception)
         cols = list(at.dataframe[0].value.columns)
         self.assertEqual(cols, [
-            "Bet_Type", "Selection", "Initial_Odds", "System_Stake", "歷史樣本",
+            "Bet_Type", "Selection", "Initial_Line", "Initial_Odds", "System_Stake", "歷史樣本",
             "歷史 ROI", "命中率", "單位盈虧", "狀態", "反向單位盈虧", "反向ROI",
             "反向命中率", "看盤規則", "Model_Prob", "Market_Prob", "Edge", "Gate",
             "User_Stake"])
         self.assertNotIn("ID", cols)
-        self.assertNotIn("Initial_Line", cols)
+        self.assertEqual(cols.index("Initial_Line"), cols.index("Selection") + 1)
 
     def test_widths_grow_for_cjk_and_clamp(self):
         at = unit("_follow_auto_width", "[_follow_auto_width('G', ['1']), "

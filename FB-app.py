@@ -36,7 +36,7 @@ import fb_app_profitable_rules as pr
 # V16.4.11：自動分析及入庫只讀本批次已核對的快照，不讀手動表單的 widget。
 # V16.4.12：排程以有效日期及正式庫核對確認完成，不把缺值或掃描結束當成功。
 # V18：香港固定時段可各自啟用，沿用既有結算；原每日排程及歷史補建保留。
-FB_APP_RELEASE = 'V18.3.6'
+FB_APP_RELEASE = 'V18.3.7'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -11296,7 +11296,7 @@ def _follow_rule_states(df_db, open_df, data):
     return out
 
 
-FOLLOW_COLUMN_ORDER = ['Bet_Type', 'Selection', 'Initial_Odds', 'System_Stake', '歷史樣本',
+FOLLOW_COLUMN_ORDER = ['Bet_Type', 'Selection', 'Initial_Line', 'Initial_Odds', 'System_Stake', '歷史樣本',
                        '歷史 ROI', '命中率', '單位盈虧', '狀態', '反向單位盈虧', '反向ROI',
                        '反向命中率', '看盤規則', 'Model_Prob', 'Market_Prob', 'Edge', 'Gate',
                        'User_Stake']
@@ -11419,6 +11419,8 @@ def v162_render_follow_tab():
             _display['反向單位盈虧'] = _rvnets
             _display['反向ROI'] = _rvrois
             _display['反向命中率'] = _rvhits
+            if 'Initial_Line' in _display.columns:
+                _display['Initial_Line'] = pd.to_numeric(_display['Initial_Line'], errors='coerce')
             _view = _display[[c for c in FOLLOW_COLUMN_ORDER if c in _display.columns]]
             _styled = _view.style.apply(
                 lambda r: _follow_row_style(r, rule_states[0]), axis=1)
@@ -11434,7 +11436,7 @@ def v162_render_follow_tab():
                         format='%.2f U', width=_follow_auto_width(_c, [f'{v:+.2f} U' if v is not None else None for v in _view[_c]]))
                 elif _c in ('Bet_Type', 'Selection', '狀態', '看盤規則'):
                     _cfg[_c] = st.column_config.TextColumn(width=_follow_auto_width(_c, _view[_c]))
-                elif _c in ('Initial_Odds', 'System_Stake', 'User_Stake', 'Model_Prob', 'Market_Prob', 'Edge', 'Gate'):
+                elif _c in ('Initial_Line', 'Initial_Odds', 'System_Stake', 'User_Stake', 'Model_Prob', 'Market_Prob', 'Edge', 'Gate'):
                     _cfg[_c] = st.column_config.NumberColumn(
                         width=_follow_auto_width(_c, [f'{v:.4f}' if isinstance(v, float) else v for v in _view[_c]]))
             st.dataframe(_styled, use_container_width=True, hide_index=True, column_config=_cfg)
