@@ -10,7 +10,9 @@ APP = Path(__file__).resolve().parents[1] / "FB-app.py"
 FOLLOW_FUNCTIONS = {
     "v10_md_series", "v10_match_groups", "v10_match_mask",
     "_v162_follow_record_time", "_v162_follow_match_sections", "v162_render_follow_tab",
+    "_follow_auto_width", "_follow_row_style",
 }
+FOLLOW_CONSTANTS = {"FOLLOW_COLUMN_ORDER", "FOLLOW_CANDIDATE_STYLE"}
 
 PRELUDE = """
 from datetime import datetime, timedelta, timezone
@@ -39,12 +41,25 @@ def slip(name, bet_id, recorded, *, day="2026-11-21", system=0, status="Open"):
         "ID": bet_id, "Date": recorded, "System_Stake": system, "User_Stake": 0,
         "Status": status, "Note": "", "Bet_Type": "入球大小", "Selection": "Over",
         "Initial_Line": 2.5, "Initial_Odds": 1.91,
+        "Model_Prob": 0.55, "Market_Prob": 0.52, "Edge": 0.03, "Gate": "PASS",
     }
+
+
+def unit(fn, expr):
+    nodes = [n for n in ast.parse(APP.read_text(encoding="utf-8")).body
+             if (isinstance(n, ast.FunctionDef) and n.name == fn)
+             or (isinstance(n, ast.Assign) and any(
+                 isinstance(t, ast.Name) and t.id in FOLLOW_CONSTANTS for t in n.targets))]
+    src = PRELUDE + "\n" + "\n\n".join(ast.unparse(n) for n in nodes)
+    src += f"\nst.session_state['out'] = {expr}\n"
+    return AppTest.from_string(src).run()
 
 
 def boot(*rows):
     nodes = [n for n in ast.parse(APP.read_text(encoding="utf-8")).body
-             if isinstance(n, ast.FunctionDef) and n.name in FOLLOW_FUNCTIONS]
+             if (isinstance(n, ast.FunctionDef) and n.name in FOLLOW_FUNCTIONS)
+             or (isinstance(n, ast.Assign) and any(
+                 isinstance(t, ast.Name) and t.id in FOLLOW_CONSTANTS for t in n.targets))]
     wrapper = PRELUDE + "\n" + "\n\n".join(ast.unparse(n) for n in nodes)
     wrapper += (
         "\nif 'df_db' not in st.session_state:\n"
@@ -52,6 +67,39 @@ def boot(*rows):
         "with st.tabs(['用家跟投'])[0]:\n    v162_render_follow_tab()\n"
     )
     return AppTest.from_string(wrapper).run()
+
+
+class FollowTableDefaults(unittest.TestCase):
+    def test_default_columns_follow_requested_order(self):
+        at = boot(slip("預設欄", "B202611212100000", "2026-11-21 21:00"))
+        self.assertFalse(at.exception)
+        cols = list(at.dataframe[0].value.columns)
+        self.assertEqual(cols, [
+            "Bet_Type", "Selection", "Initial_Odds", "System_Stake", "歷史樣本",
+            "歷史 ROI", "命中率", "單位盈虧", "狀態", "反向單位盈虧", "反向ROI",
+            "反向命中率", "看盤規則", "Model_Prob", "Market_Prob", "Edge", "Gate",
+            "User_Stake"])
+        self.assertNotIn("ID", cols)
+        self.assertNotIn("Initial_Line", cols)
+
+    def test_widths_grow_for_cjk_and_clamp(self):
+        at = unit("_follow_auto_width", "[_follow_auto_width('G', ['1']), "
+                  "_follow_auto_width('狀態', ['模擬候選']), _follow_auto_width('x', ['y' * 400])]")
+        self.assertFalse(at.exception)
+        short, cjk, long = at.session_state["out"]
+        self.assertEqual(short, 84)
+        self.assertGreater(cjk, short)
+        self.assertEqual(long, 360)
+
+    def test_candidate_status_highlights_every_cell(self):
+        at = unit("_follow_row_style", "[_follow_row_style({'狀態': '模擬候選', 'Bet_Type': '讓球', "
+                  "'Gate': 'x'}), _follow_row_style({'狀態': '未入選', 'Bet_Type': '讓球'})]")
+        self.assertFalse(at.exception)
+        candidate, other = at.session_state["out"]
+        self.assertEqual(len(candidate), 3)
+        self.assertTrue(all(candidate))
+        self.assertEqual(set(candidate), {"background-color:#d9eee9;color:#163b38"})
+        self.assertFalse(any(other))
 
 
 class FollowNewestFirst(unittest.TestCase):
@@ -66,12 +114,14 @@ class FollowNewestFirst(unittest.TestCase):
                          "candidate_status": "移出／待重入"}, None)
         at = boot(new, old, removed)
         self.assertFalse(at.exception)
-        view = at.dataframe[0].value.set_index("ID")
-        self.assertEqual(view.loc["B1", "看盤規則"], "盤水不變")
-        self.assertEqual(view.loc["B1", "狀態"], "模擬候選")
-        self.assertEqual(view.loc["B2", "看盤規則"], "—")
-        self.assertEqual(view.loc["B2", "狀態"], "")
-        self.assertEqual(view.loc["B3", "狀態"], "移出／待重入")
+        view = at.dataframe[0].value
+        candidate = view[view["狀態"] == "模擬候選"]
+        self.assertEqual(len(candidate), 1)
+        self.assertEqual(candidate.iloc[0]["看盤規則"], "盤水不變")
+        blank = view[view["看盤規則"] == "—"]
+        self.assertEqual(len(blank), 1)
+        self.assertEqual(blank.iloc[0]["狀態"], "")
+        self.assertEqual(list(view["狀態"]).count("移出／待重入"), 1)
 
     def assert_order(self, at, *matches):
         self.assertFalse(at.exception)

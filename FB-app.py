@@ -36,7 +36,7 @@ import fb_app_profitable_rules as pr
 # V16.4.11：自動分析及入庫只讀本批次已核對的快照，不讀手動表單的 widget。
 # V16.4.12：排程以有效日期及正式庫核對確認完成，不把缺值或掃描結束當成功。
 # V18：香港固定時段可各自啟用，沿用既有結算；原每日排程及歷史補建保留。
-FB_APP_RELEASE = 'V18.3.2'
+FB_APP_RELEASE = 'V18.3.3'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -5432,6 +5432,23 @@ def _profitable_write(picks):
         return sum(conn.execute(sql, {**p, 'payload': json.dumps(p, ensure_ascii=False)}).scalar() is not None for p in picks)
 
 
+def _profitable_paper_probe():
+    """Read-only check of the side table; never writes or fabricates rows."""
+    from sqlalchemy import text
+    engine = _v163_sql_engine()
+    if engine is None:
+        return None, '沒有可用的 SQL 連線（未設定資料庫或連線失敗）。'
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL statement_timeout = '4000ms'"))
+        exists = conn.execute(text(
+            "SELECT to_regclass('public.fb_profitable_paper_v1') IS NOT NULL")).scalar()
+        if not exists:
+            return False, '旁表 public.fb_profitable_paper_v1 尚未建立。'
+        n = conn.execute(text("SELECT count(*) FROM public.fb_profitable_paper_v1")).scalar()
+        last = conn.execute(text("SELECT max(observed) FROM public.fb_profitable_paper_v1")).scalar()
+    return True, f'旁表存在，共 {int(n or 0)} 筆' + (f'；最近鎖定時間 {last}（UTC）。' if last else '。')
+
+
 def _profitable_read(days):
     from sqlalchemy import text
     engine = _v163_sql_engine()
@@ -5478,9 +5495,7 @@ def _profitable_show(df):
     st.info('全部看盤研究、獨立 $0 候選模擬及反向研究分開。現有實注、注碼及熔斷不變。')
     st.caption('首次及重入：歷史樣本 >40、ROI >2%、命中 >55%；累計 ROI 跌至負數移出。'
                '命中為贏半或以上，走盤留在分母。最低參考價按完整／半盤盈虧換算，並非未來盈利保證。')
-    toggle = _profitable_paper_enabled()
-    if not toggle:
-        st.warning('自動模擬鎖定未啟用；本頁不會寫下注單，也不會以歷史資料補造前瞻紀錄。')
+    _paper_on = _profitable_paper_enabled()
     if st.button('計算歷史候選規則', key='profitable_history_v1'):
         try:
             st.session_state['_profitable_report_v2'] = _profitable_report(_profitable_history_input(df))
@@ -5579,21 +5594,49 @@ def _profitable_show(df):
         st.caption('歷史樣本使用既有 V10 收盤主盤重建；不可和 T−30 的實時價格混為同一驗證。')
     st.markdown('#### 獨立候選 $0 前瞻盈虧')
     st.caption('只有唯一候選規則與方向、賽前報價合格才可鎖定；不從全部規則或反向研究寫入。')
+    if _paper_on:
+        st.success('自動模擬鎖定已啟用（FB_PROFITABLE_PAPER_V1 = 1）；只在自動賽前 CLV 的 BET 階段寫入 $0 模擬注。')
+    else:
+        st.warning('自動模擬鎖定未啟用（未設定 FB_PROFITABLE_PAPER_V1），所以不會有新鎖定紀錄。')
+    with st.expander('如何啟用自動模擬鎖定？啟用後有甚麼作用？'):
+        st.markdown("""
+1. **建立旁表**：在正式 Supabase 執行 `migrations/20261124_profitable_paper_v1.sql`，只新增 `public.fb_profitable_paper_v1`，不會改 `football_bets`、注碼、設定或結算。
+2. **設定旗標**：Streamlit Cloud → 本 App → Settings → Secrets，加入 `FB_PROFITABLE_PAPER_V1 = "1"`，儲存後 App 會重新啟動。
+3. **核對**：重新載入本頁，此處應顯示「已啟用」；再按「檢查旁表狀態」，確認旁表存在。
+
+**啟用後的作用**：每場開賽前 30 分鐘的自動 CLV `BET` 階段，若該場該盤口只有唯一一對「候選規則 × 方向」，且來源雙邊價、時間及開賽時間都合格，才寫入一筆 **$0 模擬注**；同一場／開賽時間／盤口只留第一筆。它不會下真注、不會改主帳本、注碼、設定或結算，亦不會補造歷史紀錄；只供其後用正式賽果核對前瞻表現。把旗標改為 `"0"` 或移除即停止寫入，已存的模擬紀錄仍可讀。
+
+現在未有紀錄，通常是因為旗標未開、旁表未建立，或尚未出現合格的自然賽前訊號；三者都不等於 ROI 為 0。
+""")
     _days = st.selectbox('前瞻模擬查詢期間', (30, 90, 365), key='profitable_days_v1')
-    if st.button('讀取已鎖定的前瞻模擬', key='profitable_read_v1'):
+    _read_col, _probe_col = st.columns(2)
+    if _read_col.button('讀取已鎖定的前瞻模擬', key='profitable_read_v1'):
         try:
             st.session_state['_profitable_forward_v2'] = _days, _profitable_read(_days)
-        except Exception:
+        except Exception as _exc:
             st.session_state['_profitable_forward_v2'] = _days, None
+            st.session_state['_profitable_read_error_v1'] = str(_exc)
+    if _probe_col.button('檢查旁表狀態', key='profitable_probe_v1'):
+        try:
+            st.session_state['_profitable_probe_result_v1'] = _profitable_paper_probe()
+        except Exception as _exc:
+            st.session_state['_profitable_probe_result_v1'] = (None, f'檢查失敗：{_exc}')
+    if '_profitable_probe_result_v1' in st.session_state:
+        _ok, _msg = st.session_state['_profitable_probe_result_v1']
+        (st.success if _ok else st.warning)(_msg)
     days_loaded, loaded = st.session_state.get('_profitable_forward_v2', (None, None))
     if days_loaded == _days:
         if loaded is None:
-            st.error('未能讀取 Supabase 模擬旁表；不可把查詢失敗當成 0 注。')
+            _err = st.session_state.get('_profitable_read_error_v1') or ''
+            st.error('未能讀取 Supabase 模擬旁表；不可把查詢失敗當成 0 注。'
+                     + (f' 原因：{_err}' if _err else '')
+                     + ' 可按「檢查旁表狀態」核對旁表是否已建立。')
             return
         papers, settled = loaded
         papers = [p for p in papers if scope == '總體' or p['market'] == scope]
         if not papers:
-            st.info('所選期間未有已鎖定模擬，不代表 ROI 為 0。')
+            st.info('所選期間未有已鎖定模擬，不代表 ROI 為 0。'
+                    + ('' if _paper_on else ' 自動模擬鎖定目前未啟用，見上方啟用說明。'))
             return
         def settle(p, h, a):
             args = (0, 0, h, a) if p['market'] == '角球大小' else (h, a, 0, 0)
@@ -11219,6 +11262,28 @@ def _follow_rule_states(df_db, open_df, data):
     return out
 
 
+FOLLOW_COLUMN_ORDER = ['Bet_Type', 'Selection', 'Initial_Odds', 'System_Stake', '歷史樣本',
+                       '歷史 ROI', '命中率', '單位盈虧', '狀態', '反向單位盈虧', '反向ROI',
+                       '反向命中率', '看盤規則', 'Model_Prob', 'Market_Prob', 'Edge', 'Gate',
+                       'User_Stake']
+
+
+def _follow_auto_width(label, values):
+    """Approximate a pixel width from the widest cell so no header is clipped."""
+    def px(text):
+        return sum(13 if ord(ch) > 0x2E7F else 7 for ch in str(text))
+    cells = [px(v) for v in values if v is not None and str(v) not in ('', 'None', 'nan')]
+    return int(min(360, max(84, max([px(label), *cells]) + 34)))
+
+
+FOLLOW_CANDIDATE_STYLE = 'background-color:#d9eee9;color:#163b38'
+
+
+def _follow_row_style(row, candidate='模擬候選'):
+    """Whole-row highlight: every cell of a 模擬候選 row, not only the rule cells."""
+    return [FOLLOW_CANDIDATE_STYLE if row.get('狀態') == candidate else '' for _ in row]
+
+
 def v162_render_follow_tab():
     """V16.2「👤 用家跟投」分頁：監察系統待結算注單 + 賽前分析結果，
     用家自行決定跟投 (自訂注碼) 或觀望。任何裝置可用 (含唯讀查看裝置)。"""
@@ -11320,19 +11385,25 @@ def v162_render_follow_tab():
             _display['反向單位盈虧'] = _rvnets
             _display['反向ROI'] = _rvrois
             _display['反向命中率'] = _rvhits
-            _styled = _display.style.apply(
-                lambda col: ['background-color:#d9eee9;color:#163b38' if s == rule_states[0] else '' for s in _states],
-                subset=['看盤規則', '歷史樣本', '歷史 ROI', '命中率', '狀態',
-                        '單位盈虧', '反向單位盈虧', '反向ROI', '反向命中率'])
-            st.dataframe(_styled, use_container_width=True, hide_index=True,
-                         column_config={'看盤規則': st.column_config.TextColumn(width='medium'),
-                                        '歷史 ROI': st.column_config.NumberColumn(format='percent', width='small'),
-                                        '命中率': st.column_config.NumberColumn(format='percent', width='small'),
-                                        '狀態': st.column_config.TextColumn(width='small'),
-                                        '單位盈虧': st.column_config.NumberColumn(format='%.2f U', width='medium'),
-                                        '反向單位盈虧': st.column_config.NumberColumn(format='%.2f U', width='large'),
-                                        '反向ROI': st.column_config.NumberColumn(format='percent', width='small'),
-                                        '反向命中率': st.column_config.NumberColumn(format='percent', width='small')})
+            _view = _display[[c for c in FOLLOW_COLUMN_ORDER if c in _display.columns]]
+            _styled = _view.style.apply(
+                lambda r: _follow_row_style(r, rule_states[0]), axis=1)
+            _pct = ('歷史 ROI', '命中率', '反向ROI', '反向命中率')
+            _units = ('單位盈虧', '反向單位盈虧')
+            _cfg = {}
+            for _c in _view.columns:
+                if _c in _pct:
+                    _cfg[_c] = st.column_config.NumberColumn(
+                        format='percent', width=_follow_auto_width(_c, [f'{v:+.2%}' if v is not None else None for v in _view[_c]]))
+                elif _c in _units:
+                    _cfg[_c] = st.column_config.NumberColumn(
+                        format='%.2f U', width=_follow_auto_width(_c, [f'{v:+.2f} U' if v is not None else None for v in _view[_c]]))
+                elif _c in ('Bet_Type', 'Selection', '狀態', '看盤規則'):
+                    _cfg[_c] = st.column_config.TextColumn(width=_follow_auto_width(_c, _view[_c]))
+                elif _c in ('Initial_Odds', 'System_Stake', 'User_Stake', 'Model_Prob', 'Market_Prob', 'Edge', 'Gate'):
+                    _cfg[_c] = st.column_config.NumberColumn(
+                        width=_follow_auto_width(_c, [f'{v:.4f}' if isinstance(v, float) else v for v in _view[_c]]))
+            st.dataframe(_styled, use_container_width=True, hide_index=True, column_config=_cfg)
             st.caption('狀態以注單建檔日前已結算的資料重播判定（模擬候選／移出·待重入／未入選），'
                        '已凍結的注單沿用建檔時證據。單位盈虧、反向單位盈虧、反向ROI 及反向命中率為'
                        '該注單對應看盤規則的歷史／反向研究數值，不是這張注單的賽果，也不代表建議實注。')
