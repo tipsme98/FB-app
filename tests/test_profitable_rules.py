@@ -132,6 +132,46 @@ class ProfitableRules(unittest.TestCase):
         self.assertEqual(pr.chronological_research(frame,[(start,start)],
                             fit,lambda d,c:d,masks)['reverse']['總體']['n'], 0)
 
+    def test_shared_bets_are_counted_once_and_statuses_partition(self):
+        rows = []
+        for i in range(43):
+            d = pd.Timestamp('2026-01-01') + pd.Timedelta(days=i)
+            rows.append(dict(date=d, bet_type='讓球', key=str(i), line=0.25, nsnap=2, side='Home',
+                             ret=(.90 if i >= 41 else .5), odds=1.90, maskA=True, maskB=i >= 41))
+        frame = pd.DataFrame(rows)
+        start = pd.Timestamp('2026-02-11')
+        def masks(d, n=None):
+            return ['A', 'B'], d[['maskA', 'maskB']].to_numpy()
+        out = pr.chronological_research(frame, [(start, start + pd.Timedelta(days=1))],
+                                        lambda t: None, lambda d, c: d, masks)
+        # Two quotes, each counted once even though both rules fire on both.
+        self.assertEqual(out['all']['總體']['n'], 2)
+        self.assertEqual(sum(out['by_status']['總體'][s]['n'] for s in pr.STATUS), 2)
+        # A is the candidate, so the shared bets go to A rather than B.
+        self.assertEqual(out['by_status']['總體'][pr.STATUS[0]]['n'], 2)
+        self.assertEqual(out['by_status']['總體'][pr.STATUS[2]]['n'], 0)
+
+    def test_date_window_limits_only_reported_days(self):
+        rows = []
+        for i in range(43):
+            d = pd.Timestamp('2026-01-01') + pd.Timedelta(days=i)
+            rows.append(dict(date=d, bet_type='讓球', key=str(i), line=0.25, nsnap=2, side='Home',
+                             ret=(-1. if i == 41 else 1.), odds=1.90, mask=True))
+        frame = pd.DataFrame(rows)
+        start = pd.Timestamp('2026-02-11')
+        seen = []
+        def fit(train):
+            seen.append(train.date.max())
+        def masks(d, n=None):
+            return ['R'], d[['mask']].to_numpy()
+        folds = [(start, start + pd.Timedelta(days=1))]
+        both = pr.chronological_research(frame, folds, fit, lambda d, c: d, masks)
+        first = pr.chronological_research(frame, folds, fit, lambda d, c: d, masks,
+                                          date_from=start, date_to=start)
+        self.assertEqual(both['all']['總體']['n'], 2)
+        self.assertEqual(first['all']['總體']['n'], 1)
+        self.assertTrue(all(day < start for day in seen))
+
     def test_scope_filters_all_and_history(self):
         stub = """
 import sys
@@ -142,7 +182,7 @@ s = importlib.util.spec_from_file_location('fb_ui_metrics', {src!r})
 a=importlib.util.module_from_spec(s)
 s.loader.exec_module(a)
 a._profitable_paper_enabled = lambda: False
-def rep(df):
+def rep(df, *args, **kwargs):
     row=dict(n=41,roi=.07,net=1,hit=.6,ci=[.01,.10],first=.05,second=.07)
     report={{k:{{m:dict(row,n=i) for i,m in enumerate(('總體','讓球','入球大小','角球大小'),1)}} for k in ('all','reverse')}}
     report['reverse_rules']=[dict(market='讓球',rule='R',original=row,opposite=row)]
@@ -150,6 +190,7 @@ def rep(df):
     hist={{('讓球','H'):dict(row,avg=1.9,floor=1.8,active=True,ever=True),
           ('入球大小','G'):dict(row,avg=1.9,floor=1.8,active=False,ever=True)}}
     return hist,report
+a._profitable_date_bounds=lambda df: None
 a._profitable_report=rep
 a._profitable_show(pd.DataFrame())
 """.format(root=str(Path(__file__).parents[1]), src=str(Path(__file__).parents[1]/'FB-app.py'))
@@ -249,7 +290,8 @@ s = importlib.util.spec_from_file_location('fb_ui_filters', {src!r})
 a = importlib.util.module_from_spec(s)
 s.loader.exec_module(a)
 a._profitable_paper_enabled = lambda: False
-def rep(df):
+a._profitable_date_bounds = lambda df: None
+def rep(df, *args, **kwargs):
     row = dict(n=41, roi=.07, net=1, hit=.6, ci=[.01,.10], first=.05, second=.07)
     mk = lambda n: dict(row, n=n)
     report = {{k: {{m: mk(1) for m in ('總體','讓球','入球大小','角球大小')}} for k in ('all','reverse')}}

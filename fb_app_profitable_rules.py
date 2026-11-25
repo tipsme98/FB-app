@@ -201,8 +201,15 @@ def _merge_days(maps):
     return out
 
 
-def chronological_research(design, folds, fit, apply, matrix):
-    """All-rule, status-split, weak-rule and reverse comparison. Cannot create an order."""
+def chronological_research(design, folds, fit, apply, matrix, *, date_from=None, date_to=None):
+    """All-rule, status-split, weak-rule and reverse comparison. Cannot create an order.
+
+    Each out-of-sample quote is credited to exactly one rule: the best rule firing
+    on it (candidate first, then larger sample, higher ROI, name). Totals therefore
+    count unique bets, and the three status groups partition those bets. The
+    optional date window only limits which out-of-sample days are reported; fits
+    still use data before each fold.
+    """
     totals = {m:{} for m in ('總體', *MARKETS)}
     reverse_totals = {m:{} for m in totals}
     status_totals = {m:{s:{} for s in STATUS} for m in totals}
@@ -221,6 +228,10 @@ def chronological_research(design, folds, fit, apply, matrix):
     for start, end in folds:
         train = design[design['date'] < start]
         test = design[design['date'].between(start, end)]
+        if date_from is not None:
+            test = test[test['date'] >= date_from]
+        if date_to is not None:
+            test = test[test['date'] <= date_to]
         if train.empty or test.empty:
             continue
         coef = fit(train)
@@ -239,7 +250,11 @@ def chronological_research(design, folds, fit, apply, matrix):
             for j in weak_index:
                 weak_meta[(m,names[j])] = dict(stats[(m,names[j])])
             stat_of = [rule_status(stats.get((m,name), {})) for name in names]
-            cls = {s: np.array([v==s for v in stat_of], dtype=bool) for s in STATUS}
+            rank = np.array([STATUS.index(v) for v in stat_of], dtype=int)
+            samples = np.array([stats.get((m,name), {}).get('n', 0) for name in names], dtype=float)
+            rois = np.array([stats.get((m,name), {}).get('roi', -math.inf) for name in names], dtype=float)
+            order = np.array(sorted(range(len(names)),
+                                    key=lambda j: (rank[j], -samples[j], -rois[j], names[j])), dtype=int)
             md = test[test['bet_type'].eq(m)]
             for d, group in md.groupby('date', sort=True):
                 datum = d.to_pydatetime()
@@ -250,14 +265,18 @@ def chronological_research(design, folds, fit, apply, matrix):
                 vals = group['ret'].to_numpy(float)
                 valid = np.isfinite(vals) & group['odds'].gt(1).to_numpy()
                 active = M[indices,:]
-                weights = active.sum(axis=1)
-                keep = valid & (weights>0)
+                first = active[:, order].argmax(axis=1)
+                has = active[:, order].any(axis=1)
+                assigned = order[first]
+                keep = valid & has
+                # Only quotes a rule fires on are rule bets; the status groups
+                # partition exactly those bets.
+                assigned_rank = np.where(has, rank[assigned], -1)
                 for k in (m,'總體'):
-                    record(totals[k], datum, vals[keep], weights[keep])
+                    record(totals[k], datum, vals[keep])
                     for s in STATUS:
-                        ws = (active & cls[s]).sum(axis=1)
-                        ks = valid & (ws>0)
-                        record(status_totals[k][s], datum, vals[ks], ws[ks])
+                        ks = keep & (assigned_rank == STATUS.index(s))
+                        record(status_totals[k][s], datum, vals[ks])
                 if not (name_index or weak_index):
                     continue
                 # Look up the opposite side from the same reconstructed main quote,

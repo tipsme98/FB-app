@@ -36,7 +36,7 @@ import fb_app_profitable_rules as pr
 # V16.4.11：自動分析及入庫只讀本批次已核對的快照，不讀手動表單的 widget。
 # V16.4.12：排程以有效日期及正式庫核對確認完成，不把缺值或掃描結束當成功。
 # V18：香港固定時段可各自啟用，沿用既有結算；原每日排程及歷史補建保留。
-FB_APP_RELEASE = 'V18.3.3'
+FB_APP_RELEASE = 'V18.3.4'
 # V16.4 刪除墓碑統一修復 + 設定殭屍來源修復 + 跟投分頁崩潰修復 — 2026-11-18
 #
 #   背景 (用家 V16.3.1 部署後實測)：刪除 11 筆問題記錄後「刪了又跑出來，
@@ -5363,15 +5363,28 @@ def _profitable_engine(df):
     return {'trained': True, 'coef': coef, 'profitable': pr.historical(D, M, names)}
 
 
-@st.cache_data(max_entries=2, show_spinner=False)
-def _profitable_report(df):
+@st.cache_data(max_entries=8, show_spinner=False)
+def _profitable_report(df, date_from=None, date_to=None):
     D = _profitable_design(df)
     if D.empty:
         return {}, None
     engine = _profitable_engine(df)
     folds = v9_folds(D['date'], n_folds=6, init_frac=.4)
     return engine['profitable'], pr.chronological_research(
-        D, folds, v10_fit_resid, v10_apply_resid, v10_rule_matrix)
+        D, folds, v10_fit_resid, v10_apply_resid, v10_rule_matrix,
+        date_from=date_from, date_to=date_to)
+
+
+@st.cache_data(max_entries=4, show_spinner=False)
+def _profitable_date_bounds(df):
+    """Earliest/latest settled match day available to the out-of-sample window."""
+    if df.empty:
+        return None
+    d = pd.to_datetime(df['Match_Date'].astype(str).str[:10], format='%Y-%m-%d', errors='coerce')
+    ok = d.notna() & df['Status'].eq('Settled') & ~df['Bet_Type'].astype(str).str.contains('即場')
+    if not ok.any():
+        return None
+    return d[ok].min().date(), d[ok].max().date()
 
 
 def _profitable_history_input(df, before=None):
@@ -5496,15 +5509,25 @@ def _profitable_show(df):
     st.caption('首次及重入：歷史樣本 >40、ROI >2%、命中 >55%；累計 ROI 跌至負數移出。'
                '命中為贏半或以上，走盤留在分母。最低參考價按完整／半盤盈虧換算，並非未來盈利保證。')
     _paper_on = _profitable_paper_enabled()
+    _bounds = _profitable_date_bounds(df)
+    _win = None
+    if _bounds:
+        _win = st.date_input('樣本外日期區間（香港時間）', value=_bounds,
+                             min_value=_bounds[0], max_value=_bounds[1], key='profitable_dates_v1')
     if st.button('計算歷史候選規則', key='profitable_history_v1'):
         try:
-            st.session_state['_profitable_report_v2'] = _profitable_report(_profitable_history_input(df))
+            _d1, _d2 = (pd.Timestamp(_win[0]), pd.Timestamp(_win[1])) if _bounds and _win else (None, None)
+            st.session_state['_profitable_report_v2'] = (
+                _profitable_report(_profitable_history_input(df), _d1, _d2), (_d1, _d2))
         except Exception:
-            st.session_state['_profitable_report_v2'] = None, None
+            st.session_state['_profitable_report_v2'] = (None, None), None
     if '_profitable_report_v2' in st.session_state:
-        hist, report = st.session_state['_profitable_report_v2']
+        (hist, report), _loaded_win = st.session_state['_profitable_report_v2']
         if report is not None:
             st.markdown('#### 全部規則樣本外盈虧')
+            if _loaded_win and _loaded_win[0] is not None:
+                st.caption(f'已載入日期區間：{_loaded_win[0]:%Y-%m-%d} 至 {_loaded_win[1]:%Y-%m-%d}'
+                           '（香港時間；改日期後需再按「計算歷史候選規則」更新）。')
             _stat_pick = st.selectbox('規則樣本外盈虧', ('全部', *pr.STATUS), key='profitable_status_v1')
             _summary = (report['all'][scope] if _stat_pick == '全部'
                         else report.get('by_status', {}).get(scope, {}).get(_stat_pick))
@@ -5512,9 +5535,10 @@ def _profitable_show(df):
                 _profitable_metrics(_summary)
             else:
                 st.info('所選狀態在此範圍沒有樣本；不代表 ROI 為 0。')
-            st.caption('每次觸發一條原規則計 1 單位，重疊規則及兩邊可重複計數。這不是實注、候選旁表或單一投組。'
-                       '按周叢集重抽樣估 95% 區間；以篩選後有注的比賽日分前後兩半，同日不拆開。'
-                       '狀態以每段只用較早資料判定的規則分類，同一批注會因狀態不同而分開呈現。')
+            st.caption('每張樣本外注單只歸一條規則：候選優先，其次歷史樣本較多、ROI 較高、名稱排序；'
+                       '同一張注不再被多條規則重複計算，三個狀態因此互不重疊並合計為全部。'
+                       '這不是實注、候選旁表或單一投組。日期區間只限制樣本外評估日，訓練仍只用每折之前資料。'
+                       '按周叢集重抽樣估 95% 區間；以區間內有注的比賽日分前後兩半，同日不拆開。')
             with st.expander('反向盈虧對照（只讀研究，不自動下注）'):
                 st.caption('每段只以較早資料選歷史樣本 >40、ROI <−10%、命中率 <40% 的規則；'
                            '逐筆以同盤對家的賠率、盤線及正式結算口徑重算，非把原盈虧改符號。'
